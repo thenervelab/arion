@@ -1,0 +1,55 @@
+# Hippius Miner Configuration
+# Copy this file to miner.toml and customize
+
+[network]
+# HTTP API port for blob serving  
+port = 3001
+
+# Public hostname/IP for other nodes to reach this miner
+# Required - set to your public IP or DNS name
+hostname = "your-miner-hostname.example.com"
+
+# Iroh relay URL for P2P connectivity (NAT traversal)
+relay_url = "https://relay.hippius.com"
+
+# P2P bind port (UDP)
+p2p_port = 11230
+
+# Family ID for CRUSH placement grouping
+# Miners in the same family won't hold duplicate shards
+family_id = "SS58"
+
+[storage]
+# Directory for blob storage
+path = "data/miner/blobs"
+
+# Data directory for keypair and state
+data_dir = "data/miner"
+
+# Maximum storage to use in GB (0 = unlimited)
+max_storage_gb = 0
+
+[validator]
+# Validator Node ID (Ed25519 public key) for P2P registration
+# Get this from validator startup logs
+node_id = "your-validator-node-id"
+
+# Warden Node ID (Ed25519 public key) for PoS challenge authorization
+# Optional - if not set, PoS challenges from warden will be rejected
+# Get this from warden startup logs
+# warden_node_id = "your-warden-node-id"
+
+# Heartbeat interval in seconds
+heartbeat_interval_secs = 30
+
+# Registration retry delay in seconds
+registration_retry_secs = 60
+
+[tuning]
+# Backpressure / concurrency knobs (also overridable via env vars)
+# - MINER_STORE_CONCURRENCY
+# - MINER_PULL_CONCURRENCY
+# - MINER_FETCH_CONCURRENCY
+store_concurrency = 64
+pull_concurrency = 32
+fetch_concurrency = 256

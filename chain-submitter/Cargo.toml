@@ -1,0 +1,51 @@
+[package]
+name = "chain-submitter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+tokio = { version = "1.32", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.11", features = [
+    "json",
+    "gzip",
+    "brotli",
+    "deflate",
+    "rustls-tls",
+] }
+clap = { version = "4.4", features = ["derive", "env"] }
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+common = { path = "../common" }
+
+# Substrate / Subxt client
+subxt = { version = "0.44", default-features = false, features = [
+    "native",
+    "jsonrpsee",
+] }
+subxt-signer = "0.44"
+parity-scale-codec = { version = "3", features = ["derive"] }
+hex = "0.4"
+blake3 = "1.5"
+bip39 = "2.2"
+iroh = "0.95.1"
+iroh-base = { version = "0.95.1", features = ["key"] }
+
+# HTTP server for warden attestation endpoint
+axum = "0.8"
+ed25519-dalek = "2"
+dashmap = "6"
+rand = "0.9"
+futures = "0.3"
+
+[[bin]]
+name = "chain-registry-cache"
+path = "src/bin/chain-registry-cache.rs"
+
+[[bin]]
+name = "test-chain-storage"
+path = "src/bin/test-chain-storage.rs"

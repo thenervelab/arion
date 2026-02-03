@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "common",
+    "miner",
+    "gateway",
+    "validator",
+    "admin-cli",
+    "listener",
+    "chain-submitter",
+    "miner-cli",
+    "tools",
+    "warden",
+    "pos-circuits",
+    "proptests",
+]
+resolver = "2"
+
+[workspace.dependencies]
+axum-server = { version = "0.7", features = ["tls-openssl"] }
+openssl = { version = "0.10", features = ["vendored"] }
+proptest = "1.4"
+test-case = "3.3"

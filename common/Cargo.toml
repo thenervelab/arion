@@ -1,0 +1,37 @@
+[package]
+name = "common"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+# Enable Ed25519 signature verification for attestations
+verify = ["ed25519-dalek"]
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reed-solomon-erasure = "6.0"
+iroh = "0.95.1"
+iroh-base = "0.95.1"
+iroh-blobs = "0.97.0"
+# For CRUSH placement algorithm - using xxhash for deterministic hashing
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+tracing = "0.1"
+axum = { version = "0.8", features = ["macros"] }
+axum-server = { version = "0.7", features = ["tls-openssl"] }
+openssl = { version = "0.10", features = ["vendored"] }
+tower = "0.5"
+convert_case = "0.6"
+tokio = { version = "1", features = ["process"] }
+subtle = "2.5"
+# For attestation bundle SCALE encoding
+parity-scale-codec = { version = "3.6", features = ["derive"] }
+scale-info = { version = "2.11", features = ["derive"] }
+# For merkle tree hashing
+blake3 = "1.5"
+# Optional: Ed25519 signature verification (enabled with "verify" feature)
+ed25519-dalek = { version = "2.1", optional = true }
+# For serde support of large arrays (e.g., [u8; 64] for signatures)
+serde-big-array = "0.5"

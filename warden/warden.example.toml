@@ -1,0 +1,31 @@
+# Warden Configuration
+# Copy to warden.toml and customize
+
+# Data directory for warden state (P2P keypair, node_id, etc.)
+# The warden's P2P node ID is persisted here for stable identity across restarts
+data_dir = "data/warden"
+
+# Path to Ed25519 keypair for signing attestations
+keypair_path = "data/warden/keypair.bin"
+
+# Sled database path for persistent shard storage
+# Shards survive restarts; no need for validators to re-push commitments
+db_path = "data/warden/shards.db"
+
+# HTTP listen address (validator push, health, metrics)
+listen_addr = "0.0.0.0:3003"
+
+# Chain submitter service URL
+chain_submitter_url = "http://localhost:3004"
+
+# Audit interval in seconds
+audit_interval_secs = 30
+
+# Number of shards to audit per interval
+shards_per_audit = 10
+
+# Challenge timeout in seconds (after which Timeout attestation is created)
+challenge_timeout_secs = 60
+
+# Number of chunk indices per challenge
+chunks_per_challenge = 4

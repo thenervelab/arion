@@ -1,0 +1,106 @@
+# Hippius Validator Configuration
+# Copy this file to validator.toml and customize
+
+[network]
+# HTTP API port
+port = 3002
+
+# Iroh relay URL for P2P connectivity
+relay_url = "https://relay.hippius.com"
+
+# Data directory for persistent storage
+data_dir = "data/validator"
+
+[backup.full]
+# Complete database snapshot
+enabled = true
+interval_hours = 24
+retention_days = 30
+
+[backup.differential]
+# Changes since last full backup
+enabled = true
+interval_hours = 6
+retention_days = 7
+
+[backup.incremental]
+# Changes since last backup (any type)
+enabled = true
+interval_minutes = 30
+retention_days = 3
+
+[backup.blobs]
+# Incremental blob backup - syncs erasure-coded shard blobs to S3
+# Since blobs are content-addressed (BLAKE3 hash = filename), only new blobs are uploaded
+# S3 key structure: {prefix}/blobs/{hash[0:2]}/{hash[2:4]}/{full_hash}
+# Also overridable via env vars:
+# - BLOB_BACKUP_ENABLED
+# - BLOB_BACKUP_SYNC_INTERVAL_MINUTES
+# - BLOB_BACKUP_BATCH_SIZE
+# - BLOB_BACKUP_UPLOAD_CONCURRENCY
+enabled = false
+sync_interval_minutes = 15
+batch_size = 100
+upload_concurrency = 8
+prefix = "blobs"
+
+[families]
+# Enable family verification during miner registration
+# When enabled, miners must be whitelisted in the families API to register
+enabled = false
+
+
+# How often to refresh the families list (seconds)
+refresh_interval_secs = 300
+
+[tuning]
+# Backpressure / rebuild loop knobs (also overridable via env vars)
+# - REBUILD_ENABLED
+# - REBUILD_TICK_SECS
+# - REBUILD_FILES_PER_TICK
+# - REBUILD_STRIPES_PER_FILE
+# - REBUILD_CONCURRENCY
+# - MINER_OUT_THRESHOLD_SECS
+rebuild_enabled = true
+rebuild_tick_secs = 10
+rebuild_files_per_tick = 5
+rebuild_stripes_per_file = 25
+rebuild_concurrency = 2
+miner_out_threshold_secs = 600
+
+# Placement weight update knobs (also overridable via env vars)
+# - WEIGHT_UPDATE_ENABLED
+# - WEIGHT_UPDATE_TICK_SECS
+# - WEIGHT_UPDATE_MIN_CHANGE_PCT
+weight_update_enabled = false
+weight_update_tick_secs = 3600
+weight_update_min_change_pct = 20
+
+[p2p]
+# P2P protocol authorization (empty = allow all, for development)
+# In production, specify the hex-encoded Ed25519 public keys of authorized nodes.
+# Also overridable via env vars (comma-separated):
+# - P2P_AUTHORIZED_GATEWAYS
+# - P2P_AUTHORIZED_WARDENS
+# - P2P_AUTHORIZED_SUBMITTERS
+
+# Authorized gateway node IDs
+authorized_gateways = []
+
+# Authorized warden node IDs
+authorized_wardens = []
+
+# Authorized chain-submitter node IDs
+authorized_submitters = []
+
+[chain_submitter]
+# Chain-submitter P2P connection for attestation commitment push.
+# When configured, the validator will push epoch attestation commitments
+# to the chain-submitter via P2P at epoch boundaries for on-chain submission.
+# Also overridable via env var:
+# - CHAIN_SUBMITTER_NODE_ID
+#
+# To get the chain-submitter node ID:
+#   kubectl logs -n hippius-arion deployment/chain-submitter | grep "node_id"
+#
+# node_id = "hex-encoded-ed25519-public-key"

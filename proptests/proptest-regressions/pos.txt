@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 41bc3c0194926e1da280524bd8dc0bd597ddc330fea1bee75747fe68f64ff7a0 # shrinks to nonce1 = [167, 137, 184, 252, 65, 150, 228, 71, 4, 120, 233, 116, 8, 188, 47, 243, 166, 74, 57, 172, 115, 137, 227, 156, 246, 191, 127, 183, 197, 233, 29, 101], nonce2 = [99, 92, 132, 176, 172, 135, 112, 114, 119, 78, 180, 245, 95, 83, 175, 142, 164, 163, 221, 99, 145, 87, 43, 175, 185, 49, 128, 93, 40, 39, 192, 79], chunk_count = 11, num_challenges = 2
