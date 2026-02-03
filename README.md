@@ -4,6 +4,10 @@
 
 Decentralized storage subnet built on [Iroh](https://iroh.computer/) with Reed-Solomon erasure coding, CRUSH placement, and automated recovery. Part of the Hippius infrastructure on Bittensor.
 
+> [!CAUTION]
+> **Active Development**: This project is currently in active development. Features, APIs, and storage formats are subject to change without notice. Use at your own risk.
+
+
 ## Architecture
 
 ```
