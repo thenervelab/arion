@@ -4,7 +4,6 @@ members = [
     "miner",
     "gateway",
     "validator",
-    "admin-cli",
     "listener",
     "chain-submitter",
     "miner-cli",
