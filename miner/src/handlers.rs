@@ -6,20 +6,20 @@ use axum::Json;
 use axum::extract::{Multipart, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use tracing::debug;
+use tracing::trace;
 
 /// Request logging middleware
 pub async fn log_request(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> impl IntoResponse {
-    debug!(method = %req.method(), uri = %req.uri(), "Received request");
+    trace!(method = %req.method(), uri = %req.uri(), "Received request");
     next.run(req).await
 }
 
 /// Fallback handler for unknown routes
 pub async fn fallback_handler(uri: axum::http::Uri) -> impl IntoResponse {
-    debug!(uri = %uri, "404 - No route found");
+    trace!(uri = %uri, "404 - No route found");
     (StatusCode::NOT_FOUND, format!("No route for {}", uri))
 }
 
@@ -110,11 +110,11 @@ pub async fn add_blob(
     };
 
     let hash = outcome.hash;
-    debug!(hash = %hash, "Stored blob");
+    trace!(hash = %hash, "Stored blob");
     let node_addr = iroh::EndpointAddr::from(state.endpoint.secret_key().public());
     let ticket = iroh_blobs::ticket::BlobTicket::new(node_addr, hash, iroh_blobs::BlobFormat::Raw);
     let ticket_str = ticket.to_string().replace("blob", "hip");
-    debug!(ticket = %ticket_str, "Generated ticket");
+    trace!(ticket = %ticket_str, "Generated ticket");
     Json(ticket_str).into_response()
 }
 

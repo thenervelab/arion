@@ -165,7 +165,6 @@ Storage node that stores shards via Iroh blob store.
 | `STORAGE_PATH` | - | Path to store data |
 | `FAMILY_ID` | - | Family ID for CRUSH diversity |
 | `VALIDATOR_NODE_ID` | - | Validator's Iroh node ID |
-| `WARDEN_NODE_ID` | - | Warden's Iroh node ID for PoS audits |
 
 **Additional Binaries:**
 

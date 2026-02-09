@@ -10,6 +10,7 @@ mod helpers;
 mod p2p;
 mod rebalance;
 mod state;
+mod version_check;
 
 use constants::MAX_HTTP_BODY_SIZE;
 
@@ -29,7 +30,9 @@ use iroh::protocol::Router;
 use iroh_blobs::BlobsProtocol;
 use iroh_blobs::store::fs::FsStore;
 use p2p::MinerControlHandler;
-use state::{AppState, get_blobs_dir, get_needs_reregistration, get_validator_endpoint};
+use state::{
+    AppState, get_blobs_dir, get_needs_reregistration, get_validator_endpoint, get_warden_node_ids,
+};
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -230,20 +233,8 @@ async fn handle_subcommand(command: Commands) -> Result<()> {
 }
 
 async fn run_miner(cli: Cli) -> Result<()> {
-    info!("");
-    info!(" /$$   /$$ /$$$$$$ /$$$$$$$  /$$$$$$$  /$$$$$$ /$$   /$$  /$$$$$$ ");
-    info!("| $$  | $$|_  $$_/| $$__  $$| $$__  $$|_  $$_/| $$  | $$ /$$__  $$");
-    info!("| $$  | $$  | $$  | $$  \\ $$| $$  \\ $$  | $$  | $$  | $$| $$  \\__/");
-    info!("| $$$$$$$$  | $$  | $$$$$$$/| $$$$$$$/  | $$  | $$  | $$|  $$$$$$ ");
-    info!("| $$__  $$  | $$  | $$____/ | $$____/   | $$  | $$  | $$ \\____  $$");
-    info!("| $$  | $$  | $$  | $$      | $$        | $$  | $$  | $$ /$$  \\ $$");
-    info!("| $$  | $$ /$$$$$$| $$      | $$       /$$$$$$|  $$$$$$/|  $$$$$$/");
-    info!("|__/  |__/|______/|__/      |__/      |______/ \\______/  \\______/ ");
-    info!("");
-    info!("=========================================================================");
-    info!("                      Hippius Miner Starting");
-    info!("=========================================================================");
     info!(version = env!("CARGO_PKG_VERSION"), "Starting miner");
+    tokio::spawn(version_check::check_for_updates());
 
     // Load config from TOML file with env overrides
     let config = match config::MinerConfig::load(None) {
@@ -356,8 +347,11 @@ async fn run_miner(cli: Cli) -> Result<()> {
         })
         .transpose()?;
 
-    if let Some(ref warden_id) = warden_node_id {
-        info!(warden = %truncate_for_log(warden_id, 16), "Warden PoS challenges authorized");
+    // Initialize dynamic warden node IDs from config (will be updated by validator heartbeats)
+    if let Some(wpk) = warden_pubkey {
+        let mut ids = get_warden_node_ids().write().await;
+        ids.push(wpk);
+        info!(warden = %truncate_for_log(warden_node_id.as_deref().unwrap_or(""), 16), "Warden PoS challenges authorized");
     }
 
     info!(validator = %truncate_for_log(&validator_node_id_str, 16), "Registering with validator via P2P");
@@ -393,7 +387,6 @@ async fn run_miner(cli: Cli) -> Result<()> {
         fetch_sem: Arc::new(tokio::sync::Semaphore::new(fetch_concurrency)),
         pos_sem: Arc::new(tokio::sync::Semaphore::new(pos_concurrency)),
         validator_node_id: Some(validator_pubkey),
-        warden_node_id: warden_pubkey,
     };
     let _router = Router::builder(endpoint.clone())
         .accept(iroh_blobs::ALPN, blobs.clone())
@@ -743,7 +736,7 @@ fn spawn_heartbeat_loop(
                 && let Ok(new_pubkey) = iroh::PublicKey::from_str(&new_validator_id)
                 && new_pubkey != current_validator_pubkey
             {
-                info!(
+                debug!(
                     old = %truncate_for_log(&current_validator_pubkey.to_string(), 16),
                     new = %truncate_for_log(&new_validator_id, 16),
                     "Validator address refreshed from environment"
@@ -830,6 +823,38 @@ fn spawn_heartbeat_loop(
                             get_needs_reregistration()
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
                             return Err(anyhow::anyhow!("Re-registration needed"));
+                        }
+
+                        // Try to parse JSON response for warden node IDs (new validator format)
+                        if let Ok(response) = serde_json::from_str::<serde_json::Value>(&ack_str)
+                            && let Some(ids) =
+                                response.get("warden_node_ids").and_then(|v| v.as_array())
+                        {
+                            let mut new_ids = Vec::new();
+                            for id in ids {
+                                if let Some(s) = id.as_str()
+                                    && let Ok(pk) = iroh::PublicKey::from_str(s)
+                                {
+                                    new_ids.push(pk);
+                                }
+                            }
+                            if !new_ids.is_empty() {
+                                // Sort for deterministic comparison (validator sends from HashSet)
+                                new_ids.sort();
+                                let warden_ids = get_warden_node_ids().read().await;
+                                if *warden_ids != new_ids {
+                                    drop(warden_ids);
+                                    let mut warden_ids = get_warden_node_ids().write().await;
+                                    // Double-check after acquiring write lock
+                                    if *warden_ids != new_ids {
+                                        debug!(
+                                            count = new_ids.len(),
+                                            "Updated warden node IDs from validator heartbeat"
+                                        );
+                                        *warden_ids = new_ids;
+                                    }
+                                }
+                            }
                         }
 
                         Ok::<_, anyhow::Error>(())

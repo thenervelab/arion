@@ -75,6 +75,9 @@ static BLOB_CACHE: OnceLock<Arc<Cache<String, Arc<Vec<u8>>>>> = OnceLock::new();
 /// Flag to signal that re-registration is needed (set when validator returns UNKNOWN)
 static NEEDS_REREGISTRATION: OnceLock<Arc<std::sync::atomic::AtomicBool>> = OnceLock::new();
 
+/// Dynamic warden node IDs for PoS challenge authorization (auto-distributed by validator)
+static WARDEN_NODE_IDS: OnceLock<Arc<RwLock<Vec<iroh::PublicKey>>>> = OnceLock::new();
+
 pub fn get_peer_cache() -> &'static DashMap<String, iroh::EndpointAddr> {
     PEER_MINER_CACHE.get_or_init(DashMap::new)
 }
@@ -110,6 +113,10 @@ pub fn get_blob_cache() -> &'static Arc<Cache<String, Arc<Vec<u8>>>> {
 
 pub fn get_needs_reregistration() -> &'static Arc<std::sync::atomic::AtomicBool> {
     NEEDS_REREGISTRATION.get_or_init(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+}
+
+pub fn get_warden_node_ids() -> &'static Arc<RwLock<Vec<iroh::PublicKey>>> {
+    WARDEN_NODE_IDS.get_or_init(|| Arc::new(RwLock::new(Vec::new())))
 }
 
 /// Get a pooled connection or create a new one

@@ -412,6 +412,9 @@ pub enum MinerControlMessage {
         peers: Vec<(String, String)>,
         /// Full cluster map JSON for CRUSH calculations (enables self-rebalancing)
         cluster_map_json: Option<String>,
+        /// Authorized warden node IDs for PoS challenge authorization (auto-distributed by validator)
+        #[serde(default)]
+        warden_node_ids: Option<Vec<String>>,
     },
     /// Query files in a Placement Group (Miner → Validator)
     QueryPgFiles {

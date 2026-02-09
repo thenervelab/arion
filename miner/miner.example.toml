@@ -34,10 +34,8 @@ max_storage_gb = 0
 # Get this from validator startup logs
 node_id = "your-validator-node-id"
 
-# Warden Node ID (Ed25519 public key) for PoS challenge authorization
-# Optional - if not set, PoS challenges from warden will be rejected
-# Get this from warden startup logs
-# warden_node_id = "your-warden-node-id"
+# Warden node IDs are automatically distributed by the validator
+# via heartbeat responses and cluster map updates - no manual config needed
 
 # Heartbeat interval in seconds
 heartbeat_interval_secs = 30

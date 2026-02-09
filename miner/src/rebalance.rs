@@ -16,7 +16,7 @@ use iroh::endpoint::Endpoint;
 use iroh_blobs::store::fs::FsStore;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// PG-based self-rebalancing: Calculate which PGs this miner is responsible for,
 /// query validator for files in each PG, and pull any missing shards
@@ -29,7 +29,7 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
     endpoint.secret_key().public().to_string().hash(&mut hasher);
     let my_uid = (hasher.finish() as u32) & 0x7FFFFFFF;
 
-    debug!(miner_uid = my_uid, "My miner UID");
+    trace!(miner_uid = my_uid, "My miner UID");
 
     // Epoch lookback for locating shards during transitions
     let epoch_lookback: u64 = std::env::var("EPOCH_LOOKBACK")
@@ -70,7 +70,7 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
 
     // Calculate which PGs we are responsible for
     let my_pgs = common::calculate_my_pgs(my_uid, &cluster_map);
-    debug!(
+    trace!(
         pg_count = my_pgs.len(),
         total_pgs = cluster_map.pg_count,
         "Responsible for PGs"
@@ -81,7 +81,7 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
         return Ok(());
     }
 
-    debug!(pgs = ?my_pgs.iter().take(10).collect::<Vec<_>>(), "My PG assignments (first 10)");
+    trace!(pgs = ?my_pgs.iter().take(10).collect::<Vec<_>>(), "My PG assignments (first 10)");
 
     // Query validator for files in ALL our PGs in a single batch request
     let mut total_files = 0;
@@ -99,7 +99,7 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
     let connect_timeout = std::time::Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS);
     let read_timeout = std::time::Duration::from_secs(60); // Longer timeout for batch response
 
-    info!(
+    debug!(
         pg_count = my_pgs.len(),
         "Querying validator for files in assigned PGs (batch)"
     );
@@ -151,21 +151,21 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
         }
     };
 
-    info!(
+    debug!(
         pgs_with_files = pg_files_map.len(),
         "Received batch PG query response"
     );
 
     // Process all files from the batch response (with limits to prevent memory exhaustion)
     'pg_loop: for (pg_id, files) in pg_files_map.iter() {
-        debug!(pg_id = pg_id, file_count = files.len(), "Processing PG");
+        trace!(pg_id = pg_id, file_count = files.len(), "Processing PG");
         total_files += files.len();
 
         // For each file, fetch manifest and check which shards we should have
         for file_hash in files.iter() {
             // Check file processing limit
             if files_processed >= REBALANCE_MAX_FILES_PER_CYCLE {
-                info!(
+                debug!(
                     limit = REBALANCE_MAX_FILES_PER_CYCLE,
                     processed = files_processed,
                     "Hit file processing limit, continuing in next cycle"
@@ -290,7 +290,7 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
                                             break;
                                         }
                                         Err(e) => {
-                                            debug!(error = %e, peer = %pk, "Pull attempt failed");
+                                            trace!(error = %e, peer = %pk, "Pull attempt failed");
                                         }
                                     }
                                 }
@@ -317,7 +317,7 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
         }
     }
 
-    info!(
+    debug!(
         files_total = total_files,
         files_processed = files_processed,
         expected_shards = expected_shards.len(),
@@ -399,7 +399,7 @@ async fn gc_orphan_shards(expected_shards: &std::collections::HashSet<String>) {
                                 // Check if grace period expired
                                 if now - first_seen > ORPHAN_GRACE_PERIOD_SECS {
                                     // Delete this orphan
-                                    debug!(
+                                    trace!(
                                         hash = %truncate_for_log(&hash_str, 16),
                                         age_secs = now - first_seen,
                                         "GC: Deleting orphan"
@@ -435,7 +435,7 @@ async fn gc_orphan_shards(expected_shards: &std::collections::HashSet<String>) {
             }
 
             if orphan_count > 0 || deleted_count > 0 {
-                info!(
+                debug!(
                     expected = kept_count,
                     orphans_tracked = orphan_count,
                     deleted = deleted_count,

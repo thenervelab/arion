@@ -7,9 +7,12 @@ use crate::constants::{
 use crate::helpers::truncate_for_log;
 use crate::state::{
     get_blob_cache, get_blobs_dir, get_cluster_map, get_current_epoch, get_peer_cache,
+    get_warden_node_ids,
 };
 use anyhow::Result;
+use futures::StreamExt;
 use iroh::endpoint::Endpoint;
+use iroh_blobs::BlobFormat;
 use iroh_blobs::store::fs::FsStore;
 use pos_circuits::commitment::CommitmentWithTree;
 use pos_circuits::prover::generate_proof;
@@ -18,7 +21,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, trace, warn};
 
 /// Global semaphore to limit concurrent P2P stream handlers
 /// Prevents OOM from connection flood attacks spawning unbounded tasks
@@ -50,15 +53,20 @@ fn is_authorized(
 }
 
 /// Check if the remote node is authorized for PoS challenges (validator or warden)
-fn is_authorized_for_pos(
+async fn is_authorized_for_pos(
     remote_node_id: &iroh::PublicKey,
     validator_node_id: Option<&iroh::PublicKey>,
-    warden_node_id: Option<&iroh::PublicKey>,
 ) -> bool {
-    // Allow if: no validator configured (dev mode), or sender is validator, or sender is warden
-    validator_node_id.is_none()
-        || validator_node_id.is_some_and(|v| remote_node_id == v)
-        || warden_node_id.is_some_and(|w| remote_node_id == w)
+    // Allow if: no validator configured (dev mode), or sender is validator
+    if validator_node_id.is_none() {
+        return true;
+    }
+    if validator_node_id.is_some_and(|v| remote_node_id == v) {
+        return true;
+    }
+    // Check dynamic warden node IDs (auto-distributed by validator)
+    let warden_ids = get_warden_node_ids().read().await;
+    warden_ids.iter().any(|w| remote_node_id == w)
 }
 
 /// Result of attempting to acquire a semaphore permit with timeout
@@ -95,7 +103,6 @@ pub struct MinerControlHandler {
     pub fetch_sem: Arc<tokio::sync::Semaphore>,
     pub pos_sem: Arc<tokio::sync::Semaphore>,
     pub validator_node_id: Option<iroh::PublicKey>,
-    pub warden_node_id: Option<iroh::PublicKey>,
 }
 
 impl iroh::protocol::ProtocolHandler for MinerControlHandler {
@@ -103,7 +110,7 @@ impl iroh::protocol::ProtocolHandler for MinerControlHandler {
         &self,
         conn: iroh::endpoint::Connection,
     ) -> impl futures::Future<Output = Result<(), iroh::protocol::AcceptError>> + Send {
-        debug!(remote = %conn.remote_id(), "MinerControlHandler::accept called");
+        trace!(remote = %conn.remote_id(), "MinerControlHandler::accept called");
         let store = self.store.clone();
         let endpoint = self.endpoint.clone();
         let store_sem = self.store_sem.clone();
@@ -111,7 +118,6 @@ impl iroh::protocol::ProtocolHandler for MinerControlHandler {
         let fetch_sem = self.fetch_sem.clone();
         let pos_sem = self.pos_sem.clone();
         let validator_node_id = self.validator_node_id;
-        let warden_node_id = self.warden_node_id;
         async move {
             handle_miner_control(
                 conn,
@@ -122,7 +128,6 @@ impl iroh::protocol::ProtocolHandler for MinerControlHandler {
                 fetch_sem,
                 pos_sem,
                 validator_node_id,
-                warden_node_id,
             )
             .await
             .map_err(|e| iroh::protocol::AcceptError::from_err(std::io::Error::other(e)))
@@ -145,10 +150,9 @@ pub async fn handle_miner_control(
     fetch_sem: Arc<tokio::sync::Semaphore>,
     pos_sem: Arc<tokio::sync::Semaphore>,
     validator_node_id: Option<iroh::PublicKey>,
-    warden_node_id: Option<iroh::PublicKey>,
 ) -> Result<()> {
     let remote_node_id = connection.remote_id();
-    debug!(remote = %remote_node_id, "Accepted MinerControl connection");
+    trace!(remote = %remote_node_id, "Accepted MinerControl connection");
 
     // Loop accepting streams until connection is closed
     loop {
@@ -156,7 +160,7 @@ pub async fn handle_miner_control(
             Ok(streams) => streams,
             Err(e) => {
                 // Connection closed by peer or error - this is expected
-                debug!(remote = %remote_node_id, error = %e, "Connection closed");
+                trace!(remote = %remote_node_id, error = %e, "Connection closed");
                 break;
             }
         };
@@ -193,7 +197,6 @@ pub async fn handle_miner_control(
                 recv,
                 &remote_node_id,
                 validator_node_id.as_ref(),
-                warden_node_id.as_ref(),
                 &store,
                 &endpoint,
                 &store_sem,
@@ -218,7 +221,6 @@ async fn handle_single_stream(
     mut recv: iroh::endpoint::RecvStream,
     remote_node_id: &iroh::PublicKey,
     validator_node_id: Option<&iroh::PublicKey>,
-    warden_node_id: Option<&iroh::PublicKey>,
     store: &FsStore,
     endpoint: &Endpoint,
     store_sem: &Arc<tokio::sync::Semaphore>,
@@ -259,6 +261,7 @@ async fn handle_single_stream(
             epoch,
             peers,
             cluster_map_json,
+            warden_node_ids,
         } => {
             handle_cluster_map_update(
                 remote_node_id,
@@ -267,6 +270,7 @@ async fn handle_single_stream(
                 epoch,
                 peers,
                 cluster_map_json,
+                warden_node_ids,
             )
             .await?;
         }
@@ -308,8 +312,8 @@ async fn handle_single_stream(
         } => {
             // Authorization: Only allow PoS challenges from validator or warden
             // This prevents DoS attacks and information disclosure from arbitrary peers
-            if !is_authorized_for_pos(remote_node_id, validator_node_id, warden_node_id) {
-                warn!(remote = %remote_node_id, "PosChallenge rejected: unauthorized sender");
+            if !is_authorized_for_pos(remote_node_id, validator_node_id).await {
+                debug!(remote = %remote_node_id, "PosChallenge rejected: unauthorized sender");
                 return send_response(&mut send, b"ERROR: UNAUTHORIZED").await;
             }
 
@@ -317,7 +321,7 @@ async fn handle_single_stream(
             let _permit = match pos_sem.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    warn!(shard = %truncate_for_log(&shard_hash, 16), "PosChallenge rate limited");
+                    debug!(shard = %truncate_for_log(&shard_hash, 16), "PosChallenge rate limited");
                     return send_response(&mut send, b"RATE_LIMITED").await;
                 }
             };
@@ -357,7 +361,7 @@ async fn handle_store(
         return send_response(send, b"ERROR: UNAUTHORIZED").await;
     }
 
-    debug!(hash = %hash, "Received Store command");
+    trace!(hash = %hash, "Received Store command");
 
     match (data, source_miner) {
         // CASE 1: Push from validator (initial upload)
@@ -370,12 +374,12 @@ async fn handle_store(
                     return send_response(send, b"ERROR: Internal error").await;
                 }
                 PermitResult::Timeout => {
-                    warn!(hash = %hash, "Store command timed out waiting for permit");
+                    debug!(hash = %hash, "Store command timed out waiting for permit");
                     return send_response(send, b"RATE_LIMITED").await;
                 }
             };
 
-            debug!(hash = %hash, size = blob_data.len(), "Receiving blob from validator");
+            trace!(hash = %hash, size = blob_data.len(), "Receiving blob from validator");
 
             // Verify requested hash parses and matches what we actually store
             let requested = match iroh_blobs::Hash::from_str(&hash) {
@@ -403,7 +407,7 @@ async fn handle_store(
                 return send_response(send, b"ERROR: Hash mismatch").await;
             }
 
-            debug!(hash = %outcome.hash, "Stored blob");
+            trace!(hash = %outcome.hash, "Stored blob");
 
             // Send ACK and wait for remote to receive it
             send_response(send, b"OK").await?;
@@ -419,12 +423,12 @@ async fn handle_store(
                     return send_response(send, b"ERROR: Internal error").await;
                 }
                 PermitResult::Timeout => {
-                    warn!(hash = %hash, miner_id = %miner_id, "Pull command timed out waiting for permit");
+                    debug!(hash = %hash, miner_id = %miner_id, "Pull command timed out waiting for permit");
                     return send_response(send, b"RATE_LIMITED").await;
                 }
             };
 
-            debug!(hash = %hash, miner_id = %miner_id, "Downloading blob from miner");
+            trace!(hash = %hash, miner_id = %miner_id, "Downloading blob from miner");
 
             // Await download completion BEFORE sending ACK
             let result = tokio::time::timeout(
@@ -444,7 +448,7 @@ async fn handle_store(
             // Send ACK based on actual result
             let response: &[u8] = match &result {
                 Ok(Ok(())) => {
-                    debug!(hash = %hash, "Downloaded blob from peer miner");
+                    trace!(hash = %hash, "Downloaded blob from peer miner");
                     b"OK"
                 }
                 Ok(Err(e)) => {
@@ -482,7 +486,7 @@ async fn handle_delete(
         return send_response(send, b"ERROR: UNAUTHORIZED").await;
     }
 
-    debug!(hash = %hash, "Received Delete command");
+    trace!(hash = %hash, "Received Delete command");
 
     // Parse hash
     let hash_parsed = match iroh_blobs::Hash::from_str(&hash) {
@@ -493,16 +497,73 @@ async fn handle_delete(
         }
     };
 
-    // Best-effort: physically remove blob bytes from disk
+    let canonical_hash = hash_parsed.to_string();
+
+    // Step 1: Delete any tags associated with this blob hash
+    // This unprotects the blob from GC, allowing it to be cleaned up.
+    // Note: Tags are auto-generated by add_bytes(), so we need to find them by hash.
+    let mut tags_deleted = 0u64;
+    match store.tags().list().await {
+        Ok(mut tag_stream) => {
+            while let Some(tag_result) = tag_stream.next().await {
+                match tag_result {
+                    Ok(tag_info) => {
+                        // Check if this tag references our blob hash (Raw format for shards)
+                        if tag_info.hash == hash_parsed && tag_info.format == BlobFormat::Raw {
+                            match store.tags().delete(&tag_info.name).await {
+                                Ok(count) => {
+                                    tags_deleted += count;
+                                    trace!(
+                                        hash = %truncate_for_log(&canonical_hash, 32),
+                                        tag = ?tag_info.name,
+                                        "Deleted tag for blob"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        hash = %truncate_for_log(&canonical_hash, 32),
+                                        tag = ?tag_info.name,
+                                        error = %e,
+                                        "Failed to delete tag"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Error reading tag during delete");
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                hash = %truncate_for_log(&canonical_hash, 32),
+                error = %e,
+                "Failed to list tags for deletion"
+            );
+        }
+    }
+
+    if tags_deleted > 0 {
+        trace!(
+            hash = %truncate_for_log(&canonical_hash, 32),
+            tags_deleted,
+            "Deleted tags, blob now eligible for GC"
+        );
+    }
+
+    // Step 2: Best-effort physically remove blob bytes from disk
+    // For large blobs (> 16KB), data is stored in files. For small blobs, data is
+    // inlined in the database and will be cleaned up by GC after tag removal.
     let blobs_path = {
         let bd = get_blobs_dir().read().await;
         bd.clone()
     };
 
-    let mut removed_any = false;
+    let mut removed_file = false;
     if let Some(blobs_dir) = blobs_path {
         let data_dir = blobs_dir.join("data");
-        let canonical_hash = hash_parsed.to_string();
 
         // Try both filename formats: with and without .data extension
         let p1 = data_dir.join(format!("{}.data", canonical_hash));
@@ -511,17 +572,17 @@ async fn handle_delete(
         for p in [p1, p2] {
             match tokio::fs::remove_file(&p).await {
                 Ok(()) => {
-                    debug!(
-                        hash = %truncate_for_log(&hash, 32),
+                    trace!(
+                        hash = %truncate_for_log(&canonical_hash, 32),
                         file = %p.display(),
-                        "Deleted blob bytes"
+                        "Deleted blob file"
                     );
-                    removed_any = true;
+                    removed_file = true;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
                     error!(
-                        hash = %truncate_for_log(&hash, 32),
+                        hash = %truncate_for_log(&canonical_hash, 32),
                         file = %p.display(),
                         error = %e,
                         "Delete: failed to remove file"
@@ -533,23 +594,27 @@ async fn handle_delete(
         error!("Delete: blobs_dir not initialized; cannot delete on disk");
     }
 
-    // If we didn't find files to remove, check whether the store still has the blob
-    if !removed_any {
-        if store.get_bytes(hash_parsed).await.is_ok() {
-            warn!(
-                hash = %truncate_for_log(&hash, 32),
-                "Delete: blob appears present in FsStore but backing file not found; leaving as-is"
-            );
-        } else {
-            warn!(
-                hash = %truncate_for_log(&hash, 32),
-                "Delete: hash not found in store, ignoring"
-            );
-        }
+    // Log outcome
+    if removed_file {
+        trace!(
+            hash = %truncate_for_log(&canonical_hash, 32),
+            "Delete complete: removed file"
+        );
+    } else if tags_deleted > 0 {
+        // Small/inlined blob - tags removed, GC will clean up
+        trace!(
+            hash = %truncate_for_log(&canonical_hash, 32),
+            "Delete complete: tags removed, GC will clean up inlined blob"
+        );
+    } else {
+        // Neither file nor tags found - blob may already be deleted or never existed
+        trace!(
+            hash = %truncate_for_log(&canonical_hash, 32),
+            "Delete: no file or tags found, blob may already be deleted"
+        );
     }
 
-    // Invalidate blob cache entry to prevent serving stale data
-    let canonical_hash = hash_parsed.to_string();
+    // Step 3: Invalidate blob cache entry to prevent serving stale data
     get_blob_cache().remove(&canonical_hash);
 
     // Send ACK
@@ -562,7 +627,7 @@ async fn handle_fetch_blob(
     fetch_sem: &Arc<tokio::sync::Semaphore>,
     hash: String,
 ) -> Result<()> {
-    debug!(hash = %truncate_for_log(&hash, 32), "FetchBlob request");
+    trace!(hash = %truncate_for_log(&hash, 32), "FetchBlob request");
 
     // Backpressure: bound concurrent FetchBlob serving ops
     let _permit = match fetch_sem.clone().try_acquire_owned() {
@@ -592,7 +657,7 @@ async fn handle_fetch_blob(
     // Check blob cache first for better performance
     let blob_cache = get_blob_cache();
     if let Some(cached) = blob_cache.get(&canonical_hash) {
-        debug!(
+        trace!(
             hash = %truncate_for_log(&hash, 16),
             size = cached.len(),
             "FetchBlob: Cache HIT"
@@ -603,7 +668,7 @@ async fn handle_fetch_blob(
     // Read blob data from store
     match store.get_bytes(hash_parsed).await {
         Ok(bytes) if !bytes.is_empty() => {
-            debug!(
+            trace!(
                 hash = %truncate_for_log(&hash, 16),
                 size = bytes.len(),
                 "FetchBlob: Read bytes"
@@ -617,11 +682,11 @@ async fn handle_fetch_blob(
         }
         Ok(_) => {
             // Empty data means blob not found
-            warn!(hash = %truncate_for_log(&hash, 16), "FetchBlob: Blob not found (empty)");
+            debug!(hash = %truncate_for_log(&hash, 16), "FetchBlob: Blob not found (empty)");
             send_response(send, b"ERROR: Not found").await
         }
         Err(e) => {
-            warn!(
+            debug!(
                 hash = %truncate_for_log(&hash, 16),
                 error = %e,
                 "FetchBlob: Failed to read blob"
@@ -638,6 +703,7 @@ async fn handle_cluster_map_update(
     epoch: u64,
     peers: Vec<(String, String)>, // (public_key, endpoint_json)
     cluster_map_json: Option<String>,
+    warden_node_ids: Option<Vec<String>>,
 ) -> Result<()> {
     // Only validator should broadcast map updates
     if !is_authorized(remote_node_id, validator_node_id) {
@@ -658,7 +724,7 @@ async fn handle_cluster_map_update(
 
         // Validate epoch jump to prevent malformed updates
         if epoch > old + MAX_EPOCH_JUMP && old > 0 {
-            warn!(
+            debug!(
                 old_epoch = old,
                 new_epoch = epoch,
                 "Epoch jump too large, ignoring update"
@@ -679,7 +745,7 @@ async fn handle_cluster_map_update(
     }
 
     if epoch_changed {
-        info!(old_epoch = old_epoch, new_epoch = epoch, "Epoch updated");
+        debug!(old_epoch = old_epoch, new_epoch = epoch, "Epoch updated");
     }
 
     // Update peer cache (lock-free DashMap)
@@ -689,7 +755,7 @@ async fn handle_cluster_map_update(
     // On epoch change, clear stale entries to prevent unbounded growth
     if epoch_changed {
         peer_cache.clear();
-        debug!("Cleared peer cache on epoch change");
+        trace!("Cleared peer cache on epoch change");
     }
 
     for (node_id, addr_json) in peers {
@@ -705,7 +771,7 @@ async fn handle_cluster_map_update(
         if let Ok(addr) = serde_json::from_str::<iroh::EndpointAddr>(&addr_json) {
             peer_cache.insert(node_id, addr);
         } else {
-            warn!(node_id = %node_id, "Failed to parse peer endpoint address");
+            debug!(node_id = %node_id, "Failed to parse peer endpoint address");
         }
     }
 
@@ -713,7 +779,7 @@ async fn handle_cluster_map_update(
     // Validate size before parsing to prevent OOM from malicious large payloads
     if let Some(json) = cluster_map_json {
         if json.len() > MAX_CLUSTER_MAP_JSON_SIZE {
-            warn!(
+            debug!(
                 size = json.len(),
                 max = MAX_CLUSTER_MAP_JSON_SIZE,
                 "cluster_map_json exceeds size limit, ignoring"
@@ -725,7 +791,33 @@ async fn handle_cluster_map_update(
                     *map_guard = Some(Arc::new(map));
                 }
                 Err(e) => {
-                    warn!(error = %e, "Failed to parse cluster_map_json");
+                    debug!(error = %e, "Failed to parse cluster_map_json");
+                }
+            }
+        }
+    }
+
+    // Update warden node IDs if provided by validator
+    if let Some(ids) = warden_node_ids {
+        let mut new_ids = Vec::new();
+        for id_str in &ids {
+            if let Ok(pk) = iroh::PublicKey::from_str(id_str) {
+                new_ids.push(pk);
+            }
+        }
+        if !new_ids.is_empty() {
+            // Sort for deterministic comparison (validator sends from HashSet)
+            new_ids.sort();
+            let warden_ids = get_warden_node_ids().read().await;
+            if *warden_ids != new_ids {
+                drop(warden_ids);
+                let mut warden_ids = get_warden_node_ids().write().await;
+                if *warden_ids != new_ids {
+                    debug!(
+                        count = new_ids.len(),
+                        "Updated warden node IDs from ClusterMapUpdate"
+                    );
+                    *warden_ids = new_ids;
                 }
             }
         }
@@ -752,7 +844,7 @@ async fn handle_pull_from_peer(
         return send_response(send, b"ERROR: UNAUTHORIZED").await;
     }
 
-    debug!(hash = %truncate_for_log(&hash, 32), "Received PullFromPeer command");
+    trace!(hash = %truncate_for_log(&hash, 32), "Received PullFromPeer command");
 
     // Backpressure: bound concurrent peer pulls
     let permit = match acquire_permit_with_timeout(pull_sem.clone(), 30).await {
@@ -762,7 +854,7 @@ async fn handle_pull_from_peer(
             return send_response(send, b"ERROR: Internal error").await;
         }
         PermitResult::Timeout => {
-            warn!(hash = %truncate_for_log(&hash, 32), "PullFromPeer command timed out waiting for permit");
+            debug!(hash = %truncate_for_log(&hash, 32), "PullFromPeer command timed out waiting for permit");
             return send_response(send, b"RATE_LIMITED").await;
         }
     };
@@ -780,7 +872,7 @@ async fn handle_pull_from_peer(
     // Send ACK based on actual result
     let response: &[u8] = match &result {
         Ok(Ok(())) => {
-            debug!(hash = %truncate_for_log(&hash, 16), "Downloaded blob from peer");
+            trace!(hash = %truncate_for_log(&hash, 16), "Downloaded blob from peer");
             b"OK"
         }
         Ok(Err(e)) => {
@@ -802,7 +894,7 @@ pub async fn pull_blob_from_peer(
     peer_addr: iroh::EndpointAddr,
     hash: String,
 ) -> Result<()> {
-    debug!(hash = %truncate_for_log(&hash, 16), "Pulling blob from peer");
+    trace!(hash = %truncate_for_log(&hash, 16), "Pulling blob from peer");
 
     // Connect to peer via miner-control protocol
     let conn = endpoint
@@ -853,7 +945,7 @@ pub async fn pull_blob_from_peer(
         ));
     }
 
-    debug!(hash = %truncate_for_log(&hash, 16), "Pulled and stored blob from peer");
+    trace!(hash = %truncate_for_log(&hash, 16), "Pulled and stored blob from peer");
     Ok(())
 }
 
@@ -864,7 +956,7 @@ pub async fn download_from_peer_miner(
     store: FsStore,
     endpoint: Endpoint,
 ) -> Result<()> {
-    debug!(
+    trace!(
         hash = %truncate_for_log(&hash, 16),
         miner_id = %truncate_for_log(&miner_id, 16),
         "Downloading blob from peer miner"
@@ -934,7 +1026,7 @@ async fn handle_pos_challenge(
         }
     };
 
-    debug!(
+    trace!(
         shard = %truncate_for_log(&shard_hash, 16),
         size = shard_data.len(),
         "Read shard data for proof generation"
@@ -1001,7 +1093,7 @@ async fn handle_pos_challenge(
     let response_json = serde_json::to_vec(&response)?;
     send_response(send, &response_json).await?;
 
-    info!(
+    debug!(
         shard = %truncate_for_log(&shard_hash, 16),
         chunks = chunk_indices.len(),
         proving_time_ms = proving_time_ms,

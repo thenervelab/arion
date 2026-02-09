@@ -11,6 +11,7 @@ The miner is a storage node that:
 - Sends periodic heartbeats to the validator to maintain cluster membership
 - Optionally performs self-rebalancing to pull missing shards after epoch changes
 - Responds to proof-of-storage (PoS) challenges from wardens with ZK proofs
+- Automatically receives authorized warden node IDs from the validator (no manual configuration needed)
 
 ## Quick Start
 
@@ -79,10 +80,6 @@ max_storage_gb = 0
 # Get this from validator startup logs
 node_id = "your-validator-node-id"
 
-# Warden Node ID (optional) for PoS challenge authorization
-# If not set, PoS challenges from warden will be rejected
-# warden_node_id = "your-warden-node-id"
-
 # Heartbeat interval in seconds
 heartbeat_interval_secs = 30
 
@@ -120,7 +117,6 @@ rebalance_tick_secs = 300
 | `STORAGE_PATH` | data/miner/blobs | Blob storage directory |
 | `MAX_STORAGE_GB` | 0 (unlimited) | Storage limit in GB |
 | `VALIDATOR_NODE_ID` | **required** | Validator's Iroh node ID |
-| `WARDEN_NODE_ID` | - | Warden's Iroh node ID for PoS authorization |
 | `IROH_RELAY_URL` | - | Custom relay URL for P2P |
 | `MINER_STORE_CONCURRENCY` | 64 | Concurrent store operations |
 | `MINER_PULL_CONCURRENCY` | 32 | Concurrent peer pull operations |
@@ -142,7 +138,6 @@ Options:
       --storage-path <STORAGE_PATH>   Storage path [env: STORAGE_PATH]
       --family-id <FAMILY_ID>         Family ID [env: FAMILY_ID]
       --validator-node-id <ID>        Validator Node ID [env: VALIDATOR_NODE_ID]
-      --warden-node-id <ID>           Warden Node ID [env: WARDEN_NODE_ID]
   -h, --help                          Print help
   -V, --version                       Print version
 
@@ -249,7 +244,7 @@ Miners respond to PoS challenges from wardens:
 5. Generate ZK proof using Plonky3
 6. Return `PosProofResponse` with proof bytes and public inputs
 
-Authorization: Only requests from the configured validator or warden node ID are accepted.
+Authorization: Only requests from the validator or its authorized wardens are accepted. Warden node IDs are automatically distributed by the validator via heartbeat responses and cluster map updates — no manual configuration is needed.
 
 ## Running Multiple Miners
 
