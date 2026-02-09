@@ -294,11 +294,11 @@ async fn main() -> Result<()> {
                 .layer(axum::middleware::from_fn(handlers::require_admin_key)),
         )
         .route(
-            "/download/:hash",
+            "/download/{hash}",
             axum::routing::get(handlers::download_file),
         )
         .route(
-            "/blobs/:hash",
+            "/blobs/{hash}",
             axum::routing::get(handlers::download_file).delete(handlers::delete_file),
         )
         .route("/stats", axum::routing::get(handlers::get_gateway_stats))
