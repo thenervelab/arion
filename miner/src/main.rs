@@ -447,7 +447,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
         };
         let app = AxumRouter::new()
             .route("/blobs/add", post(handlers::add_blob))
-            .route("/blobs/:hash", get(handlers::get_blob))
+            .route("/blobs/{hash}", get(handlers::get_blob))
             .route("/status", get(handlers::status))
             .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_SIZE)) // Bounded to prevent OOM attacks
             .layer(axum::middleware::from_fn(handlers::log_request))

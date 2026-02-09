@@ -44,8 +44,13 @@ pub const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
 pub const INITIAL_BACKOFF_SECS: u64 = 5;
 pub const MAX_BACKOFF_SECS: u64 = 60;
 
-/// Buffer sizes (reserved for future use)
-pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024; // 1MB
+/// Buffer sizes
+/// 2MB to accommodate V1 JSON-encoded Store messages with larger shards
+pub const MAX_MESSAGE_SIZE: usize = 2 * 1024 * 1024; // 2MB
+/// Maximum raw shard data size for V2 binary framing (4 MiB).
+/// Separate from MAX_MESSAGE_SIZE (which covers V1 JSON overhead).
+/// Matches MAX_FETCH_RESPONSE_SIZE since both bound single-shard payloads.
+pub const MAX_V2_DATA_SIZE: u64 = 4 * 1024 * 1024; // 4MB
 /// Maximum FetchBlob response size (4 MiB)
 /// Based on stripe config: default shard ~200KB (2MB stripe / 10 data shards)
 pub const MAX_FETCH_RESPONSE_SIZE: usize = 4 * 1024 * 1024;

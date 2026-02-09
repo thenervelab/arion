@@ -66,11 +66,15 @@ static ORPHAN_SHARDS: OnceLock<DashMap<String, u64>> = OnceLock::new();
 static BLOBS_DIR: OnceLock<Arc<RwLock<Option<std::path::PathBuf>>>> = OnceLock::new();
 
 /// Connection pool for P2P connections (with TTL)
-static CONNECTION_POOL: OnceLock<Arc<RwLock<HashMap<String, (iroh::endpoint::Connection, u64)>>>> =
-    OnceLock::new();
+/// Key: iroh::PublicKey (32 bytes, Copy) — avoids Debug-formatting the entire EndpointAddr
+static CONNECTION_POOL: OnceLock<
+    Arc<RwLock<HashMap<iroh::PublicKey, (iroh::endpoint::Connection, u64)>>>,
+> = OnceLock::new();
 
 /// Blob cache for FetchBlob responses
-static BLOB_CACHE: OnceLock<Arc<Cache<String, Arc<Vec<u8>>>>> = OnceLock::new();
+/// Key: iroh_blobs::Hash (32 bytes, Copy — no heap alloc for key)
+/// Value: bytes::Bytes (refcounted — clone is just a refcount bump)
+static BLOB_CACHE: OnceLock<Arc<Cache<iroh_blobs::Hash, bytes::Bytes>>> = OnceLock::new();
 
 /// Flag to signal that re-registration is needed (set when validator returns UNKNOWN)
 static NEEDS_REREGISTRATION: OnceLock<Arc<std::sync::atomic::AtomicBool>> = OnceLock::new();
@@ -103,11 +107,11 @@ pub fn get_blobs_dir() -> &'static Arc<RwLock<Option<std::path::PathBuf>>> {
 }
 
 pub fn get_connection_pool()
--> &'static Arc<RwLock<HashMap<String, (iroh::endpoint::Connection, u64)>>> {
+-> &'static Arc<RwLock<HashMap<iroh::PublicKey, (iroh::endpoint::Connection, u64)>>> {
     CONNECTION_POOL.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
 }
 
-pub fn get_blob_cache() -> &'static Arc<Cache<String, Arc<Vec<u8>>>> {
+pub fn get_blob_cache() -> &'static Arc<Cache<iroh_blobs::Hash, bytes::Bytes>> {
     BLOB_CACHE.get_or_init(|| Arc::new(Cache::new(BLOB_CACHE_SIZE)))
 }
 
@@ -128,8 +132,8 @@ pub async fn get_pooled_connection(
 ) -> Result<iroh::endpoint::Connection> {
     use futures::future::FutureExt;
 
-    // Use endpoint address string as key (includes node ID and relay info)
-    let key = format!("{:?}", peer_addr);
+    // Use node ID as key (32 bytes, Copy — no heap allocation)
+    let key = peer_addr.id;
     let now = now_secs();
 
     // Guard: if clock skew detected (now_secs returns 0), skip pool and create new connection
@@ -178,7 +182,7 @@ pub async fn get_pooled_connection(
         // If at capacity, evict ~10% oldest entries to reduce eviction frequency under burst
         if pool.len() >= MAX_CONNECTION_POOL_SIZE {
             let entries_to_remove = pool.len() / 10 + 1; // Remove ~10%
-            let mut oldest: Vec<_> = pool.iter().map(|(k, (_, ts))| (k.clone(), *ts)).collect();
+            let mut oldest: Vec<_> = pool.iter().map(|(k, (_, ts))| (*k, *ts)).collect();
             oldest.sort_by_key(|(_, ts)| *ts);
             for (key, _) in oldest.into_iter().take(entries_to_remove) {
                 pool.remove(&key);

@@ -1,8 +1,8 @@
 //! P2P protocol handler for the miner.
 
 use crate::constants::{
-    MAX_CLUSTER_MAP_JSON_SIZE, MAX_CONCURRENT_HANDLERS, MAX_EPOCH_JUMP, MAX_FETCH_RESPONSE_SIZE,
-    MAX_MESSAGE_SIZE, MAX_PEER_CACHE_ENTRIES,
+    DEFAULT_READ_TIMEOUT_SECS, MAX_CLUSTER_MAP_JSON_SIZE, MAX_CONCURRENT_HANDLERS, MAX_EPOCH_JUMP,
+    MAX_FETCH_RESPONSE_SIZE, MAX_MESSAGE_SIZE, MAX_PEER_CACHE_ENTRIES, MAX_V2_DATA_SIZE,
 };
 use crate::helpers::truncate_for_log;
 use crate::state::{
@@ -228,8 +228,86 @@ async fn handle_single_stream(
     fetch_sem: &Arc<tokio::sync::Semaphore>,
     pos_sem: &Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
-    let message_bytes = recv.read_to_end(MAX_MESSAGE_SIZE).await?;
-    let message: common::MinerControlMessage = serde_json::from_slice(&message_bytes)?;
+    // Read the first byte to detect V1 (JSON) vs V2 (binary framing) protocol.
+    // SAFETY: JSON-encoded MinerControlMessage always starts with '{' (0x7B),
+    // so 0x02 is an unambiguous V2 discriminant that can never appear in V1.
+    // Data timeout (55s) is slightly shorter than the validator's write timeout (default 60s)
+    // to ensure the miner times out before the validator, producing a clean error.
+    // DEFAULT_READ_TIMEOUT_SECS (30s) is used for header/first-byte reads (small payloads).
+    let header_timeout = std::time::Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS);
+    let data_timeout = std::time::Duration::from_secs(55);
+
+    let mut first_byte = [0u8; 1];
+    tokio::time::timeout(header_timeout, recv.read_exact(&mut first_byte))
+        .await
+        .map_err(|_| anyhow::anyhow!("First byte read timed out"))?
+        .map_err(|e| anyhow::anyhow!("First byte read failed: {}", e))?;
+
+    let message = if first_byte[0] == common::STORE_V2_MAGIC {
+        // V2 binary framing: [0x02][4-byte LE header_len][JSON header][raw blob bytes]
+        let mut header_len_bytes = [0u8; 4];
+        tokio::time::timeout(header_timeout, recv.read_exact(&mut header_len_bytes))
+            .await
+            .map_err(|_| anyhow::anyhow!("StoreV2 header_len read timed out"))?
+            .map_err(|e| anyhow::anyhow!("StoreV2 header_len read failed: {}", e))?;
+        let header_len = u32::from_le_bytes(header_len_bytes) as usize;
+
+        if header_len > MAX_MESSAGE_SIZE {
+            anyhow::bail!("StoreV2 header too large: {} bytes", header_len);
+        }
+
+        let mut header_bytes = vec![0u8; header_len];
+        tokio::time::timeout(header_timeout, recv.read_exact(&mut header_bytes))
+            .await
+            .map_err(|_| anyhow::anyhow!("StoreV2 header read timed out"))?
+            .map_err(|e| anyhow::anyhow!("StoreV2 header read failed: {}", e))?;
+        let header: common::MinerControlMessage = serde_json::from_slice(&header_bytes)?;
+
+        match header {
+            common::MinerControlMessage::StoreV2 { hash, data_len } => {
+                if data_len > MAX_V2_DATA_SIZE {
+                    anyhow::bail!(
+                        "StoreV2 data too large: {} bytes (max {})",
+                        data_len,
+                        MAX_V2_DATA_SIZE
+                    );
+                }
+                let data_len = data_len as usize;
+                let mut data = vec![0u8; data_len];
+                tokio::time::timeout(data_timeout, recv.read_exact(&mut data))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("StoreV2 data read timed out after 55s"))?
+                    .map_err(|e| anyhow::anyhow!("StoreV2 data read failed: {}", e))?;
+                // Convert to Store variant for unified handling
+                common::MinerControlMessage::Store {
+                    hash,
+                    data: Some(data),
+                    source_miner: None,
+                }
+            }
+            other => {
+                // V2 framing only valid for StoreV2; other variants would leave raw data
+                // unconsumed on the stream, causing protocol corruption.
+                anyhow::bail!(
+                    "V2 framing used with non-StoreV2 header: {:?}",
+                    std::mem::discriminant(&other)
+                );
+            }
+        }
+    } else {
+        // V1: prepend the first byte back and read rest as JSON.
+        // Use io::Read chain to avoid allocating a Vec just to prepend one byte.
+        // Use MAX_MESSAGE_SIZE - 1 since we already consumed the first byte.
+        let remaining = tokio::time::timeout(data_timeout, recv.read_to_end(MAX_MESSAGE_SIZE - 1))
+            .await
+            .map_err(|_| anyhow::anyhow!("V1 message read timed out after 55s"))?
+            .map_err(|e| anyhow::anyhow!("V1 message read failed: {}", e))?;
+        let reader = std::io::Read::chain(
+            std::io::Cursor::new(&first_byte[..]),
+            std::io::Cursor::new(&remaining),
+        );
+        serde_json::from_reader(reader)?
+    };
 
     match message {
         common::MinerControlMessage::Store {
@@ -337,6 +415,13 @@ async fn handle_single_stream(
             )
             .await?;
         }
+        common::MinerControlMessage::StoreV2 { .. } => {
+            // V1 JSON path: a raw JSON StoreV2 message (without V2 binary framing) is invalid.
+            // V2 framing always converts StoreV2 → Store above, so this is only reachable
+            // if someone sends {"StoreV2":...} as plain JSON — reject it.
+            warn!("Received raw JSON StoreV2 message (not V2-framed), rejecting");
+            send_response(&mut send, b"ERROR: StoreV2 requires binary framing").await?;
+        }
     }
 
     Ok(())
@@ -400,7 +485,7 @@ async fn handle_store(
             };
 
             // Invalidate blob cache entry to ensure fresh data on next read
-            get_blob_cache().remove(&hash);
+            get_blob_cache().remove(&requested);
 
             if outcome.hash != requested {
                 error!(requested = %requested, stored = %outcome.hash, "Store hash mismatch");
@@ -615,7 +700,7 @@ async fn handle_delete(
     }
 
     // Step 3: Invalidate blob cache entry to prevent serving stale data
-    get_blob_cache().remove(&canonical_hash);
+    get_blob_cache().remove(&hash_parsed);
 
     // Send ACK
     send_response(send, b"OK").await
@@ -644,9 +729,6 @@ async fn handle_fetch_blob(
         }
     };
 
-    // Use canonical hash string for consistent cache keys
-    let canonical_hash = hash_parsed.to_string();
-
     // Helper to send blob data with DATA: prefix
     async fn send_blob_data(send: &mut iroh::endpoint::SendStream, data: &[u8]) -> Result<()> {
         send.write_all(b"DATA:").await?;
@@ -654,9 +736,9 @@ async fn handle_fetch_blob(
         finish_stream(send).await
     }
 
-    // Check blob cache first for better performance
+    // Check blob cache first (key is Hash — 32-byte Copy type, no heap alloc)
     let blob_cache = get_blob_cache();
-    if let Some(cached) = blob_cache.get(&canonical_hash) {
+    if let Some(cached) = blob_cache.get(&hash_parsed) {
         trace!(
             hash = %truncate_for_log(&hash, 16),
             size = cached.len(),
@@ -665,20 +747,19 @@ async fn handle_fetch_blob(
         return send_blob_data(send, &cached).await;
     }
 
-    // Read blob data from store
+    // Read blob data from store (returns bytes::Bytes — already refcounted)
     match store.get_bytes(hash_parsed).await {
-        Ok(bytes) if !bytes.is_empty() => {
+        Ok(data) if !data.is_empty() => {
             trace!(
                 hash = %truncate_for_log(&hash, 16),
-                size = bytes.len(),
+                size = data.len(),
                 "FetchBlob: Read bytes"
             );
 
-            // Cache the blob data for future requests and use cached Arc for response
-            let cached_data = Arc::new(bytes.to_vec());
-            blob_cache.insert(canonical_hash, cached_data.clone());
+            // Cache the Bytes directly — clone is just a refcount bump, no data copy
+            blob_cache.insert(hash_parsed, data.clone());
 
-            send_blob_data(send, &cached_data).await
+            send_blob_data(send, &data).await
         }
         Ok(_) => {
             // Empty data means blob not found
@@ -896,11 +977,9 @@ pub async fn pull_blob_from_peer(
 ) -> Result<()> {
     trace!(hash = %truncate_for_log(&hash, 16), "Pulling blob from peer");
 
-    // Connect to peer via miner-control protocol
-    let conn = endpoint
-        .connect(peer_addr.clone(), b"hippius/miner-control")
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to peer: {}", e))?;
+    // Use connection pool to avoid QUIC handshake on repeated pulls to the same peer
+    let conn = crate::state::get_pooled_connection(&endpoint, &peer_addr, b"hippius/miner-control")
+        .await?;
 
     let (mut send, mut recv) = conn.open_bi().await?;
 
@@ -926,12 +1005,13 @@ pub async fn pull_blob_from_peer(
         ));
     }
 
-    let data = response[5..].to_vec();
+    // Zero-copy slice: Bytes::from(Vec) takes ownership, .slice() is a refcount bump
+    let data = bytes::Bytes::from(response).slice(5..);
     if data.is_empty() {
         return Err(anyhow::anyhow!("Empty DATA payload from peer"));
     }
 
-    // Store blob and verify hash matches
+    // Store blob and verify hash matches (add_bytes accepts impl Into<Bytes>)
     let outcome = store
         .add_bytes(data)
         .await
@@ -1013,9 +1093,9 @@ async fn handle_pos_challenge(
         }
     };
 
-    // Read shard data from blob store
+    // Read shard data from blob store (keep as Bytes — Deref<Target=[u8]> for proof APIs)
     let shard_data = match store.get_bytes(hash_parsed).await {
-        Ok(data) if !data.is_empty() => data.to_vec(),
+        Ok(data) if !data.is_empty() => data,
         Ok(_) => {
             warn!(shard = %truncate_for_log(&shard_hash, 16), "Shard not found (empty)");
             return send_response(send, b"ERROR: Shard not found").await;
@@ -1061,12 +1141,22 @@ async fn handle_pos_challenge(
         expires_at,
     };
 
-    // Generate proof
+    // Generate proof on blocking thread pool to avoid starving the async executor.
+    // With pos_sem=2, this can block 2 executor threads for 500ms+ — spawn_blocking
+    // moves the work to a dedicated thread pool.
     let start = Instant::now();
-    let proof = match generate_proof(&shard_data, &commitment, &challenge) {
-        Ok(p) => p,
-        Err(e) => {
+    let proof = match tokio::task::spawn_blocking(move || {
+        generate_proof(&shard_data, &commitment, &challenge)
+    })
+    .await
+    {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => {
             error!(shard = %truncate_for_log(&shard_hash, 16), error = %e, "Failed to generate proof");
+            return send_response(send, b"ERROR: Proof generation failed").await;
+        }
+        Err(e) => {
+            error!(shard = %truncate_for_log(&shard_hash, 16), error = %e, "Proof generation task panicked");
             return send_response(send, b"ERROR: Proof generation failed").await;
         }
     };

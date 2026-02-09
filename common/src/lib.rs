@@ -448,7 +448,21 @@ pub enum MinerControlMessage {
         /// Challenge expiry timestamp (Unix seconds)
         expires_at: u64,
     },
+    /// Binary-framed Store (V2): header-only, data follows as raw bytes on the wire.
+    /// Used for efficient shard distribution — avoids JSON encoding of binary data.
+    /// The actual blob data is NOT in this variant; it is read separately from the stream.
+    StoreV2 {
+        /// BLAKE3 hash of the shard data
+        hash: String,
+        /// Length of raw blob data that follows this header on the stream.
+        /// Uses u64 for platform-independent wire format.
+        data_len: u64,
+    },
 }
+
+/// Magic byte for StoreV2 binary framing protocol.
+/// When a miner receives a message starting with this byte, it uses V2 binary parsing.
+pub const STORE_V2_MAGIC: u8 = 0x02;
 
 /// Messages sent via the `hippius/validator-control` P2P protocol (Miner → Validator).
 ///
@@ -617,11 +631,12 @@ pub fn calculate_placement_for_stripe(
 
     // Step 2: Group miners by family for diversity-aware placement
     // Include ALL miners (filtering happens at write-time when validator attempts connection)
-    let mut families: HashMap<String, Vec<(usize, &MinerNode)>> = HashMap::new();
+    // Borrow family_id from the ClusterMap to avoid per-miner String clones.
+    let mut families: HashMap<&str, Vec<(usize, &MinerNode)>> = HashMap::new();
 
     for (idx, miner) in map.miners.iter().enumerate() {
         families
-            .entry(miner.family_id.clone())
+            .entry(miner.family_id.as_str())
             .or_default()
             .push((idx, miner));
     }
@@ -755,11 +770,11 @@ fn weighted_select(
 ///
 /// Family weight = sum of all miner weights in that family.
 /// Uses deterministic LCG PRNG seeded from placement input.
-fn select_weighted_families(
-    families: &HashMap<String, Vec<(usize, &MinerNode)>>,
+fn select_weighted_families<'a>(
+    families: &'a HashMap<&'a str, Vec<(usize, &MinerNode)>>,
     count: usize,
     seed: u64,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<&'a str>, String> {
     // Build indexed weights once: (original_index, family_id, weight)
     // Use u64 for weights to prevent overflow when summing many miner weights
     let mut indexed_weights: Vec<(usize, &str, u64)> = families
@@ -767,7 +782,7 @@ fn select_weighted_families(
         .enumerate()
         .map(|(i, (fid, miners))| {
             let total_weight: u64 = miners.iter().map(|(_, m)| m.weight as u64).sum();
-            (i, fid.as_str(), total_weight)
+            (i, *fid, total_weight)
         })
         .collect();
 
@@ -779,7 +794,7 @@ fn select_weighted_families(
     let iterations = count.min(indexed_weights.len());
 
     for _ in 0..iterations {
-        // Build weights slice for selection (reuses allocation)
+        // Build weights slice for selection
         let weights: Vec<(usize, u64)> = indexed_weights.iter().map(|(i, _, w)| (*i, *w)).collect();
 
         // Check if all remaining weights are zero
@@ -789,8 +804,10 @@ fn select_weighted_families(
 
         let selected_idx = weighted_select(&weights, &mut rng_seed, "Weighted family selection")?;
 
+        // Use remove (not swap_remove) to preserve deterministic ordering —
+        // weighted_select depends on cumulative weight order across iterations.
         let (_, family_id, _) = indexed_weights.remove(selected_idx);
-        selected.push(family_id.to_owned());
+        selected.push(family_id);
     }
 
     Ok(selected)
@@ -831,6 +848,8 @@ fn select_weighted_miners_from_family(
 
         let selected_idx = weighted_select(&available, &mut rng_seed, "Weighted miner selection")?;
 
+        // Use remove (not swap_remove) to preserve deterministic ordering —
+        // weighted_select depends on cumulative weight order across iterations.
         let (miner_idx, _) = available.remove(selected_idx);
         // Safety: miner_idx was validated above
         selected.push(map.miners[miner_idx].clone());
@@ -844,6 +863,12 @@ fn select_weighted_miners_from_family(
 // ============================================================================
 
 use reed_solomon_erasure::galois_8::ReedSolomon;
+
+/// Cached RS(10, 20) instance — the default stripe config.
+/// Building `ReedSolomon` constructs GF(2^8) multiplication tables (~65 KB);
+/// caching avoids repeating this work on every stripe.
+static RS_10_20: std::sync::LazyLock<ReedSolomon> =
+    std::sync::LazyLock::new(|| ReedSolomon::new(10, 20).expect("RS(10,20) is valid"));
 
 /// Encodes a data stripe into k data shards + m parity shards.
 ///
@@ -875,7 +900,15 @@ pub fn encode_stripe(data: &[u8], config: &StripeConfig) -> Result<Vec<Vec<u8>>,
         return Err("k (data shards) must be at least 1".to_string());
     }
 
-    let rs = ReedSolomon::new(config.k, config.m).map_err(|e| e.to_string())?;
+    // Reuse cached RS instance for the default (10, 20) config to avoid
+    // rebuilding GF(2^8) multiplication tables on every stripe.
+    let owned_rs;
+    let rs: &ReedSolomon = if config.k == 10 && config.m == 20 {
+        &RS_10_20
+    } else {
+        owned_rs = ReedSolomon::new(config.k, config.m).map_err(|e| e.to_string())?;
+        &owned_rs
+    };
 
     // Dynamic shard size calculation: ceil(data_len / k), minimum 1
     // (div_ceil always returns >= 1 for non-empty data, but .max(1) is defensive)
@@ -933,6 +966,24 @@ pub fn calculate_stripe_data_len(file_size: u64, stripe_index: u64, stripe_size:
         .unwrap_or(usize::MAX)
 }
 
+/// Calculate the actual byte size of a single shard in a given stripe.
+///
+/// After Reed-Solomon encoding, all `k + m` shards in a stripe have identical size:
+/// `ceil(stripe_data_len / k)`.  This helper provides a single source of truth for
+/// that computation, used by both HTTP and P2P network-stats endpoints.
+///
+/// Returns 0 when `k == 0` or the stripe is beyond the file end.
+pub fn calculate_shard_size(file_size: u64, stripe_index: u64, stripe_size: u64, k: usize) -> u64 {
+    if k == 0 {
+        return 0;
+    }
+    let stripe_data_len = calculate_stripe_data_len(file_size, stripe_index, stripe_size);
+    if stripe_data_len == 0 {
+        return 0;
+    }
+    stripe_data_len.div_ceil(k) as u64
+}
+
 /// Decode a stripe from Reed-Solomon encoded shards.
 ///
 /// # Arguments
@@ -968,7 +1019,13 @@ pub fn decode_stripe(
         ));
     }
 
-    let rs = ReedSolomon::new(config.k, config.m).map_err(|e| e.to_string())?;
+    let owned_rs;
+    let rs: &ReedSolomon = if config.k == 10 && config.m == 20 {
+        &RS_10_20
+    } else {
+        owned_rs = ReedSolomon::new(config.k, config.m).map_err(|e| e.to_string())?;
+        &owned_rs
+    };
 
     rs.reconstruct(shards).map_err(|e| e.to_string())?;
 
@@ -1342,7 +1399,7 @@ pub enum SubmitterControlMessage {
     NetworkStatsResponse {
         /// Total number of files stored
         total_files: usize,
-        /// Per-miner storage stats: miner_uid -> [stored_bytes, shard_count]
+        /// Per-miner storage stats: miner_uid -> [shard_count, stored_bytes]
         miner_stats: HashMap<String, [u64; 2]>,
         /// Per-miner bandwidth stats: miner_uid -> bytes_served
         bandwidth_stats: HashMap<String, u64>,
@@ -1541,8 +1598,9 @@ pub const LATENCY_EMA_ALPHA: f64 = 0.2;
 pub const DEFAULT_AUDIT_EPOCH_SECS: u64 = 3600;
 
 /// Default number of shards to sample per miner per epoch.
-/// With 30 miners and 100 shards each, the warden tracks 3000 shards max per epoch.
-pub const DEFAULT_SHARDS_PER_MINER_PER_EPOCH: usize = 100;
+/// With 50 shards per miner and max_shards=50,000, supports up to 1000 miners.
+/// Lower shard count per miner = more miners supported on the network.
+pub const DEFAULT_SHARDS_PER_MINER_PER_EPOCH: usize = 50;
 
 /// Calculate the current epoch number from a timestamp.
 ///
@@ -1714,6 +1772,12 @@ pub async fn p2p_send_response(
     .await;
     Ok(())
 }
+
+// Dead V2 helpers (encode_store_v2, decode_miner_control_message) were removed:
+// they used big-endian framing and the legacy `Store` variant, which is incompatible
+// with the production V2 protocol (little-endian, `StoreV2` variant).
+// The canonical encoder is `validator::serialize_store_message` and the decoder
+// lives in `miner::p2p::handle_single_stream`.
 
 /// Validates that a string is a valid 64-character hex file hash.
 ///
