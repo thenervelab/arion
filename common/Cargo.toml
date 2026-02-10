@@ -35,3 +35,4 @@ blake3 = "1.5"
 ed25519-dalek = { version = "2.1", optional = true }
 # For serde support of large arrays (e.g., [u8; 64] for signatures)
 serde-big-array = "0.5"
+bytes = "1"

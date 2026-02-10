@@ -105,6 +105,9 @@ pub struct MinerNode {
     /// Consecutive successful audit passes (for recovery calculation)
     #[serde(default)]
     pub consecutive_audit_passes: u32,
+    /// Software version reported by the miner (e.g., "0.1.1")
+    #[serde(default)]
+    pub version: String,
 }
 
 /// Result of auditing a single shard's availability and integrity.
@@ -490,6 +493,9 @@ pub enum ValidatorControlMessage {
         /// Miner's full EndpointAddr including relay hints for NAT traversal
         #[serde(default)]
         endpoint_addr: Option<iroh::EndpointAddr>,
+        /// Miner software version
+        #[serde(default)]
+        version: Option<String>,
     },
     /// Periodic heartbeat to maintain online status (sent every 30 seconds).
     /// Miners are marked offline after 2 minutes without heartbeat.
@@ -504,6 +510,9 @@ pub enum ValidatorControlMessage {
         public_key: String,
         /// Ed25519 signature of "HEARTBEAT:{public_key}:{timestamp}"
         signature: Vec<u8>,
+        /// Miner software version
+        #[serde(default)]
+        version: Option<String>,
     },
     /// P2P health check - validator responds with Pong
     Ping {

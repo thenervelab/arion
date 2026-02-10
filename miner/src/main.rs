@@ -555,6 +555,7 @@ async fn register_with_validator(
                 timestamp,
                 signature: signature.to_bytes().to_vec(),
                 endpoint_addr: my_endpoint_addr,
+                version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }
         };
 
@@ -779,6 +780,7 @@ fn spawn_heartbeat_loop(
                     available_storage: reported_available,
                     public_key: public_key_str,
                     signature: signature.to_bytes().to_vec(),
+                    version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 }
             };
 
@@ -948,6 +950,7 @@ async fn register_with_validator_once(
             timestamp,
             signature: signature.to_bytes().to_vec(),
             endpoint_addr: my_endpoint_addr,
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
         }
     };
 
