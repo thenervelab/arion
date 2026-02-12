@@ -5,10 +5,9 @@
 
 use crate::constants::{
     DEFAULT_CONNECT_TIMEOUT_SECS, MAX_BATCH_PG_RESPONSE_SIZE, MAX_ORPHAN_ENTRIES,
-    ORPHAN_GRACE_PERIOD_SECS, REBALANCE_MAX_FILES_PER_CYCLE, REBALANCE_MAX_PULL_ATTEMPTS,
+    ORPHAN_GRACE_PERIOD_SECS, REBALANCE_MAX_FILES_PER_CYCLE,
 };
 use crate::helpers::truncate_for_log;
-use crate::p2p::download_from_peer_miner;
 use crate::state::{get_blobs_dir, get_cluster_map, get_orphan_shards, get_validator_endpoint};
 use anyhow::Result;
 use common::now_secs;
@@ -31,12 +30,6 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
 
     trace!(miner_uid = my_uid, "My miner UID");
 
-    // Epoch lookback for locating shards during transitions
-    let epoch_lookback: u64 = std::env::var("EPOCH_LOOKBACK")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(3);
-
     // Get cluster map for CRUSH calculations
     let cluster_map: Arc<common::ClusterMap> = {
         let map_guard = get_cluster_map().read().await;
@@ -48,13 +41,6 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
             }
         }
     };
-
-    // Pre-compute uid -> public_key mapping ONCE (not per-shard!)
-    let uid_to_pk: std::collections::HashMap<u32, String> = cluster_map
-        .miners
-        .iter()
-        .map(|m| (m.uid, m.public_key.clone()))
-        .collect();
 
     // Get validator endpoint for P2P queries
     let validator_addr = {
@@ -86,8 +72,7 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
     // Query validator for files in ALL our PGs in a single batch request
     let mut total_files = 0;
     let mut files_processed = 0;
-    let mut shards_pulled = 0;
-    let mut pull_attempts = 0;
+    let mut missing_shards = 0;
     let mut expected_shards: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Build batch query message with all our PGs
@@ -129,6 +114,17 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
 
                 let files: std::collections::HashMap<u32, Vec<String>> =
                     serde_json::from_slice(&response_bytes)?;
+
+                // Validate deserialized size to prevent memory exhaustion from
+                // many small strings that fit within the byte limit but expand in memory.
+                let total_entries: usize = files.values().map(|v| v.len()).sum();
+                if total_entries > 100_000 {
+                    anyhow::bail!(
+                        "PG batch response too large: {} file entries (max 100000)",
+                        total_entries
+                    );
+                }
+
                 Ok(files)
             }
             .await;
@@ -227,89 +223,13 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
                             };
 
                         if !has_shard {
-                            // Skip pull logic if we've hit the limit (but still track expected shards above)
-                            if pull_attempts >= REBALANCE_MAX_PULL_ATTEMPTS {
-                                continue;
-                            }
-
-                            // Need to pull this shard from the most likely source(s)
-                            let cur_epoch = cluster_map.epoch;
-                            let min_epoch = cur_epoch.saturating_sub(epoch_lookback);
-                            let mut tried: std::collections::HashSet<String> =
-                                std::collections::HashSet::new();
-
-                            let mut pulled = false;
-                            let mut e = cur_epoch;
-                            while e >= min_epoch {
-                                // Get map for epoch e
-                                let map_e: Option<Arc<common::ClusterMap>> = if e == cur_epoch {
-                                    Some(cluster_map.clone())
-                                } else {
-                                    fetch_map_epoch_http(e).await.map(Arc::new)
-                                };
-                                let Some(map_e) = map_e else {
-                                    if e == 0 {
-                                        break;
-                                    }
-                                    e = e.saturating_sub(1);
-                                    continue;
-                                };
-
-                                if let Ok(miners_e) = common::calculate_pg_placement_for_stripe(
-                                    file_hash,
-                                    stripe_idx as u64,
-                                    shards_per_stripe,
-                                    &map_e,
-                                ) && let Some(src) = miners_e.get(local_idx)
-                                    && src.uid != my_uid
-                                    && let Some(pk) = uid_to_pk.get(&src.uid).cloned()
-                                    && tried.insert(pk.clone())
-                                {
-                                    // Check pull attempts limit before attempting
-                                    if pull_attempts >= REBALANCE_MAX_PULL_ATTEMPTS {
-                                        debug!(
-                                            limit = REBALANCE_MAX_PULL_ATTEMPTS,
-                                            "Hit pull attempts limit, skipping remaining pulls"
-                                        );
-                                        break;
-                                    }
-                                    pull_attempts += 1;
-
-                                    // Attempt P2P pull
-                                    match download_from_peer_miner(
-                                        pk.clone(),
-                                        shard.blob_hash.clone(),
-                                        store.clone(),
-                                        endpoint.clone(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(()) => {
-                                            shards_pulled += 1;
-                                            pulled = true;
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            trace!(error = %e, peer = %pk, "Pull attempt failed");
-                                        }
-                                    }
-                                }
-
-                                if e == 0 {
-                                    break;
-                                }
-                                e = e.saturating_sub(1);
-                            }
-
-                            if !pulled {
-                                warn!(
-                                    shard_idx = local_idx,
-                                    blob_hash = %truncate_for_log(&shard.blob_hash, 16),
-                                    file_hash = %truncate_for_log(file_hash, 16),
-                                    epoch_lookback = epoch_lookback,
-                                    "Could not pull shard after epoch-lookback"
-                                );
-                            }
+                            missing_shards += 1;
+                            trace!(
+                                shard_idx = local_idx,
+                                blob_hash = %truncate_for_log(&shard.blob_hash, 16),
+                                file_hash = %truncate_for_log(file_hash, 16),
+                                "Missing shard (validator handles migration via PullFromPeer)"
+                            );
                         }
                     }
                 }
@@ -321,8 +241,7 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
         files_total = total_files,
         files_processed = files_processed,
         expected_shards = expected_shards.len(),
-        pull_attempts = pull_attempts,
-        pulled = shards_pulled,
+        missing_shards = missing_shards,
         "Self-rebalance summary"
     );
 
@@ -445,31 +364,6 @@ async fn gc_orphan_shards(expected_shards: &std::collections::HashSet<String>) {
             }
         }
     }
-}
-
-/// Shared HTTP client for rebalance operations (created once, reused)
-fn get_http_client() -> &'static reqwest::Client {
-    use std::sync::OnceLock;
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .pool_max_idle_per_host(2)
-            .build()
-            .expect("Failed to create HTTP client")
-    })
-}
-
-/// Helper: fetch a historical cluster map from validator HTTP
-async fn fetch_map_epoch_http(epoch: u64) -> Option<common::ClusterMap> {
-    let base = std::env::var("VALIDATOR_URL").ok()?;
-    let url = format!("{}/map/epoch/{}", base.trim_end_matches('/'), epoch);
-    let client = get_http_client();
-    let res = client.get(&url).send().await.ok()?;
-    if !res.status().is_success() {
-        return None;
-    }
-    res.json::<common::ClusterMap>().await.ok()
 }
 
 /// Fetch manifest from validator via P2P

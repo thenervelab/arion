@@ -63,9 +63,11 @@ pub const REBALANCE_MAX_FILES_PER_CYCLE: usize = 1000;
 /// Maximum missing shards to attempt pulling per cycle
 pub const REBALANCE_MAX_PULL_ATTEMPTS: usize = 500;
 
-/// Maximum concurrent P2P stream handlers to prevent connection flood attacks
-/// This bounds task spawning in handle_miner_control() to prevent OOM
-pub const MAX_CONCURRENT_HANDLERS: usize = 1000;
+/// Maximum concurrent P2P stream handlers to prevent connection flood attacks.
+/// This bounds task spawning in handle_miner_control() to prevent OOM.
+/// Must exceed store_concurrency (1024) + pull + fetch + pos to avoid
+/// Store operations starving FetchBlob and other handler types.
+pub const MAX_CONCURRENT_HANDLERS: usize = 2048;
 
 /// Maximum connection pool size (prevents unbounded growth between cleanups)
 pub const MAX_CONNECTION_POOL_SIZE: usize = 500;

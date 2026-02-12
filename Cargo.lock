@@ -1261,7 +1261,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
@@ -4420,7 +4420,7 @@ dependencies = [
 
 [[package]]
 name = "miner"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum 0.8.8",

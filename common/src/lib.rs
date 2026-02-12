@@ -66,6 +66,9 @@ pub struct MinerNode {
     pub weight: u32,
     /// IP subnet for network locality awareness (e.g., "192.168.1.0/24")
     pub ip_subnet: String,
+    /// IP address extracted from EndpointAddr or http_addr at registration
+    #[serde(default)]
+    pub ip_address: Option<String>,
     /// HTTP address for legacy API calls (e.g., "http://127.0.0.1:3001")
     pub http_addr: String,
     /// Ed25519 public key (hex-encoded) for authentication
@@ -105,6 +108,9 @@ pub struct MinerNode {
     /// Consecutive successful audit passes (for recovery calculation)
     #[serde(default)]
     pub consecutive_audit_passes: u32,
+    /// Count of audit failures due to invalid/failed proofs (for on-chain penalty)
+    #[serde(default)]
+    pub integrity_fails: u32,
     /// Software version reported by the miner (e.g., "0.1.1")
     #[serde(default)]
     pub version: String,
@@ -174,7 +180,7 @@ pub struct SyncIndex {
 ///
 /// Files store their `placement_epoch` in the manifest to support epoch-fallback
 /// reads during cluster transitions.
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ClusterMap {
     /// Monotonically increasing version number (increments on topology changes)
     pub epoch: u64,
@@ -205,6 +211,12 @@ fn default_ec_m() -> usize {
     20
 }
 
+impl Default for ClusterMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClusterMap {
     /// Creates a new empty cluster map with default parameters.
     ///
@@ -216,6 +228,20 @@ impl ClusterMap {
             pg_count: default_pg_count(),
             ec_k: default_ec_k(),
             ec_m: default_ec_m(),
+        }
+    }
+
+    /// Ensure critical placement parameters are never zero.
+    /// Call after deserialization from untrusted sources.
+    pub fn ensure_defaults(&mut self) {
+        if self.pg_count == 0 {
+            self.pg_count = default_pg_count();
+        }
+        if self.ec_k == 0 {
+            self.ec_k = default_ec_k();
+        }
+        if self.ec_m == 0 {
+            self.ec_m = default_ec_m();
         }
     }
 
@@ -466,6 +492,23 @@ pub enum MinerControlMessage {
 /// Magic byte for StoreV2 binary framing protocol.
 /// When a miner receives a message starting with this byte, it uses V2 binary parsing.
 pub const STORE_V2_MAGIC: u8 = 0x02;
+
+/// Magic byte for gateway streaming upload framing protocol.
+/// When the validator receives a message starting with this byte on the gateway-control
+/// protocol, it uses binary streaming upload parsing instead of JSON deserialization.
+pub const GATEWAY_UPLOAD_V1_MAGIC: u8 = 0x03;
+
+/// Header for streaming upload over P2P (gateway → validator).
+///
+/// Sent as length-prefixed JSON after the magic byte. The raw file bytes follow
+/// immediately after the header until the sender calls `finish()` on the stream.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GatewayUploadHeader {
+    pub filename: String,
+    /// Advisory file size — validator streams until EOF and does not rely on this value.
+    pub size_hint: u64,
+    pub content_type: Option<String>,
+}
 
 /// Messages sent via the `hippius/validator-control` P2P protocol (Miner → Validator).
 ///
@@ -1393,6 +1436,14 @@ pub enum SubmitterControlMessage {
     /// Request network statistics for rewards calculation
     GetNetworkStats,
 
+    /// Request the validator to sync its epoch to the on-chain value.
+    ///
+    /// Sent when the chain-submitter detects that the validator's epoch is
+    /// behind the on-chain `CurrentEpoch` (e.g. after a PVC recreation).
+    /// The validator bumps its epoch to `on_chain_epoch + 1` so that the
+    /// next CRUSH map submission can proceed.
+    SyncEpoch { on_chain_epoch: u64 },
+
     // ========================================
     // Responses (Validator → Chain-Submitter)
     // ========================================
@@ -1432,6 +1483,16 @@ pub enum SubmitterControlMessage {
         success: bool,
         /// Optional message
         message: Option<String>,
+    },
+
+    /// Response to a `SyncEpoch` request.
+    SyncEpochResponse {
+        /// Whether the epoch sync succeeded
+        success: bool,
+        /// The validator's epoch after the operation
+        new_epoch: u64,
+        /// Error description on failure
+        error: Option<String>,
     },
 }
 
@@ -1578,6 +1639,76 @@ pub fn calculate_my_pgs(miner_uid: u32, map: &ClusterMap) -> Vec<u32> {
 }
 
 // ============================================================================
+// Store Failure Helpers (CRUSH-aware replacement)
+// ============================================================================
+
+/// Create a copy of the cluster map with specified miners' weights zeroed out.
+///
+/// Used before CRUSH placement to exclude soft-banned miners without altering
+/// the miner vec indices (critical for deterministic placement).
+pub fn cluster_map_with_zeroed_miners(
+    map: &ClusterMap,
+    zero_uids: &std::collections::HashSet<u32>,
+) -> ClusterMap {
+    let mut cloned = map.clone();
+    for miner in &mut cloned.miners {
+        if zero_uids.contains(&miner.uid) {
+            miner.weight = 0;
+        }
+    }
+    cloned
+}
+
+/// Select a replacement miner for a failed shard distribution.
+///
+/// Performs weighted random selection from miners not in `excluded_uids` and with `weight > 0`.
+/// The seed is non-deterministic (includes current timestamp) because replacement placement
+/// doesn't need to be reproducible — the manifest records the actual miner assignment.
+///
+/// # Returns
+/// `None` if all miners are excluded or have zero weight.
+pub fn select_replacement_miner(
+    map: &ClusterMap,
+    excluded_uids: &std::collections::HashSet<u32>,
+    file_hash: &str,
+    shard_index: usize,
+) -> Option<MinerNode> {
+    let candidates: Vec<&MinerNode> = map
+        .miners
+        .iter()
+        .filter(|m| m.weight > 0 && !excluded_uids.contains(&m.uid))
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Non-deterministic seed: file_hash + shard_index + timestamp
+    let mut hasher = xxh3::Xxh3::new();
+    hasher.write(file_hash.as_bytes());
+    hasher.write_usize(shard_index);
+    hasher.write_u64(now_secs());
+    let seed = hasher.finish();
+
+    // Weighted random selection
+    let total_weight: u64 = candidates.iter().map(|m| m.weight as u64).sum();
+    if total_weight == 0 {
+        return None;
+    }
+    let target = seed % total_weight;
+    let mut cumulative: u64 = 0;
+    for candidate in &candidates {
+        cumulative += candidate.weight as u64;
+        if target < cumulative {
+            return Some((*candidate).clone());
+        }
+    }
+
+    // Fallback (should not happen due to modulo arithmetic)
+    Some((*candidates.last().unwrap()).clone())
+}
+
+// ============================================================================
 // Shared Utility Functions
 // ============================================================================
 
@@ -1594,9 +1725,76 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Extract miner IP from EndpointAddr direct addresses
+/// or fall back to parsing the http_addr URL hostname.
+pub fn extract_miner_ip(
+    endpoint_addr: Option<&iroh::EndpointAddr>,
+    http_addr: &str,
+) -> Option<String> {
+    // Try EndpointAddr direct addresses first
+    if let Some(addr) = endpoint_addr {
+        for transport_addr in &addr.addrs {
+            if let iroh::TransportAddr::Ip(sock) = transport_addr {
+                let ip = sock.ip();
+                if !ip.is_loopback() {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
+    // Fall back to parsing http_addr URL
+    // Expected format: "http://203.0.113.5:3001" or "http://[::1]:3001"
+    let host = http_addr
+        .strip_prefix("https://")
+        .or_else(|| http_addr.strip_prefix("http://"))
+        .unwrap_or(http_addr);
+    // Strip path suffix if any
+    let host = host.split('/').next().unwrap_or(host);
+    // Strip port: handle IPv6 bracket notation [::1]:3001
+    let host = if host.starts_with('[') {
+        // IPv6 bracket notation: [addr]:port or [addr]
+        host.trim_start_matches('[')
+            .split(']')
+            .next()
+            .unwrap_or(host)
+    } else {
+        // IPv4 or hostname: addr:port or addr
+        host.rsplit_once(':').map_or(host, |(h, _)| h)
+    };
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if !ip.is_loopback() {
+            return Some(ip.to_string());
+        }
+    }
+    None
+}
+
 /// Default EMA alpha for latency smoothing (20% new, 80% old).
 /// This provides good smoothing while still being responsive to changes.
 pub const LATENCY_EMA_ALPHA: f64 = 0.2;
+
+/// Expected heartbeat interval in seconds (shared between validator and chain-submitter).
+pub const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+
+/// Calculate uptime score based on heartbeat count and time since registration.
+/// Returns a value in [0.0, 1.0]. New miners (< 60s) get 1.0.
+pub fn calculate_uptime_score(
+    heartbeat_count: u32,
+    registration_time: u64,
+    current_time: u64,
+) -> f32 {
+    let elapsed = current_time.saturating_sub(registration_time);
+    let expected_heartbeats = elapsed / HEARTBEAT_INTERVAL_SECS;
+
+    // New miners or very short elapsed time get benefit of doubt
+    let is_newly_registered = elapsed < 60;
+    let insufficient_data = expected_heartbeats == 0;
+    if is_newly_registered || insufficient_data {
+        return 1.0;
+    }
+
+    (heartbeat_count as f32 / expected_heartbeats as f32).clamp(0.0, 1.0)
+}
 
 // ============================================================================
 // Epoch-Based Audit Sampling
@@ -2365,6 +2563,123 @@ mod tests {
             }
             _ => panic!("Wrong variant"),
         }
+
+        // Test SyncEpoch request
+        let request = SubmitterControlMessage::SyncEpoch {
+            on_chain_epoch: 2090,
+        };
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let decoded: SubmitterControlMessage = serde_json::from_slice(&bytes).unwrap();
+        match decoded {
+            SubmitterControlMessage::SyncEpoch { on_chain_epoch } => {
+                assert_eq!(on_chain_epoch, 2090);
+            }
+            _ => panic!("Wrong variant"),
+        }
+
+        // Test SyncEpochResponse (success)
+        let response = SubmitterControlMessage::SyncEpochResponse {
+            success: true,
+            new_epoch: 2091,
+            error: None,
+        };
+        let bytes = serde_json::to_vec(&response).unwrap();
+        let decoded: SubmitterControlMessage = serde_json::from_slice(&bytes).unwrap();
+        match decoded {
+            SubmitterControlMessage::SyncEpochResponse {
+                success,
+                new_epoch,
+                error,
+            } => {
+                assert!(success);
+                assert_eq!(new_epoch, 2091);
+                assert!(error.is_none());
+            }
+            _ => panic!("Wrong variant"),
+        }
+
+        // Test SyncEpochResponse (failure)
+        let response = SubmitterControlMessage::SyncEpochResponse {
+            success: false,
+            new_epoch: 0,
+            error: Some("persist failed".to_string()),
+        };
+        let bytes = serde_json::to_vec(&response).unwrap();
+        let decoded: SubmitterControlMessage = serde_json::from_slice(&bytes).unwrap();
+        match decoded {
+            SubmitterControlMessage::SyncEpochResponse {
+                success,
+                new_epoch,
+                error,
+            } => {
+                assert!(!success);
+                assert_eq!(new_epoch, 0);
+                assert_eq!(error, Some("persist failed".to_string()));
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_cluster_map_default_has_correct_params() {
+        let map = ClusterMap::default();
+        assert_eq!(map.pg_count, 16384);
+        assert_eq!(map.ec_k, 10);
+        assert_eq!(map.ec_m, 20);
+        assert_eq!(map.epoch, 0);
+        assert!(map.miners.is_empty());
+    }
+
+    #[test]
+    fn test_ensure_defaults_fixes_zeros() {
+        let mut map = ClusterMap {
+            epoch: 5,
+            miners: vec![],
+            pg_count: 0,
+            ec_k: 0,
+            ec_m: 0,
+        };
+        map.ensure_defaults();
+        assert_eq!(map.pg_count, 16384);
+        assert_eq!(map.ec_k, 10);
+        assert_eq!(map.ec_m, 20);
+        assert_eq!(map.epoch, 5); // epoch should NOT be touched
+    }
+
+    #[test]
+    fn test_ensure_defaults_preserves_nonzero() {
+        let mut map = ClusterMap {
+            epoch: 3,
+            miners: vec![],
+            pg_count: 8192,
+            ec_k: 5,
+            ec_m: 15,
+        };
+        map.ensure_defaults();
+        assert_eq!(map.pg_count, 8192);
+        assert_eq!(map.ec_k, 5);
+        assert_eq!(map.ec_m, 15);
+    }
+
+    #[test]
+    fn test_calculate_uptime_score() {
+        // New miner (< 60s elapsed) gets perfect score
+        assert_eq!(calculate_uptime_score(0, 1000, 1050), 1.0);
+
+        // Zero expected heartbeats returns 1.0
+        assert_eq!(calculate_uptime_score(0, 100, 100), 1.0);
+
+        // 100% uptime: 10 heartbeats in 300s (expected 10 at 30s interval)
+        assert_eq!(calculate_uptime_score(10, 0, 300), 1.0);
+
+        // 50% uptime: 5 heartbeats in 300s
+        assert!((calculate_uptime_score(5, 0, 300) - 0.5).abs() < 0.01);
+
+        // 0 heartbeats, > 60s elapsed
+        assert_eq!(calculate_uptime_score(0, 0, 120), 0.0);
+
+        // More heartbeats than expected clamps to 1.0
+        assert_eq!(calculate_uptime_score(100, 0, 300), 1.0);
     }
 
     #[test]
@@ -2378,5 +2693,154 @@ mod tests {
         assert_ne!(GATEWAY_CONTROL_ALPN, WARDEN_CONTROL_ALPN);
         assert_ne!(GATEWAY_CONTROL_ALPN, SUBMITTER_CONTROL_ALPN);
         assert_ne!(WARDEN_CONTROL_ALPN, SUBMITTER_CONTROL_ALPN);
+    }
+
+    /// Helper: create a MinerNode with a deterministic endpoint from the UID.
+    fn test_miner(uid: u32, weight: u32) -> MinerNode {
+        let mut seed = [0u8; 32];
+        seed[0..4].copy_from_slice(&uid.to_le_bytes());
+        let secret_key = iroh::SecretKey::from_bytes(&seed);
+        let public_key = secret_key.public();
+        let endpoint = iroh::EndpointAddr::from(public_key);
+        MinerNode {
+            uid,
+            endpoint,
+            weight,
+            ip_subnet: String::new(),
+            ip_address: None,
+            http_addr: String::new(),
+            public_key: String::new(),
+            total_storage: 0,
+            available_storage: 0,
+            family_id: String::new(),
+            strikes: 0,
+            last_seen: 0,
+            heartbeat_count: 0,
+            registration_time: 0,
+            bandwidth_total: 0,
+            bandwidth_window_start: 0,
+            weight_manual_override: false,
+            reputation: 0.0,
+            consecutive_audit_passes: 0,
+            integrity_fails: 0,
+            version: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_cluster_map_with_zeroed_miners() {
+        let mut map = ClusterMap::new();
+        map.miners = vec![test_miner(1, 100), test_miner(2, 200), test_miner(3, 300)];
+
+        let zero_uids: std::collections::HashSet<u32> = [2].into_iter().collect();
+        let zeroed = cluster_map_with_zeroed_miners(&map, &zero_uids);
+
+        assert_eq!(zeroed.miners[0].weight, 100, "UID 1 should be unchanged");
+        assert_eq!(zeroed.miners[1].weight, 0, "UID 2 should be zeroed");
+        assert_eq!(zeroed.miners[2].weight, 300, "UID 3 should be unchanged");
+        // Original map should be unmodified
+        assert_eq!(map.miners[1].weight, 200);
+    }
+
+    #[test]
+    fn test_select_replacement_excludes_banned() {
+        let mut map = ClusterMap::new();
+        map.miners = vec![test_miner(1, 100), test_miner(2, 100), test_miner(3, 100)];
+
+        let excluded: std::collections::HashSet<u32> = [1, 3].into_iter().collect();
+        // Run multiple times to cover randomness
+        for i in 0..20 {
+            let result = select_replacement_miner(&map, &excluded, "filehash", i);
+            let replacement = result.expect("Should find miner 2");
+            assert_eq!(replacement.uid, 2, "Only non-excluded miner is UID 2");
+        }
+    }
+
+    #[test]
+    fn test_select_replacement_none_when_all_excluded() {
+        let mut map = ClusterMap::new();
+        map.miners = vec![test_miner(1, 100), test_miner(2, 100)];
+
+        let excluded: std::collections::HashSet<u32> = [1, 2].into_iter().collect();
+        let result = select_replacement_miner(&map, &excluded, "filehash", 0);
+        assert!(result.is_none(), "No candidates when all excluded");
+    }
+
+    #[test]
+    fn test_select_replacement_none_when_all_zero_weight() {
+        let mut map = ClusterMap::new();
+        map.miners = vec![test_miner(1, 0), test_miner(2, 0)];
+
+        let excluded: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let result = select_replacement_miner(&map, &excluded, "filehash", 0);
+        assert!(result.is_none(), "No candidates when all have zero weight");
+    }
+
+    #[test]
+    fn test_extract_miner_ip_from_direct_addr() {
+        let secret = iroh::SecretKey::from_bytes(&[1u8; 32]);
+        let public = secret.public();
+        let sock = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 5)),
+            3001,
+        );
+        let addr = iroh::EndpointAddr::from(public).with_addrs(vec![iroh::TransportAddr::Ip(sock)]);
+        let result = extract_miner_ip(Some(&addr), "");
+        assert_eq!(result, Some("203.0.113.5".to_string()));
+    }
+
+    #[test]
+    fn test_extract_miner_ip_skips_loopback_direct_addr() {
+        let secret = iroh::SecretKey::from_bytes(&[2u8; 32]);
+        let public = secret.public();
+        let loopback =
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 3001);
+        let addr =
+            iroh::EndpointAddr::from(public).with_addrs(vec![iroh::TransportAddr::Ip(loopback)]);
+        // Loopback direct addr skipped, falls through to http_addr
+        let result = extract_miner_ip(Some(&addr), "http://198.51.100.1:3001");
+        assert_eq!(result, Some("198.51.100.1".to_string()));
+    }
+
+    #[test]
+    fn test_extract_miner_ip_from_http_addr() {
+        let result = extract_miner_ip(None, "http://203.0.113.5:3001");
+        assert_eq!(result, Some("203.0.113.5".to_string()));
+    }
+
+    #[test]
+    fn test_extract_miner_ip_hostname_returns_none() {
+        let result = extract_miner_ip(None, "http://miner.example.com:3001");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_extract_miner_ip_empty_returns_none() {
+        let result = extract_miner_ip(None, "");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_extract_miner_ip_loopback_http_returns_none() {
+        let result = extract_miner_ip(None, "http://127.0.0.1:3001");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_extract_miner_ip_from_ipv6_http_addr() {
+        let result = extract_miner_ip(None, "http://[2001:db8::1]:3001");
+        assert_eq!(result, Some("2001:db8::1".to_string()));
+    }
+
+    #[test]
+    fn test_extract_miner_ip_ipv6_loopback_returns_none() {
+        let result = extract_miner_ip(None, "http://[::1]:3001");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_extract_miner_ip_from_https_addr() {
+        let result = extract_miner_ip(None, "https://203.0.113.5:3001");
+        assert_eq!(result, Some("203.0.113.5".to_string()));
     }
 }

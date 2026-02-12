@@ -156,7 +156,7 @@ pub async fn handle_miner_control(
 
     // Loop accepting streams until connection is closed
     loop {
-        let (send, recv) = match connection.accept_bi().await {
+        let (mut send, recv) = match connection.accept_bi().await {
             Ok(streams) => streams,
             Err(e) => {
                 // Connection closed by peer or error - this is expected
@@ -172,9 +172,11 @@ pub async fn handle_miner_control(
                 warn!(
                     remote = %remote_node_id,
                     limit = MAX_CONCURRENT_HANDLERS,
-                    "Handler limit reached, dropping stream"
+                    "Handler limit reached, rejecting stream"
                 );
-                // Close the stream gracefully by dropping send/recv
+                // Send error response so the caller can back off instead of seeing
+                // an opaque stream reset.
+                let _ = send_response(&mut send, b"ERROR: RATE_LIMITED").await;
                 continue;
             }
         };
@@ -518,12 +520,7 @@ async fn handle_store(
             // Await download completion BEFORE sending ACK
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                download_from_peer_miner(
-                    miner_id.clone(),
-                    hash.clone(),
-                    store.clone(),
-                    endpoint.clone(),
-                ),
+                download_from_peer_miner(&miner_id, &hash, store.clone(), endpoint.clone()),
             )
             .await;
 
@@ -889,17 +886,13 @@ async fn handle_cluster_map_update(
         if !new_ids.is_empty() {
             // Sort for deterministic comparison (validator sends from HashSet)
             new_ids.sort();
-            let warden_ids = get_warden_node_ids().read().await;
+            let mut warden_ids = get_warden_node_ids().write().await;
             if *warden_ids != new_ids {
-                drop(warden_ids);
-                let mut warden_ids = get_warden_node_ids().write().await;
-                if *warden_ids != new_ids {
-                    debug!(
-                        count = new_ids.len(),
-                        "Updated warden node IDs from ClusterMapUpdate"
-                    );
-                    *warden_ids = new_ids;
-                }
+                debug!(
+                    count = new_ids.len(),
+                    "Updated warden node IDs from ClusterMapUpdate"
+                );
+                *warden_ids = new_ids;
             }
         }
     }
@@ -996,7 +989,13 @@ pub async fn pull_blob_from_peer(
         recv.read_to_end(MAX_FETCH_RESPONSE_SIZE),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("Timeout reading FetchBlob response"))??;
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "Timeout reading FetchBlob response for {} from peer {}",
+            truncate_for_log(&hash, 16),
+            peer_addr.id
+        )
+    })??;
 
     if !response.starts_with(b"DATA:") {
         return Err(anyhow::anyhow!(
@@ -1031,26 +1030,26 @@ pub async fn pull_blob_from_peer(
 
 /// Download blob from peer miner using node ID (looks up EndpointAddr from cache)
 pub async fn download_from_peer_miner(
-    miner_id: String,
-    hash: String,
+    miner_id: &str,
+    hash: &str,
     store: FsStore,
     endpoint: Endpoint,
 ) -> Result<()> {
     trace!(
-        hash = %truncate_for_log(&hash, 16),
-        miner_id = %truncate_for_log(&miner_id, 16),
+        hash = %truncate_for_log(hash, 16),
+        miner_id = %truncate_for_log(miner_id, 16),
         "Downloading blob from peer miner"
     );
 
     // Look up peer address from cache
     let peer_cache = get_peer_cache();
     let peer_addr = peer_cache
-        .get(&miner_id)
+        .get(miner_id)
         .map(|r| r.value().clone())
-        .ok_or_else(|| anyhow::anyhow!("Peer {} not in cache", truncate_for_log(&miner_id, 16)))?;
+        .ok_or_else(|| anyhow::anyhow!("Peer {} not in cache", truncate_for_log(miner_id, 16)))?;
 
     // Delegate to pull_blob_from_peer which does the actual work
-    pull_blob_from_peer(store, endpoint, peer_addr, hash).await
+    pull_blob_from_peer(store, endpoint, peer_addr, hash.to_string()).await
 }
 
 /// Handle a proof-of-storage challenge from a Warden.

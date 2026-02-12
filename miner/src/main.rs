@@ -171,7 +171,7 @@ async fn handle_subcommand(command: Commands) -> Result<()> {
             if keypair_path.exists() {
                 warn!(data_dir = %data_dir, "Existing keypair.txt found - will OVERWRITE existing miner identity");
                 warn!("Press Ctrl+C to cancel, or wait 5 seconds to continue...");
-                std::thread::sleep(std::time::Duration::from_secs(5));
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
 
             // Extract archive
@@ -290,9 +290,20 @@ async fn run_miner(cli: Cli) -> Result<()> {
     // Configure transport with keep-alive to maintain relay connections
     let mut transport_config = iroh::endpoint::TransportConfig::default();
     transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
-    if let Ok(idle_timeout) = std::time::Duration::from_secs(60).try_into() {
+    if let Ok(idle_timeout) = std::time::Duration::from_secs(120).try_into() {
         transport_config.max_idle_timeout(Some(idle_timeout));
     }
+
+    // Match validator's stream capacity for shard distribution.
+    // Large uploads open ~256 streams/miner (524MB file); 16384 supports multi-GB files.
+    transport_config.max_concurrent_bidi_streams(16384u32.into());
+    transport_config.max_concurrent_uni_streams(1024u32.into());
+
+    // Flow control for receiving shard data at scale.
+    // receive_window left at quinn default (VarInt::MAX) to avoid flow-control stalls.
+    transport_config.send_window(64 * 1024 * 1024);
+    transport_config.stream_receive_window((2u32 * 1024 * 1024).into());
+
     endpoint_builder = endpoint_builder.transport_config(transport_config);
 
     // Configure relay using consistent pattern from common crate
@@ -477,6 +488,24 @@ async fn run_miner(cli: Cli) -> Result<()> {
     }
 }
 
+/// Build an EndpointAddr for the validator with relay and localhost hints.
+fn build_validator_addr(
+    pubkey: &iroh::PublicKey,
+    relay_url: &Option<iroh_base::RelayUrl>,
+    hostname: &str,
+) -> iroh::EndpointAddr {
+    let mut addr = iroh::EndpointAddr::new(*pubkey);
+    if let Some(url) = relay_url {
+        addr = addr.with_relay_url(url.clone());
+    }
+    if hostname == "localhost" {
+        let direct_addr =
+            std::net::SocketAddr::new(std::net::Ipv4Addr::new(127, 0, 0, 1).into(), 11220);
+        addr = addr.with_addrs(vec![iroh::TransportAddr::Ip(direct_addr)]);
+    }
+    addr
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn register_with_validator(
     endpoint: &iroh::Endpoint,
@@ -493,153 +522,42 @@ async fn register_with_validator(
     let mut retry_count: u32 = 0;
 
     loop {
-        // Calculate storage stats
-        let available = free_space(data_dir).unwrap_or(0);
-        let total = fs2::total_space(data_dir).unwrap_or(0);
-
-        // Respect max_storage config if set
-        let reported_available = if config.storage.max_storage_gb > 0 {
-            std::cmp::min(
-                available,
-                config
-                    .storage
-                    .max_storage_gb
-                    .saturating_mul(1024 * 1024 * 1024),
-            )
-        } else {
-            available
-        };
-
-        let register_msg = {
-            let public_key_str = endpoint.secret_key().public().to_string();
-            let timestamp = now_secs();
-
-            // Sign "REGISTER:{public_key}:{timestamp}"
-            let sign_data = format!("REGISTER:{}:{}", public_key_str, timestamp);
-            let signature = endpoint.secret_key().sign(sign_data.as_bytes());
-
-            // Construct our EndpointAddr with relay hints
-            let node_id = endpoint.secret_key().public();
-            let my_endpoint_addr = {
-                let mut addr = iroh::EndpointAddr::new(node_id);
-                if let Some(url) = relay_url {
-                    debug!(node_id = %node_id, relay = %url, "My endpoint address");
-                    addr = addr.with_relay_url(url.clone());
-                } else {
-                    debug!(node_id = %node_id, relay = "default", "My endpoint address");
-                }
-
-                // Add direct address hint from hostname
-                let ip_opt = if hostname == "localhost" {
-                    Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
-                } else {
-                    hostname.parse::<std::net::IpAddr>().ok()
-                };
-
-                if let Some(ip) = ip_opt {
-                    let direct_addr = std::net::SocketAddr::new(ip, config.network.p2p_port);
-                    let transport_addr = iroh::TransportAddr::Ip(direct_addr);
-                    addr = addr.with_addrs(vec![transport_addr]);
-                    debug!(addr = %direct_addr, "Added direct address hint");
-                }
-
-                Some(addr)
-            };
-
-            common::ValidatorControlMessage::Register {
-                public_key: public_key_str,
-                http_addr: http_addr.to_string(),
-                total_storage: total,
-                available_storage: reported_available,
-                family_id: family_id.to_string(),
-                timestamp,
-                signature: signature.to_bytes().to_vec(),
-                endpoint_addr: my_endpoint_addr,
-                version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            }
-        };
-
-        // Connect to validator via P2P
-        let mut validator_addr = iroh::EndpointAddr::new(*validator_pubkey);
-        if let Some(url) = relay_url {
-            validator_addr = validator_addr.with_relay_url(url.clone());
-        }
-
-        // Add direct address hint for localhost
-        if hostname == "localhost" {
-            let direct_addr =
-                std::net::SocketAddr::new(std::net::Ipv4Addr::new(127, 0, 0, 1).into(), 11220);
-            validator_addr = validator_addr.with_addrs(vec![iroh::TransportAddr::Ip(direct_addr)]);
-            debug!(addr = %direct_addr, "Added direct validator address hint");
-        }
-
-        // Calculate exponential backoff with jitter
-        let backoff_secs = std::cmp::min(
-            max_backoff,
-            initial_backoff.saturating_mul(2u64.saturating_pow(retry_count)),
-        );
-
-        match endpoint
-            .connect(validator_addr.clone(), b"hippius/validator-control")
-            .await
+        match register_with_validator_once(
+            endpoint,
+            validator_pubkey,
+            relay_url,
+            hostname,
+            http_addr,
+            family_id,
+            data_dir,
+            config,
+        )
+        .await
         {
-            Ok(conn) => {
-                match async {
-                    let (mut send, mut recv) = conn.open_bi().await?;
-                    let msg_bytes = serde_json::to_vec(&register_msg)?;
-                    debug!("Sending registration message");
-                    send.write_all(&msg_bytes).await?;
-                    send.finish()?;
-                    let _ = send.stopped().await;
-                    debug!("Message sent, waiting for ACK");
-
-                    // Wait for ACK
-                    let ack = recv.read_to_end(4096).await?;
-                    let ack_str = String::from_utf8_lossy(&ack);
-                    debug!(ack = %ack_str, "Received ACK");
-
-                    match ack_str.as_ref() {
-                        "OK" => Ok::<_, anyhow::Error>(()),
-                        "RATE_LIMITED" => Err(anyhow::anyhow!("RATE_LIMITED")),
-                        _ if ack_str.starts_with("FAMILY_REJECTED:") => {
-                            Err(anyhow::anyhow!("{ack_str}"))
-                        }
-                        _ => Err(anyhow::anyhow!("Registration failed: {ack_str}")),
-                    }
-                }
-                .await
+            Ok(()) => {
+                info!("Registered with validator via P2P");
+                let validator_addr = build_validator_addr(validator_pubkey, relay_url, hostname);
                 {
-                    Ok(()) => {
-                        info!("Registered with validator via P2P");
-                        // Store validator endpoint for later PG queries
-                        {
-                            let mut val_ep = get_validator_endpoint().write().await;
-                            *val_ep = Some(validator_addr.clone());
-                        }
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        retry_count = retry_count.saturating_add(1);
-                        error!(
-                            error = %e,
-                            backoff_secs = backoff_secs,
-                            attempt = retry_count,
-                            "P2P registration error, retrying"
-                        );
-                    }
+                    let mut val_ep = get_validator_endpoint().write().await;
+                    *val_ep = Some(validator_addr);
                 }
+                return Ok(());
             }
             Err(e) => {
                 retry_count = retry_count.saturating_add(1);
+                let backoff_secs = std::cmp::min(
+                    max_backoff,
+                    initial_backoff.saturating_mul(2u64.saturating_pow(retry_count)),
+                );
                 error!(
                     error = %e,
                     backoff_secs = backoff_secs,
                     attempt = retry_count,
-                    "Failed to connect to validator, retrying"
+                    "P2P registration failed, retrying"
                 );
+                tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
             }
         }
-        tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
     }
 }
 
@@ -665,24 +583,6 @@ fn spawn_heartbeat_loop(
     tokio::spawn(async move {
         let mut heartbeat_count: u32 = 0;
         let mut current_validator_pubkey = validator_pubkey;
-
-        // Build initial validator address
-        let build_validator_addr = |pubkey: &iroh::PublicKey,
-                                    relay: &Option<iroh_base::RelayUrl>,
-                                    host: &str|
-         -> iroh::EndpointAddr {
-            let mut addr = iroh::EndpointAddr::new(*pubkey);
-            if let Some(url) = relay {
-                addr = addr.with_relay_url(url.clone());
-            }
-            // Add direct address hint for localhost
-            if host == "localhost" {
-                let direct_addr =
-                    std::net::SocketAddr::new(std::net::Ipv4Addr::new(127, 0, 0, 1).into(), 11220);
-                addr = addr.with_addrs(vec![iroh::TransportAddr::Ip(direct_addr)]);
-            }
-            addr
-        };
 
         let mut heartbeat_validator_addr =
             build_validator_addr(&current_validator_pubkey, &relay_url, &hostname);
@@ -796,27 +696,24 @@ fn spawn_heartbeat_loop(
 
             match connect_result {
                 Ok(Ok(conn)) => {
-                    let result = async {
-                        // Open stream with timeout
-                        let (mut send, mut recv) =
-                            tokio::time::timeout(std::time::Duration::from_secs(5), conn.open_bi())
-                                .await??;
+                    // Wrap entire heartbeat exchange in a single timeout to prevent
+                    // stalling on write_all/stopped if the validator's receive buffer is full.
+                    let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                        let (mut send, mut recv) = conn.open_bi().await?;
 
                         let msg_bytes = serde_json::to_vec(&heartbeat_msg)?;
                         send.write_all(&msg_bytes).await?;
                         send.finish()?;
                         let _ = send.stopped().await;
 
-                        // Read ACK with timeout
-                        let ack_bytes = tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            recv.read_to_end(1024),
-                        )
-                        .await??;
+                        // Read ACK
+                        let ack_bytes = recv.read_to_end(1024).await?;
 
                         let ack_str = String::from_utf8_lossy(&ack_bytes);
                         if ack_str.starts_with("FAMILY_REJECTED:") {
-                            error!(response = %ack_str, "Heartbeat rejected");
+                            error!(response = %ack_str, "Heartbeat rejected — miner cannot operate, shutting down");
+                            // Allow tracing subscriber to flush before hard exit
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             std::process::exit(1);
                         }
                         if ack_str == "UNKNOWN" {
@@ -843,28 +740,29 @@ fn spawn_heartbeat_loop(
                             if !new_ids.is_empty() {
                                 // Sort for deterministic comparison (validator sends from HashSet)
                                 new_ids.sort();
-                                let warden_ids = get_warden_node_ids().read().await;
+                                let mut warden_ids = get_warden_node_ids().write().await;
                                 if *warden_ids != new_ids {
-                                    drop(warden_ids);
-                                    let mut warden_ids = get_warden_node_ids().write().await;
-                                    // Double-check after acquiring write lock
-                                    if *warden_ids != new_ids {
-                                        debug!(
-                                            count = new_ids.len(),
-                                            "Updated warden node IDs from validator heartbeat"
-                                        );
-                                        *warden_ids = new_ids;
-                                    }
+                                    debug!(
+                                        count = new_ids.len(),
+                                        "Updated warden node IDs from validator heartbeat"
+                                    );
+                                    *warden_ids = new_ids;
                                 }
                             }
                         }
 
                         Ok::<_, anyhow::Error>(())
-                    }
+                    })
                     .await;
 
-                    if let Err(e) = result {
-                        warn!(error = %e, "Heartbeat error");
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            warn!(error = %e, "Heartbeat error");
+                        }
+                        Err(_) => {
+                            warn!("Heartbeat exchange timed out (15s)");
+                        }
                     }
                 }
                 Ok(Err(e)) => {
@@ -955,21 +853,11 @@ async fn register_with_validator_once(
     };
 
     // Connect to validator via P2P
-    let mut validator_addr = iroh::EndpointAddr::new(*validator_pubkey);
-    if let Some(url) = relay_url {
-        validator_addr = validator_addr.with_relay_url(url.clone());
-    }
-
-    // Add direct address hint for localhost
-    if hostname == "localhost" {
-        let direct_addr =
-            std::net::SocketAddr::new(std::net::Ipv4Addr::new(127, 0, 0, 1).into(), 11220);
-        validator_addr = validator_addr.with_addrs(vec![iroh::TransportAddr::Ip(direct_addr)]);
-    }
+    let validator_addr = build_validator_addr(validator_pubkey, relay_url, hostname);
 
     let conn = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        endpoint.connect(validator_addr.clone(), b"hippius/validator-control"),
+        endpoint.connect(validator_addr, b"hippius/validator-control"),
     )
     .await
     .map_err(|_| anyhow::anyhow!("Connection timeout"))?

@@ -191,16 +191,21 @@ pub async fn get_pooled_connection(
 
         pool.insert(key, (conn.clone(), now));
 
-        // Periodic cleanup when pool gets large (also clean expired connections)
+        // Periodic cleanup when pool gets large: remove expired/closed connections.
+        // Build removal list inline to minimize time holding the write lock.
         if pool.len() > 100 {
-            pool.retain(|_, (c, created)| {
-                // Keep if: created is valid (not in future), not too old, and not closed
-                // Note: if now == 0 (clock skew), we skip cleanup to avoid deleting valid connections
-                now > 0
-                    && *created <= now
-                    && now - *created < CONNECTION_TTL_SECS * 2
-                    && c.closed().now_or_never().is_none()
-            });
+            let stale_keys: Vec<_> = pool
+                .iter()
+                .filter(|(_, (c, created))| {
+                    *created > now
+                        || now - *created >= CONNECTION_TTL_SECS * 2
+                        || c.closed().now_or_never().is_some()
+                })
+                .map(|(k, _)| *k)
+                .collect();
+            for k in stale_keys {
+                pool.remove(&k);
+            }
         }
     }
 

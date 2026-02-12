@@ -343,7 +343,7 @@ impl Default for TuningConfig {
 }
 
 fn default_store_concurrency() -> usize {
-    64
+    1024
 }
 fn default_pull_concurrency() -> usize {
     32
