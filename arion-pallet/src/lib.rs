@@ -3,19 +3,17 @@
 pub mod weights;
 pub use weights::WeightInfo;
 
-//! `pallet-arion`
-//!
-//! Minimal scaffold for Arion’s **on-chain CRUSH map** + **periodic miner stats**.
-//! Goals:
-//! - Keep placement-critical state on-chain (epoch → CRUSH input map)
-//! - Allow periodic aggregated stats updates without per-heartbeat writes
-//! - Avoid epoch regressions
-//! - Provide **node registration** primitives to:
-//!   - prevent spoofed node ids (node_id must prove ownership via signature)
-//!   - enforce global adaptive registration cost (anti-sybil / anti-yoyo)
-//!   - support deregistration with cooldown + unbonding (anti lock/unlock spam)
-//!
-//! This pallet is designed to be copied into your Substrate chain repository.
+// `pallet-arion`
+//
+// Minimal scaffold for Arion’s **on-chain CRUSH map** + **periodic miner stats**.
+// Goals:
+// - Keep placement-critical state on-chain (epoch → CRUSH input map)
+// - Allow periodic aggregated stats updates without per-heartbeat writes
+// - Avoid epoch regressions
+// - Provide **node registration** primitives to:
+//   - prevent spoofed node ids (node_id must prove ownership via signature)
+//   - enforce global adaptive registration cost (anti-sybil / anti-yoyo)
+//   - support deregistration with cooldown + unbonding (anti lock/unlock spam)
 
 use codec::{Decode, Encode, MaxEncodedLen};
 use frame_support::{
@@ -87,7 +85,7 @@ pub mod pallet {
             // Optional: Enforce specific proxy type
             // proxy_definitions.iter().any(|p| {
             //     &p.delegate == child && 
-            //     matches!(p.proxy_type, ProxyType::NonTransfer)  // or your specific type
+            //     matches!(p.proxy_type, ProxyType::NonTransfer) 
             // })
         }
     }
@@ -451,7 +449,6 @@ pub mod pallet {
         type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 
         /// Sudo/admin origin for pallet parameters.
-        /// Configure this as `EnsureRoot` (or a dedicated governance origin) in your runtime.
         type ArionAdminOrigin: EnsureOrigin<Self::RuntimeOrigin>;
 
         /// Who is allowed to publish a new CRUSH map epoch.
@@ -469,7 +466,6 @@ pub mod pallet {
         /// Family registry hook (TODO: wire to pallet).
         type FamilyRegistry: FamilyRegistry<Self::AccountId>;
 
-        /// Proxy verification hook (TODO: wire to `pallet-proxy` / your rules).
         type ProxyVerifier: ProxyVerifier<Self::AccountId>;
 
         /// Enforce that miners in submitted CRUSH maps must be present in this pallet’s registry.
@@ -1199,6 +1195,12 @@ pub mod pallet {
             sum.min(max_family as u128) as u16
         }
 
+        pub fn get_total_family_weight() -> u128 {
+            FamilyWeight::<T>::iter()
+                .map(|(_, w)| w as u128)
+                .sum()
+        }
+
         fn ilog2_u128(x: u128) -> u32 {
             if x == 0 {
                 0
@@ -1330,7 +1332,7 @@ pub mod pallet {
         /// Updates:
         /// - `CurrentEpoch`
         #[pallet::call_index(0)]
-        #[pallet::weight((T::WeightInfo::submit_crush_map(miners.len() as u32), Pays::No))]
+        #[pallet::weight((<T as pallet::Config>::WeightInfo::submit_crush_map(miners.len() as u32), Pays::No))]
         pub fn submit_crush_map(
             origin: OriginFor<T>,
             epoch: u64,
@@ -1381,7 +1383,7 @@ pub mod pallet {
         ///
         /// Suggested: call every N blocks (e.g. 300) with aggregates.
         #[pallet::call_index(1)]
-        #[pallet::weight((T::WeightInfo::submit_miner_stats(updates.len() as u32), Pays::No))]
+        #[pallet::weight((<T as pallet::Config>::WeightInfo::submit_miner_stats(updates.len() as u32), Pays::No))]
         pub fn submit_miner_stats(
             origin: OriginFor<T>,
             bucket: u32,
@@ -1418,7 +1420,7 @@ pub mod pallet {
         /// Signature payload (domain-separated, SCALE-encoded):
         /// - ("ARION_NODE_REG_V1", family, child, node_id, nonce)
         #[pallet::call_index(10)]
-        #[pallet::weight((T::WeightInfo::register_child(), Pays::No))]
+        #[pallet::weight((<T as pallet::Config>::WeightInfo::register_child(), Pays::No))]
         pub fn register_child(
             origin: OriginFor<T>,
             family: T::AccountId,
@@ -1546,7 +1548,7 @@ pub mod pallet {
         /// - Node id is released from the active registry, but put in cooldown
         /// - Deposit remains reserved until `claim_unbonded`
         #[pallet::call_index(11)]
-        #[pallet::weight((T::WeightInfo::deregister_child(), Pays::No))]
+        #[pallet::weight((<T as pallet::Config>::WeightInfo::deregister_child(), Pays::No))]
         pub fn deregister_child(origin: OriginFor<T>, child: T::AccountId) -> DispatchResult {
             let who = ensure_signed(origin)?;
 
@@ -1603,7 +1605,7 @@ pub mod pallet {
         ///
         /// Note: this does NOT bypass cooldown; cooldown is enforced on `register_child`.
         #[pallet::call_index(12)]
-        #[pallet::weight((T::WeightInfo::claim_unbonded(), Pays::No))]
+        #[pallet::weight((<T as pallet::Config>::WeightInfo::claim_unbonded(), Pays::No))]
         pub fn claim_unbonded(origin: OriginFor<T>, child: T::AccountId) -> DispatchResult {
             let who = ensure_signed(origin)?;
 
@@ -1634,7 +1636,7 @@ pub mod pallet {
         ///
         /// This is the **recommended** path (deterministic on-chain weight calculation).
         #[pallet::call_index(20)]
-        #[pallet::weight((T::WeightInfo::submit_node_quality(updates.len() as u32), Pays::No))]
+        #[pallet::weight((<T as pallet::Config>::WeightInfo::submit_node_quality(updates.len() as u32), Pays::No))]
         pub fn submit_node_quality(
             origin: OriginFor<T>,
             bucket: u32,
@@ -1675,7 +1677,7 @@ pub mod pallet {
         /// - Each attestation signature is verified using Ed25519
         /// - Invalid signatures are rejected with InvalidAttestationSignature error
         #[pallet::call_index(2)]
-        #[pallet::weight((T::WeightInfo::submit_attestations(attestations.len() as u32), Pays::No))]
+        #[pallet::weight((<T as pallet::Config>::WeightInfo::submit_attestations(attestations.len() as u32), Pays::No))]
         pub fn submit_attestations(
             origin: OriginFor<T>,
             bucket: u32,
@@ -1733,7 +1735,7 @@ pub mod pallet {
         /// - `warden_pubkey_merkle_root`: Merkle root of unique warden public keys
         /// - `attestation_count`: Number of attestations in the bundle
         #[pallet::call_index(3)]
-        #[pallet::weight((T::WeightInfo::submit_attestation_commitment(), Pays::No))]
+        #[pallet::weight((<T as pallet::Config>::WeightInfo::submit_attestation_commitment(), Pays::No))]
         pub fn submit_attestation_commitment(
             origin: OriginFor<T>,
             epoch: u64,
@@ -1784,7 +1786,7 @@ pub mod pallet {
         ///
         /// Configure `AdminOrigin` as `EnsureRoot` to make this a sudo-only extrinsic.
         #[pallet::call_index(30)]
-        #[pallet::weight((T::WeightInfo::set_lockup_enabled(), Pays::No))]
+        #[pallet::weight((<T as pallet::Config>::WeightInfo::set_lockup_enabled(), Pays::No))]
         pub fn set_lockup_enabled(origin: OriginFor<T>, enabled: bool) -> DispatchResult {
             T::ArionAdminOrigin::ensure_origin(origin)?;
             LockupEnabled::<T>::put(enabled);
@@ -1800,7 +1802,7 @@ pub mod pallet {
         /// - This does not overwrite `GlobalNextDeposit` unless it is below the new floor;
         ///   the next time registration runs, `global_next_deposit_floor_init` will raise it.
         #[pallet::call_index(31)]
-        #[pallet::weight((T::WeightInfo::set_base_child_deposit(), Pays::No))]
+        #[pallet::weight((<T as pallet::Config>::WeightInfo::set_base_child_deposit(), Pays::No))]
         pub fn set_base_child_deposit(origin: OriginFor<T>, deposit: BalanceOf<T>) -> DispatchResult {
             T::ArionAdminOrigin::ensure_origin(origin)?;
             BaseChildDepositValue::<T>::put(deposit);
@@ -1818,7 +1820,7 @@ pub mod pallet {
         /// # Parameters
         /// - `warden_pubkey`: The warden's Ed25519 public key (32 bytes)
         #[pallet::call_index(32)]
-        #[pallet::weight((T::WeightInfo::register_warden(), Pays::No))]
+        #[pallet::weight((<T as pallet::Config>::WeightInfo::register_warden(), Pays::No))]
         pub fn register_warden(origin: OriginFor<T>, warden_pubkey: [u8; 32]) -> DispatchResult {
             T::ArionAdminOrigin::ensure_origin(origin)?;
 
@@ -1854,7 +1856,7 @@ pub mod pallet {
         /// # Parameters
         /// - `warden_pubkey`: The warden's Ed25519 public key (32 bytes)
         #[pallet::call_index(33)]
-        #[pallet::weight((T::WeightInfo::deregister_warden(), Pays::No))]
+        #[pallet::weight((<T as pallet::Config>::WeightInfo::deregister_warden(), Pays::No))]
         pub fn deregister_warden(origin: OriginFor<T>, warden_pubkey: [u8; 32]) -> DispatchResult {
             T::ArionAdminOrigin::ensure_origin(origin)?;
 
@@ -1896,7 +1898,7 @@ pub mod pallet {
         /// - `before_bucket`: Prune all buckets with ID less than this value
         /// - `max_buckets`: Maximum number of buckets to prune in this call (for weight limiting)
         #[pallet::call_index(34)]
-        #[pallet::weight((T::WeightInfo::prune_attestation_buckets(max_buckets), Pays::No))]
+        #[pallet::weight((<T as pallet::Config>::WeightInfo::prune_attestation_buckets(*max_buckets), Pays::No))]
         pub fn prune_attestation_buckets(
             origin: OriginFor<T>,
             before_bucket: u32,
