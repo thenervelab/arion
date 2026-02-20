@@ -13,7 +13,7 @@
 //!
 //! | Section | Purpose |
 //! |---------|---------|
-//! | `network` | HTTP port, P2P port, relay URL, family ID |
+//! | `network` | P2P port, relay URL, family ID |
 //! | `storage` | Blob storage path, max storage limit, data directory |
 //! | `validator` | Validator node ID, heartbeat interval |
 //! | `tuning` | Concurrency limits, timeouts, rebalance settings |
@@ -22,7 +22,6 @@
 //!
 //! ```toml
 //! [network]
-//! port = 3001
 //! p2p_port = 11230
 //! family_id = "my-datacenter"
 //!
@@ -59,10 +58,6 @@ pub struct MinerConfig {
 /// Network configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NetworkConfig {
-    /// HTTP API port
-    #[serde(default = "default_port")]
-    pub port: u16,
-
     /// Public hostname/IP for other nodes to reach this miner
     pub hostname: Option<String>,
 
@@ -73,6 +68,19 @@ pub struct NetworkConfig {
     #[serde(default = "default_p2p_port")]
     pub p2p_port: u16,
 
+    /// Specific IPv4 address to bind the P2P endpoint to.
+    /// When set, iroh only advertises this address instead of scanning all
+    /// interfaces. Required when Docker is installed on the host (to avoid
+    /// advertising the docker0 bridge IP).
+    ///
+    /// Override: `P2P_BIND_IPV4` env var.
+    pub bind_ipv4: Option<String>,
+
+    /// Specific IPv6 address to bind the P2P endpoint to.
+    ///
+    /// Override: `P2P_BIND_IPV6` env var.
+    pub bind_ipv6: Option<String>,
+
     /// Family ID for CRUSH placement grouping
     #[serde(default = "default_family_id")]
     pub family_id: String,
@@ -81,18 +89,16 @@ pub struct NetworkConfig {
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            port: default_port(),
             hostname: None,
             relay_url: None,
             p2p_port: default_p2p_port(),
+            bind_ipv4: None,
+            bind_ipv6: None,
             family_id: default_family_id(),
         }
     }
 }
 
-fn default_port() -> u16 {
-    3001
-}
 fn default_p2p_port() -> u16 {
     11230
 }
@@ -183,13 +189,6 @@ impl MinerConfig {
         };
 
         // Environment variable overrides
-        if let Ok(val) = std::env::var("PORT") {
-            match val.parse() {
-                Ok(port) => config.network.port = port,
-                Err(_) => warn!(value = %val, "Invalid PORT value, using default"),
-            }
-        }
-
         if let Ok(val) = std::env::var("P2P_PORT") {
             match val.parse() {
                 Ok(port) => config.network.p2p_port = port,
@@ -203,6 +202,20 @@ impl MinerConfig {
 
         if let Ok(val) = std::env::var("IROH_RELAY_URL") {
             config.network.relay_url = Some(val);
+        }
+
+        if let Ok(val) = std::env::var("P2P_BIND_IPV4") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                config.network.bind_ipv4 = Some(trimmed.to_string());
+            }
+        }
+
+        if let Ok(val) = std::env::var("P2P_BIND_IPV6") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                config.network.bind_ipv6 = Some(trimmed.to_string());
+            }
         }
 
         if let Ok(val) = std::env::var("FAMILY_ID") {
@@ -264,29 +277,14 @@ impl MinerConfig {
                 }
             }
         }
-
-        Ok(config)
-    }
-
-    /// Validate required configuration
-    #[allow(dead_code)]
-    pub fn validate(&self) -> Result<(), String> {
-        if self.validator.node_id.is_none() {
-            return Err("validator.node_id is required (or set VALIDATOR_NODE_ID env)".to_string());
+        if let Ok(val) = std::env::var("P2P_DIRECT_WAIT_SECS") {
+            match val.parse() {
+                Ok(n) => config.tuning.p2p_direct_wait_secs = n,
+                Err(_) => warn!(value = %val, "Invalid P2P_DIRECT_WAIT_SECS, using default"),
+            }
         }
 
-        Ok(())
-    }
-
-    /// Get the full HTTP address for this miner
-    #[allow(dead_code)]
-    pub fn http_addr(&self) -> String {
-        let host = self
-            .network
-            .hostname
-            .clone()
-            .unwrap_or_else(|| "localhost".to_string());
-        format!("http://{}:{}", host, self.network.port)
+        Ok(config)
     }
 }
 
@@ -320,6 +318,13 @@ pub struct TuningConfig {
     /// Self-rebalance check interval in seconds
     #[serde(default = "default_rebalance_tick_secs")]
     pub rebalance_tick_secs: u64,
+    /// Max seconds to wait for a direct P2P connection to the validator
+    /// before each registration attempt. Iroh hole-punches during this
+    /// window. If direct is not achieved, registration is skipped and
+    /// retried with backoff. Default: 30.
+    /// Override: P2P_DIRECT_WAIT_SECS env var.
+    #[serde(default = "default_p2p_direct_wait_secs")]
+    pub p2p_direct_wait_secs: u64,
     /// Max concurrent PoS proof generation operations (CPU-intensive, default 2)
     #[serde(default)]
     pub pos_concurrency: Option<usize>,
@@ -337,6 +342,7 @@ impl Default for TuningConfig {
             max_backoff_secs: default_max_backoff(),
             rebalance_enabled: default_rebalance_enabled(),
             rebalance_tick_secs: default_rebalance_tick_secs(),
+            p2p_direct_wait_secs: default_p2p_direct_wait_secs(),
             pos_concurrency: None, // defaults to 2 in main.rs
         }
     }
@@ -368,4 +374,7 @@ fn default_rebalance_enabled() -> bool {
 }
 fn default_rebalance_tick_secs() -> u64 {
     300
+}
+fn default_p2p_direct_wait_secs() -> u64 {
+    30
 }

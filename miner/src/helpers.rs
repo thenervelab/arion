@@ -6,7 +6,6 @@
 //!
 //! - `truncate_for_log()`: Safe string truncation for logging (handles UTF-8)
 //! - `load_keypair()`: Load or generate Ed25519 keypair for miner identity
-//! - `internal_error()`: Return generic error response while logging details
 //!
 //! # Key Management
 //!
@@ -16,9 +15,8 @@
 //! - Corrupted or invalid keypairs cause a startup error (delete to regenerate)
 
 use anyhow::Result;
-use axum::http::StatusCode;
 use iroh::SecretKey;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 /// Safely truncate a string for logging (handles non-ASCII gracefully)
 pub fn truncate_for_log(s: &str, max_chars: usize) -> &str {
@@ -65,44 +63,4 @@ pub async fn load_keypair(data_dir: &std::path::Path) -> Result<SecretKey> {
 
     debug!(path = %keypair_path.display(), "Generated new keypair");
     Ok(key)
-}
-
-// ============================================================================
-// Error Response Helpers
-// ============================================================================
-
-/// Returns a generic internal server error response, logging the actual error details.
-///
-/// This prevents leaking internal implementation details to clients while
-/// ensuring errors are properly logged for debugging.
-///
-/// # Arguments
-/// * `context` - A short description of what operation failed (logged)
-/// * `err` - The actual error to log
-pub fn internal_error(context: &str, err: impl std::fmt::Display) -> (StatusCode, &'static str) {
-    error!(context = context, error = %err, "Internal error");
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "An internal error occurred.",
-    )
-}
-
-/// Returns a generic bad request error response, logging the actual error details.
-///
-/// # Arguments
-/// * `context` - A short description of what operation failed (logged)
-/// * `err` - The actual error to log
-pub fn bad_request_error(context: &str, err: impl std::fmt::Display) -> (StatusCode, &'static str) {
-    warn!(context = context, error = %err, "Bad request");
-    (StatusCode::BAD_REQUEST, "Invalid request.")
-}
-
-/// Returns a generic not found error response, logging the actual error details.
-///
-/// # Arguments
-/// * `context` - A short description of what was not found (logged)
-/// * `err` - The actual error to log
-pub fn not_found_error(context: &str, err: impl std::fmt::Display) -> (StatusCode, &'static str) {
-    warn!(context = context, error = %err, "Not found");
-    (StatusCode::NOT_FOUND, "Resource not found.")
 }

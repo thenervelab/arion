@@ -1,7 +1,7 @@
 [package]
 name = "pos-circuits"
-version = "0.1.1"
-edition = "2021"
+version = "0.1.2"
+edition = "2024"
 description = "Plonky3-based Proof-of-Storage circuits for Hippius Arion"
 license = "MIT"
 

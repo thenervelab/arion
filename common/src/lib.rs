@@ -487,6 +487,10 @@ pub enum MinerControlMessage {
         /// Uses u64 for platform-independent wire format.
         data_len: u64,
     },
+    /// Lightweight metadata-only existence check (no data transfer)
+    CheckBlob {
+        hash: String,
+    },
 }
 
 /// Magic byte for StoreV2 binary framing protocol.
@@ -1761,10 +1765,10 @@ pub fn extract_miner_ip(
         // IPv4 or hostname: addr:port or addr
         host.rsplit_once(':').map_or(host, |(h, _)| h)
     };
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if !ip.is_loopback() {
-            return Some(ip.to_string());
-        }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>()
+        && !ip.is_loopback()
+    {
+        return Some(ip.to_string());
     }
     None
 }
@@ -2135,7 +2139,7 @@ impl Clone for P2pConnectionManager {
     fn clone(&self) -> Self {
         Self {
             endpoint: self.endpoint.clone(),
-            target_node_id: self.target_node_id.clone(),
+            target_node_id: self.target_node_id,
             alpn: self.alpn,
             connection: self.connection.clone(),
             connection_ttl_secs: self.connection_ttl_secs,
@@ -2190,26 +2194,26 @@ impl P2pConnectionManager {
         // Check if we have a valid cached connection
         {
             let conn_guard = self.connection.read().await;
-            if let Some((conn, last_used)) = conn_guard.as_ref() {
-                if now.saturating_sub(*last_used) < self.connection_ttl_secs {
-                    // Connection is still valid - verify it's healthy
-                    if conn.close_reason().is_none() {
-                        debug!(
-                            target = %self.target_node_id,
-                            conn_id = conn.stable_id(),
-                            "Reusing cached P2P connection"
-                        );
-                        return Ok(conn.clone());
-                    }
-                    // Connection is unhealthy - track and log
-                    self.unhealthy_connections.fetch_add(1, Ordering::Relaxed);
-                    warn!(
+            if let Some((conn, last_used)) = conn_guard.as_ref()
+                && now.saturating_sub(*last_used) < self.connection_ttl_secs
+            {
+                // Connection is still valid - verify it's healthy
+                if conn.close_reason().is_none() {
+                    debug!(
                         target = %self.target_node_id,
                         conn_id = conn.stable_id(),
-                        reason = ?conn.close_reason(),
-                        "Cached P2P connection is unhealthy, will reconnect"
+                        "Reusing cached P2P connection"
                     );
+                    return Ok(conn.clone());
                 }
+                // Connection is unhealthy - track and log
+                self.unhealthy_connections.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    target = %self.target_node_id,
+                    conn_id = conn.stable_id(),
+                    reason = ?conn.close_reason(),
+                    "Cached P2P connection is unhealthy, will reconnect"
+                );
             }
         }
 
@@ -2217,17 +2221,16 @@ impl P2pConnectionManager {
         let mut conn_guard = self.connection.write().await;
 
         // Double-check after acquiring write lock (another task may have connected)
-        if let Some((conn, last_used)) = conn_guard.as_ref() {
-            if now.saturating_sub(*last_used) < self.connection_ttl_secs
-                && conn.close_reason().is_none()
-            {
-                debug!(
-                    target = %self.target_node_id,
-                    conn_id = conn.stable_id(),
-                    "Reusing cached P2P connection (after lock)"
-                );
-                return Ok(conn.clone());
-            }
+        if let Some((conn, last_used)) = conn_guard.as_ref()
+            && now.saturating_sub(*last_used) < self.connection_ttl_secs
+            && conn.close_reason().is_none()
+        {
+            debug!(
+                target = %self.target_node_id,
+                conn_id = conn.stable_id(),
+                "Reusing cached P2P connection (after lock)"
+            );
+            return Ok(conn.clone());
         }
 
         // Create new connection with exponential backoff retries
@@ -2257,7 +2260,7 @@ impl P2pConnectionManager {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(P2P_DEFAULT_TIMEOUT_SECS),
                 self.endpoint
-                    .connect(self.target_node_id.clone(), self.alpn),
+                    .connect(self.target_node_id, self.alpn),
             )
             .await
             {

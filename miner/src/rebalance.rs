@@ -8,7 +8,10 @@ use crate::constants::{
     ORPHAN_GRACE_PERIOD_SECS, REBALANCE_MAX_FILES_PER_CYCLE,
 };
 use crate::helpers::truncate_for_log;
-use crate::state::{get_blobs_dir, get_cluster_map, get_orphan_shards, get_validator_endpoint};
+use crate::state::{
+    get_blobs_dir, get_cluster_map, get_orphan_shards, get_validator_endpoint,
+    get_validator_reachable,
+};
 use anyhow::Result;
 use common::now_secs;
 use iroh::endpoint::Endpoint;
@@ -19,14 +22,16 @@ use tracing::{debug, error, info, trace, warn};
 
 /// PG-based self-rebalancing: Calculate which PGs this miner is responsible for,
 /// query validator for files in each PG, and pull any missing shards
-pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()> {
+pub async fn self_rebalance_pg(_store: FsStore, endpoint: Endpoint) -> Result<()> {
+    if !get_validator_reachable().load(std::sync::atomic::Ordering::Relaxed) {
+        debug!("Skipping rebalance: validator not reachable");
+        return Ok(());
+    }
+
     info!("Starting PG-based self-rebalance");
 
-    // Get my miner UID (same calculation as in heartbeat)
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    use std::hash::{Hash, Hasher};
-    endpoint.secret_key().public().to_string().hash(&mut hasher);
-    let my_uid = (hasher.finish() as u32) & 0x7FFFFFFF;
+    // Get miner UID from global (computed once at startup)
+    let my_uid = crate::state::get_miner_uid();
 
     trace!(miner_uid = my_uid, "My miner UID");
 
@@ -54,8 +59,22 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
         }
     };
 
-    // Calculate which PGs we are responsible for
-    let my_pgs = common::calculate_my_pgs(my_uid, &cluster_map);
+    // Calculate which PGs we are responsible for (cached by epoch)
+    let current_epoch = cluster_map.epoch;
+    let my_pgs = {
+        let cache = crate::state::get_my_pgs_cache();
+        let cached = cache.read().await;
+        if cached.0 == current_epoch && !cached.1.is_empty() {
+            trace!(epoch = current_epoch, "Reusing cached PG assignments");
+            cached.1.clone()
+        } else {
+            drop(cached);
+            let pgs = common::calculate_my_pgs(my_uid, &cluster_map);
+            let mut cached = cache.write().await;
+            *cached = (current_epoch, pgs.clone());
+            pgs
+        }
+    };
     trace!(
         pg_count = my_pgs.len(),
         total_pgs = cluster_map.pg_count,
@@ -73,12 +92,12 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
     let mut total_files = 0;
     let mut files_processed = 0;
     let mut missing_shards = 0;
-    let mut expected_shards: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut expected_shards: std::collections::HashSet<iroh_blobs::Hash> =
+        std::collections::HashSet::new();
 
-    // Build batch query message with all our PGs
-    let query_msg = common::ValidatorControlMessage::QueryPgFilesBatch {
-        pg_ids: my_pgs.clone(),
-    };
+    // Build overall map for the file responses
+    let mut pg_files_map: std::collections::HashMap<u32, Vec<String>> =
+        std::collections::HashMap::with_capacity(my_pgs.len());
 
     // Connect to validator via P2P with timeout
     let connect_timeout = std::time::Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS);
@@ -86,54 +105,64 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
 
     debug!(
         pg_count = my_pgs.len(),
-        "Querying validator for files in assigned PGs (batch)"
+        "Querying validator for files in assigned PGs (chunked batch)"
     );
 
     // Single connection for all PG queries
-    let pg_files_map: std::collections::HashMap<u32, Vec<String>> = match tokio::time::timeout(
+    match tokio::time::timeout(
         connect_timeout,
         endpoint.connect(validator_addr.clone(), b"hippius/validator-control"),
     )
     .await
     {
         Ok(Ok(conn)) => {
-            let result: Result<std::collections::HashMap<u32, Vec<String>>> = async {
-                let (mut send, mut recv) = conn.open_bi().await?;
-                let msg_bytes = serde_json::to_vec(&query_msg)?;
-                send.write_all(&msg_bytes).await?;
-                send.finish()?;
-                let _ = send.stopped().await;
+            // Process PGs in chunks to prevent validator OOM
+            // 500 PGs * ~17 files/PG * 64 bytes/hash ≈ 544 KB per chunk (very safe)
+            for chunk in my_pgs.chunks(500) {
+                let query_msg = common::ValidatorControlMessage::QueryPgFilesBatch {
+                    pg_ids: chunk.to_vec(),
+                };
 
-                // Buffer for batch response (bounded to prevent OOM)
-                let response_bytes = tokio::time::timeout(
-                    read_timeout,
-                    recv.read_to_end(MAX_BATCH_PG_RESPONSE_SIZE),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("QueryPgFilesBatch read timeout"))??;
+                let result: Result<std::collections::HashMap<u32, Vec<String>>> = async {
+                    let (mut send, mut recv) = conn.open_bi().await?;
+                    let msg_bytes = serde_json::to_vec(&query_msg)?;
+                    send.write_all(&msg_bytes).await?;
+                    send.finish()?;
 
-                let files: std::collections::HashMap<u32, Vec<String>> =
-                    serde_json::from_slice(&response_bytes)?;
+                    // Buffer for batch response
+                    let response_bytes = tokio::time::timeout(
+                        read_timeout,
+                        recv.read_to_end(MAX_BATCH_PG_RESPONSE_SIZE),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("QueryPgFilesBatch read timeout"))??;
 
-                // Validate deserialized size to prevent memory exhaustion from
-                // many small strings that fit within the byte limit but expand in memory.
-                let total_entries: usize = files.values().map(|v| v.len()).sum();
-                if total_entries > 100_000 {
-                    anyhow::bail!(
-                        "PG batch response too large: {} file entries (max 100000)",
-                        total_entries
-                    );
+                    let files: std::collections::HashMap<u32, Vec<String>> =
+                        serde_json::from_slice(&response_bytes)?;
+
+                    // Validate deserialized size to prevent memory exhaustion
+                    let total_entries: usize = files.values().map(|v| v.len()).sum();
+                    if total_entries > 100_000 {
+                        anyhow::bail!(
+                            "PG batch response too large: {} file entries (max 100000)",
+                            total_entries
+                        );
+                    }
+
+                    Ok(files)
                 }
+                .await;
 
-                Ok(files)
-            }
-            .await;
-
-            match result {
-                Ok(f) => f,
-                Err(e) => {
-                    error!(error = %e, "Batch PG query failed");
-                    return Ok(());
+                match result {
+                    Ok(f) => {
+                        for (k, v) in f {
+                            pg_files_map.insert(k, v);
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Batch PG chunk query failed");
+                        // Continue to next chunk or abort? Better to continue
+                    }
                 }
             }
         }
@@ -145,92 +174,163 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
             error!("Connection timeout for batch PG query");
             return Ok(());
         }
-    };
+    }
 
     debug!(
         pgs_with_files = pg_files_map.len(),
         "Received batch PG query response"
     );
 
-    // Process all files from the batch response (with limits to prevent memory exhaustion)
-    'pg_loop: for (pg_id, files) in pg_files_map.iter() {
-        trace!(pg_id = pg_id, file_count = files.len(), "Processing PG");
-        total_files += files.len();
-
-        // For each file, fetch manifest and check which shards we should have
-        for file_hash in files.iter() {
-            // Check file processing limit
-            if files_processed >= REBALANCE_MAX_FILES_PER_CYCLE {
-                debug!(
-                    limit = REBALANCE_MAX_FILES_PER_CYCLE,
-                    processed = files_processed,
-                    "Hit file processing limit, continuing in next cycle"
-                );
-                break 'pg_loop;
-            }
-            files_processed += 1;
-
-            // Fetch manifest from validator
-            let manifest = match fetch_manifest_from_validator(
-                &endpoint,
-                &validator_addr,
-                file_hash,
-            )
-            .await
-            {
-                Ok(m) => m,
-                Err(e) => {
-                    error!(file_hash = %truncate_for_log(file_hash, 16), error = %e, "Failed to fetch manifest");
-                    continue;
-                }
-            };
-
-            let shards_per_stripe = manifest.stripe_config.k + manifest.stripe_config.m;
-            let num_stripes = manifest.shards.len().div_ceil(shards_per_stripe);
-
-            // For each shard, check if this miner should have it
-            for stripe_idx in 0..num_stripes {
-                for local_idx in 0..shards_per_stripe {
-                    let global_idx = stripe_idx * shards_per_stripe + local_idx;
-                    if global_idx >= manifest.shards.len() {
-                        continue;
+    // Pre-build set of locally present hashes by walking the blobs data directory once.
+    // This replaces per-shard store.has() async I/O with O(1) in-memory lookups and
+    // is also reused by gc_orphan_shards to avoid a redundant directory walk.
+    let local_hashes: std::collections::HashSet<iroh_blobs::Hash> = {
+        let blobs_path = {
+            let bd = get_blobs_dir().read().await;
+            bd.clone()
+        };
+        let mut set = std::collections::HashSet::new();
+        if let Some(ref blobs_dir) = blobs_path {
+            let data_dir = blobs_dir.join("data");
+            if let Ok(mut entries) = tokio::fs::read_dir(&data_dir).await {
+                while let Ok(Some(dir_entry)) = entries.next_entry().await {
+                    if let Some(filename) = dir_entry.file_name().to_str() {
+                        let hash_str = filename.strip_suffix(".data").unwrap_or(filename);
+                        if let Ok(h) = iroh_blobs::Hash::from_str(hash_str) {
+                            set.insert(h);
+                        }
                     }
+                }
+            }
+        }
+        trace!(
+            local_blobs = set.len(),
+            "Built local hash set from blobs directory"
+        );
+        set
+    };
 
-                    // FULL CRUSH (PG-based, per paper): PG placement + rotate by stripe_index
-                    let target = common::calculate_pg_placement_for_stripe(
-                        file_hash,
-                        stripe_idx as u64,
+    // Establish one P2P connection for all manifest fetches.
+    // QUIC natively multiplexes streams, so 16 concurrent bidi streams on one connection is safe.
+    let manifest_conn: Option<iroh::endpoint::Connection> = match tokio::time::timeout(
+        connect_timeout,
+        endpoint.connect(validator_addr.clone(), b"hippius/validator-control"),
+    )
+    .await
+    {
+        Ok(Ok(conn)) => Some(conn),
+        Ok(Err(e)) => {
+            error!(
+                error = %e,
+                "Failed to connect for manifest fetches"
+            );
+            None
+        }
+        Err(_) => {
+            error!("Connection timeout for manifest fetches");
+            None
+        }
+    };
+
+    if let Some(conn) = manifest_conn {
+        // Collect all file hashes (owned), respecting the per-cycle limit
+        total_files = pg_files_map.values().map(|v| v.len()).sum();
+        let file_entries: Vec<String> = pg_files_map
+            .values()
+            .flat_map(|files| files.iter().cloned())
+            .take(REBALANCE_MAX_FILES_PER_CYCLE)
+            .collect();
+        files_processed = file_entries.len();
+
+        // Fetch manifests concurrently (16 parallel QUIC streams on one connection)
+        use futures::stream::StreamExt;
+        let mut manifest_stream = futures::stream::iter(file_entries.into_iter())
+            .map(|file_hash| {
+                let conn = conn.clone();
+                async move {
+                    let result = fetch_manifest_on_conn(&conn, &file_hash).await;
+                    (file_hash, result)
+                }
+            })
+            .buffer_unordered(16);
+
+        let mut consecutive_failures: u32 = 0;
+        const MAX_CONSECUTIVE_FAILURES: u32 = 10;
+
+        while let Some((file_hash, result)) = manifest_stream.next().await {
+            match result {
+                Ok(manifest) => {
+                    consecutive_failures = 0;
+
+                    let shards_per_stripe = manifest.stripe_config.k + manifest.stripe_config.m;
+                    let num_stripes = manifest.shards.len().div_ceil(shards_per_stripe);
+
+                    // Compute PG and base CRUSH placement once per file
+                    let pg_id = common::calculate_pg(&file_hash, cluster_map.pg_count);
+                    let base_miners = match common::calculate_pg_placement(
+                        pg_id,
                         shards_per_stripe,
                         &cluster_map,
-                    )
-                    .ok()
-                    .and_then(|miners| miners.get(local_idx).cloned());
+                    ) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    let base_len = base_miners.len();
 
-                    if let Some(target_miner) = target
-                        && target_miner.uid == my_uid
-                    {
-                        let shard = &manifest.shards[global_idx];
-
-                        // Track this as an expected shard
-                        expected_shards.insert(shard.blob_hash.clone());
-
-                        // Check if we have this shard locally
-                        let has_shard =
-                            if let Ok(hash) = iroh_blobs::Hash::from_str(&shard.blob_hash) {
-                                store.has(hash).await.unwrap_or(false)
-                            } else {
-                                false
-                            };
-
-                        if !has_shard {
-                            missing_shards += 1;
-                            trace!(
-                                shard_idx = local_idx,
-                                blob_hash = %truncate_for_log(&shard.blob_hash, 16),
-                                file_hash = %truncate_for_log(file_hash, 16),
-                                "Missing shard (validator handles migration via PullFromPeer)"
-                            );
+                    for stripe_idx in 0..num_stripes {
+                        let mut stripe_miners = base_miners.clone();
+                        if base_len > 0 {
+                            stripe_miners.rotate_left(stripe_idx % base_len);
                         }
+
+                        for local_idx in 0..shards_per_stripe {
+                            let global_idx = stripe_idx * shards_per_stripe + local_idx;
+                            if global_idx >= manifest.shards.len() {
+                                continue;
+                            }
+
+                            let target = stripe_miners.get(local_idx);
+
+                            if let Some(target_miner) = target
+                                && target_miner.uid == my_uid
+                            {
+                                let shard = &manifest.shards[global_idx];
+
+                                let shard_hash =
+                                    if let Ok(h) = iroh_blobs::Hash::from_str(&shard.blob_hash) {
+                                        h
+                                    } else {
+                                        continue;
+                                    };
+
+                                expected_shards.insert(shard_hash);
+
+                                if !local_hashes.contains(&shard_hash) {
+                                    missing_shards += 1;
+                                    trace!(
+                                        shard_idx = local_idx,
+                                        blob_hash = %truncate_for_log(&shard.blob_hash, 16),
+                                        file_hash = %truncate_for_log(&file_hash, 16),
+                                        "Missing shard (validator handles migration via PullFromPeer)"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        file_hash = %truncate_for_log(&file_hash, 16),
+                        error = %e,
+                        "Failed to fetch manifest"
+                    );
+                    consecutive_failures += 1;
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        error!(
+                            failures = consecutive_failures,
+                            "Too many consecutive manifest failures, aborting rebalance"
+                        );
+                        break;
                     }
                 }
             }
@@ -246,14 +346,21 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
     );
 
     // GC: Walk blobs directory, identify orphans, delete after grace period
-    gc_orphan_shards(&expected_shards).await;
+    gc_orphan_shards(&expected_shards, &local_hashes).await;
 
     info!("PG-based self-rebalance complete");
     Ok(())
 }
 
-/// Garbage collect orphan shards
-async fn gc_orphan_shards(expected_shards: &std::collections::HashSet<String>) {
+/// Garbage collect orphan shards.
+///
+/// Uses the pre-built `local_hashes` set from the rebalance directory walk
+/// to avoid a redundant directory scan. Only needs to touch the filesystem
+/// to delete confirmed orphans.
+async fn gc_orphan_shards(
+    expected_shards: &std::collections::HashSet<iroh_blobs::Hash>,
+    local_hashes: &std::collections::HashSet<iroh_blobs::Hash>,
+) {
     let now = now_secs();
 
     // Guard: if clock skew detected, skip GC entirely
@@ -262,146 +369,142 @@ async fn gc_orphan_shards(expected_shards: &std::collections::HashSet<String>) {
         return;
     }
 
-    // Get blobs directory for file system walking
+    // Get blobs directory for file deletion paths
     let blobs_path = {
         let bd = get_blobs_dir().read().await;
         bd.clone()
     };
 
-    if let Some(blobs_dir) = blobs_path {
-        let data_dir = blobs_dir.join("data");
+    let Some(blobs_dir) = blobs_path else {
+        return;
+    };
+    let data_dir = blobs_dir.join("data");
 
-        if data_dir.exists() {
-            let mut orphan_count = 0;
-            let mut deleted_count = 0;
-            let mut kept_count = 0;
+    let mut orphan_count = 0;
+    let mut deleted_count = 0;
+    let mut kept_count = 0;
 
-            // Use DashMap for lock-free orphan tracking
-            let orphan_map = get_orphan_shards();
+    // Use DashMap for lock-free orphan tracking
+    let orphan_map = get_orphan_shards();
 
-            // Walk the data directory looking for blob entries
-            if let Ok(mut entries) = tokio::fs::read_dir(&data_dir).await {
-                while let Ok(Some(dir_entry)) = entries.next_entry().await {
-                    let path = dir_entry.path();
+    // Iterate over pre-built local hash set (no directory walk needed)
+    for &blob_hash in local_hashes {
+        if expected_shards.contains(&blob_hash) {
+            // This is expected - remove from orphan tracking
+            orphan_map.remove(&blob_hash);
+            kept_count += 1;
+        } else {
+            // Potential orphan
+            orphan_count += 1;
+            let hash_str = blob_hash.to_string();
 
-                    // Try to extract hash from filename
-                    if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                        // iroh-blobs stores files as {hash}.data
-                        let hash_str = if filename.ends_with(".data") {
-                            filename.trim_end_matches(".data").to_string()
-                        } else {
-                            filename.to_string()
-                        };
+            if let Some(orphan_entry) = orphan_map.get(&blob_hash) {
+                let first_seen = *orphan_entry;
+                drop(orphan_entry);
 
-                        if expected_shards.contains(&hash_str) {
-                            // This is expected - remove from orphan tracking
-                            orphan_map.remove(&hash_str);
-                            kept_count += 1;
-                        } else if hash_str.len() > 20 {
-                            // Looks like a blob hash - potential orphan
-                            orphan_count += 1;
+                // Guard: if now < first_seen, entry is corrupted
+                if now < first_seen {
+                    warn!(
+                        hash = %truncate_for_log(&hash_str, 16),
+                        "Clock skew detected: removing corrupted orphan entry"
+                    );
+                    orphan_map.remove(&blob_hash);
+                    continue;
+                }
 
-                            if let Some(orphan_entry) = orphan_map.get(&hash_str) {
-                                let first_seen = *orphan_entry;
-                                drop(orphan_entry);
-
-                                // Guard: if now < first_seen, entry is corrupted
-                                if now < first_seen {
-                                    warn!(
-                                        hash = %truncate_for_log(&hash_str, 16),
-                                        "Clock skew detected: removing corrupted orphan entry"
-                                    );
-                                    orphan_map.remove(&hash_str);
-                                    continue;
-                                }
-
-                                // Check if grace period expired
-                                if now - first_seen > ORPHAN_GRACE_PERIOD_SECS {
-                                    // Delete this orphan
-                                    trace!(
-                                        hash = %truncate_for_log(&hash_str, 16),
-                                        age_secs = now - first_seen,
-                                        "GC: Deleting orphan"
-                                    );
-                                    if let Err(e) = tokio::fs::remove_file(&path).await {
-                                        error!(
-                                            hash = %truncate_for_log(&hash_str, 16),
-                                            error = %e,
-                                            "Failed to delete orphan"
-                                        );
-                                    } else {
-                                        deleted_count += 1;
-                                        orphan_map.remove(&hash_str);
-                                    }
-                                }
-                                // else: still in grace period, keep tracking
-                            } else {
-                                // New orphan - start tracking with timestamp
-                                // Bound orphan map size to prevent unbounded memory growth
-                                if orphan_map.len() < MAX_ORPHAN_ENTRIES {
-                                    orphan_map.insert(hash_str, now);
-                                } else {
-                                    warn!(
-                                        capacity = MAX_ORPHAN_ENTRIES,
-                                        hash = %truncate_for_log(&hash_str, 16),
-                                        "Orphan map at capacity, skipping tracking"
-                                    );
-                                }
+                // Check if grace period expired
+                if now - first_seen > ORPHAN_GRACE_PERIOD_SECS {
+                    // Delete this orphan — try both filename formats
+                    trace!(
+                        hash = %truncate_for_log(&hash_str, 16),
+                        age_secs = now - first_seen,
+                        "GC: Deleting orphan"
+                    );
+                    let p1 = data_dir.join(format!("{}.data", hash_str));
+                    let p2 = data_dir.join(&hash_str);
+                    let mut removed = false;
+                    for p in [p1, p2] {
+                        match tokio::fs::remove_file(&p).await {
+                            Ok(()) => {
+                                removed = true;
+                                break;
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => {
+                                error!(
+                                    hash = %truncate_for_log(&hash_str, 16),
+                                    error = %e,
+                                    "Failed to delete orphan"
+                                );
                             }
                         }
                     }
+                    if removed {
+                        deleted_count += 1;
+                        orphan_map.remove(&blob_hash);
+                    }
                 }
-            }
-
-            if orphan_count > 0 || deleted_count > 0 {
-                debug!(
-                    expected = kept_count,
-                    orphans_tracked = orphan_count,
-                    deleted = deleted_count,
-                    grace_period_secs = ORPHAN_GRACE_PERIOD_SECS,
-                    "GC complete"
-                );
+                // else: still in grace period, keep tracking
+            } else {
+                // New orphan - start tracking with timestamp
+                // Bound orphan map size to prevent unbounded memory growth
+                if orphan_map.len() < MAX_ORPHAN_ENTRIES {
+                    orphan_map.insert(blob_hash, now);
+                } else {
+                    warn!(
+                        capacity = MAX_ORPHAN_ENTRIES,
+                        hash = %truncate_for_log(&hash_str, 16),
+                        "Orphan map at capacity, skipping tracking"
+                    );
+                }
             }
         }
     }
+
+    if orphan_count > 0 || deleted_count > 0 {
+        debug!(
+            expected = kept_count,
+            orphans_tracked = orphan_count,
+            deleted = deleted_count,
+            grace_period_secs = ORPHAN_GRACE_PERIOD_SECS,
+            "GC complete"
+        );
+    }
 }
 
-/// Fetch manifest from validator via P2P
-pub async fn fetch_manifest_from_validator(
-    endpoint: &Endpoint,
-    validator_addr: &iroh::EndpointAddr,
+/// Fetch manifest using an existing P2P connection (opens a new bidi stream).
+///
+/// Reuses the connection instead of creating one per file, avoiding
+/// connection storms that overwhelm the validator.
+async fn fetch_manifest_on_conn(
+    conn: &iroh::endpoint::Connection,
     file_hash: &str,
 ) -> Result<common::FileManifest> {
     let query_msg = common::ValidatorControlMessage::QueryManifest {
         file_hash: file_hash.to_string(),
     };
 
-    let conn = tokio::time::timeout(
-        std::time::Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
-        endpoint.connect(validator_addr.clone(), b"hippius/validator-control"),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Connection timeout fetching manifest"))??;
-
     let (mut send, mut recv) =
         tokio::time::timeout(std::time::Duration::from_secs(10), conn.open_bi())
             .await
-            .map_err(|_| anyhow::anyhow!("Stream open timeout fetching manifest"))??;
+            .map_err(|_| anyhow::anyhow!("Stream open timeout"))??;
 
     let msg_bytes = serde_json::to_vec(&query_msg)?;
     send.write_all(&msg_bytes).await?;
     send.finish()?;
-    let _ = send.stopped().await;
 
     let response_bytes = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         recv.read_to_end(1024 * 1024),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("Read timeout fetching manifest"))??; // Max 1MB manifest
+    .map_err(|_| anyhow::anyhow!("Read timeout fetching manifest"))??;
 
     if response_bytes == b"NOT_FOUND" {
         return Err(anyhow::anyhow!("Manifest not found"));
+    }
+    if response_bytes == b"WARMING_UP" {
+        return Err(anyhow::anyhow!("Validator still warming up"));
     }
 
     let manifest: common::FileManifest = serde_json::from_slice(&response_bytes)?;

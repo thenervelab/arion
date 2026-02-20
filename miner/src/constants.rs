@@ -78,8 +78,11 @@ pub const MAX_CONNECTION_POOL_SIZE: usize = 500;
 /// message structure changes or cluster maps are received via a different path.
 pub const MAX_CLUSTER_MAP_JSON_SIZE: usize = 10 * 1024 * 1024;
 
-/// Maximum HTTP body size when HTTP server is enabled (10MB)
-pub const MAX_HTTP_BODY_SIZE: usize = 10 * 1024 * 1024;
-
 /// Maximum batch PG response size (20MB - reduced from 50MB)
 pub const MAX_BATCH_PG_RESPONSE_SIZE: usize = 20 * 1024 * 1024;
+
+/// Maximum tag map entries (Hash -> Tag) for O(1) delete lookups
+pub const MAX_TAG_MAP_ENTRIES: usize = 200_000;
+
+/// PoS commitment cache size (number of entries, ~200KB each ≈ 20MB max)
+pub const POS_COMMITMENT_CACHE_SIZE: usize = 100;

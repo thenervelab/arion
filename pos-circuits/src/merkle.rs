@@ -191,7 +191,7 @@ impl MerkleTree {
         let mut index = proof.leaf_index as usize;
 
         for sibling in &proof.siblings {
-            current = if index % 2 == 0 {
+            current = if index.is_multiple_of(2) {
                 // Current is left child
                 poseidon2_hash_two(&current, sibling)
             } else {

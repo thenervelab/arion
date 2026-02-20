@@ -49,9 +49,6 @@ Copy `miner.example.toml` to `miner.toml`:
 
 ```toml
 [network]
-# HTTP API port (only used if MINER_HTTP_ENABLED=true)
-port = 3001
-
 # Public hostname/IP for other nodes to reach this miner
 hostname = "your-miner-hostname.example.com"
 

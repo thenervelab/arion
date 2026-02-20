@@ -119,7 +119,7 @@ pub fn generate_merkle_proof_trace(
         values[row_offset + 2 * DIGEST_ELEMS + 1] = BabyBear::ONE;
 
         // Compute next hash
-        current = if index % 2 == 0 {
+        current = if index.is_multiple_of(2) {
             poseidon2_hash_two(&current, sibling)
         } else {
             poseidon2_hash_two(sibling, &current)

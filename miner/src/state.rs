@@ -1,9 +1,6 @@
-//! Application state and global state accessors for the miner.
+//! Global state accessors for the miner.
 //!
-//! This module provides two categories of state:
-//!
-//! 1. **AppState**: Per-request state passed to HTTP handlers (endpoint, blob store)
-//! 2. **Global statics**: Shared state accessed via accessor functions (OnceLock-wrapped)
+//! This module provides shared state accessed via accessor functions (OnceLock-wrapped).
 //!
 //! # Global State Design
 //!
@@ -24,24 +21,19 @@
 #![allow(dead_code)]
 #![allow(clippy::type_complexity)]
 
-use crate::constants::{BLOB_CACHE_SIZE, CONNECTION_TTL_SECS, MAX_CONNECTION_POOL_SIZE};
+use crate::constants::{
+    BLOB_CACHE_SIZE, CONNECTION_TTL_SECS, MAX_CONNECTION_POOL_SIZE, MAX_TAG_MAP_ENTRIES,
+};
 use anyhow::Result;
 use common::now_secs;
 use dashmap::DashMap;
 use iroh::endpoint::Endpoint;
-use iroh_blobs::store::fs::FsStore;
 use quick_cache::sync::Cache;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::RwLock;
-
-/// Application state for HTTP handlers
-#[derive(Clone)]
-pub struct AppState {
-    pub endpoint: Endpoint,
-    pub store: FsStore,
-}
 
 // ============================================================================
 // Global State (using DashMap for lock-free concurrent access)
@@ -60,7 +52,8 @@ static CLUSTER_MAP: OnceLock<Arc<RwLock<Option<Arc<common::ClusterMap>>>>> = Onc
 static VALIDATOR_ENDPOINT: OnceLock<Arc<RwLock<Option<iroh::EndpointAddr>>>> = OnceLock::new();
 
 /// Track orphan shards: blob_hash -> timestamp when first identified as orphan (lock-free)
-static ORPHAN_SHARDS: OnceLock<DashMap<String, u64>> = OnceLock::new();
+/// Key is iroh_blobs::Hash (32 bytes, Copy) instead of String to avoid heap allocation.
+static ORPHAN_SHARDS: OnceLock<DashMap<iroh_blobs::Hash, u64>> = OnceLock::new();
 
 /// Store the blobs directory path for GC file system access
 static BLOBS_DIR: OnceLock<Arc<RwLock<Option<std::path::PathBuf>>>> = OnceLock::new();
@@ -82,6 +75,24 @@ static NEEDS_REREGISTRATION: OnceLock<Arc<std::sync::atomic::AtomicBool>> = Once
 /// Dynamic warden node IDs for PoS challenge authorization (auto-distributed by validator)
 static WARDEN_NODE_IDS: OnceLock<Arc<RwLock<Vec<iroh::PublicKey>>>> = OnceLock::new();
 
+/// Whether the validator is currently reachable (set by heartbeat loop, read by rebalance loop)
+static VALIDATOR_REACHABLE: OnceLock<AtomicBool> = OnceLock::new();
+
+/// Miner UID computed once from public key hash (avoids repeated hashing + heap alloc)
+static MINER_UID: OnceLock<u32> = OnceLock::new();
+
+/// Tag map for O(1) delete: maps blob Hash to its Tag name.
+/// Populated on Store/Pull, used by Delete to skip full tag scan.
+static TAG_MAP: OnceLock<DashMap<iroh_blobs::Hash, iroh_blobs::api::Tag>> = OnceLock::new();
+
+/// Cached PG assignments: (epoch, pgs) — recomputed only when epoch changes
+static MY_PGS_CACHE: OnceLock<Arc<RwLock<(u64, Vec<u32>)>>> = OnceLock::new();
+
+/// PoS commitment cache: avoids rebuilding Poseidon2 Merkle trees on repeated challenges
+static POS_COMMITMENT_CACHE: OnceLock<
+    Arc<Cache<iroh_blobs::Hash, Arc<pos_circuits::commitment::CommitmentWithTree>>>,
+> = OnceLock::new();
+
 pub fn get_peer_cache() -> &'static DashMap<String, iroh::EndpointAddr> {
     PEER_MINER_CACHE.get_or_init(DashMap::new)
 }
@@ -98,7 +109,7 @@ pub fn get_validator_endpoint() -> &'static Arc<RwLock<Option<iroh::EndpointAddr
     VALIDATOR_ENDPOINT.get_or_init(|| Arc::new(RwLock::new(None)))
 }
 
-pub fn get_orphan_shards() -> &'static DashMap<String, u64> {
+pub fn get_orphan_shards() -> &'static DashMap<iroh_blobs::Hash, u64> {
     ORPHAN_SHARDS.get_or_init(DashMap::new)
 }
 
@@ -121,6 +132,42 @@ pub fn get_needs_reregistration() -> &'static Arc<std::sync::atomic::AtomicBool>
 
 pub fn get_warden_node_ids() -> &'static Arc<RwLock<Vec<iroh::PublicKey>>> {
     WARDEN_NODE_IDS.get_or_init(|| Arc::new(RwLock::new(Vec::new())))
+}
+
+pub fn get_validator_reachable() -> &'static AtomicBool {
+    VALIDATOR_REACHABLE.get_or_init(|| AtomicBool::new(false))
+}
+
+pub fn set_miner_uid(uid: u32) {
+    let _ = MINER_UID.set(uid);
+}
+
+pub fn get_miner_uid() -> u32 {
+    *MINER_UID
+        .get()
+        .expect("MINER_UID not initialized — call set_miner_uid() during startup")
+}
+
+pub fn get_tag_map() -> &'static DashMap<iroh_blobs::Hash, iroh_blobs::api::Tag> {
+    TAG_MAP.get_or_init(DashMap::new)
+}
+
+/// Insert a tag mapping, respecting the size limit
+pub fn tag_map_insert(hash: iroh_blobs::Hash, tag: iroh_blobs::api::Tag) {
+    let map = get_tag_map();
+    if map.len() < MAX_TAG_MAP_ENTRIES {
+        map.insert(hash, tag);
+    }
+}
+
+pub fn get_my_pgs_cache() -> &'static Arc<RwLock<(u64, Vec<u32>)>> {
+    MY_PGS_CACHE.get_or_init(|| Arc::new(RwLock::new((0, Vec::new()))))
+}
+
+pub fn get_pos_commitment_cache()
+-> &'static Arc<Cache<iroh_blobs::Hash, Arc<pos_circuits::commitment::CommitmentWithTree>>> {
+    POS_COMMITMENT_CACHE
+        .get_or_init(|| Arc::new(Cache::new(crate::constants::POS_COMMITMENT_CACHE_SIZE)))
 }
 
 /// Get a pooled connection or create a new one
@@ -179,34 +226,24 @@ pub async fn get_pooled_connection(
         }
 
         // Enforce hard cap on pool size to prevent OOM
-        // If at capacity, evict ~10% oldest entries to reduce eviction frequency under burst
         if pool.len() >= MAX_CONNECTION_POOL_SIZE {
-            let entries_to_remove = pool.len() / 10 + 1; // Remove ~10%
-            let mut oldest: Vec<_> = pool.iter().map(|(k, (_, ts))| (*k, *ts)).collect();
-            oldest.sort_by_key(|(_, ts)| *ts);
-            for (key, _) in oldest.into_iter().take(entries_to_remove) {
-                pool.remove(&key);
+            // First pass: cheap threshold-based cleanup (expired + closed)
+            let threshold = now.saturating_sub(CONNECTION_TTL_SECS);
+            pool.retain(|_, (conn, created)| {
+                *created > threshold && *created <= now && conn.closed().now_or_never().is_none()
+            });
+            // If still over capacity after TTL cleanup, fall back to sort-based eviction
+            if pool.len() >= MAX_CONNECTION_POOL_SIZE {
+                let entries_to_remove = pool.len() / 10 + 1;
+                let mut oldest: Vec<_> = pool.iter().map(|(k, (_, ts))| (*k, *ts)).collect();
+                oldest.sort_by_key(|(_, ts)| *ts);
+                for (evict_key, _) in oldest.into_iter().take(entries_to_remove) {
+                    pool.remove(&evict_key);
+                }
             }
         }
 
         pool.insert(key, (conn.clone(), now));
-
-        // Periodic cleanup when pool gets large: remove expired/closed connections.
-        // Build removal list inline to minimize time holding the write lock.
-        if pool.len() > 100 {
-            let stale_keys: Vec<_> = pool
-                .iter()
-                .filter(|(_, (c, created))| {
-                    *created > now
-                        || now - *created >= CONNECTION_TTL_SECS * 2
-                        || c.closed().now_or_never().is_some()
-                })
-                .map(|(k, _)| *k)
-                .collect();
-            for k in stale_keys {
-                pool.remove(&k);
-            }
-        }
     }
 
     Ok(conn)
