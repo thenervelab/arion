@@ -4,7 +4,7 @@
 //! - Arbitrary byte arrays (chunks)
 //! - Pairs of hashes (for Merkle tree construction)
 
-use p3_baby_bear::{default_babybear_poseidon2_16, BabyBear};
+use p3_baby_bear::{BabyBear, default_babybear_poseidon2_16};
 use p3_field::{PrimeCharacteristicRing, PrimeField32};
 use p3_symmetric::Permutation;
 

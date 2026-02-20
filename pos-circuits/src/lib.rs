@@ -44,7 +44,7 @@ pub mod types;
 pub mod verifier;
 
 // Re-export main types and functions
-pub use commitment::{generate_commitment, Commitment};
+pub use commitment::{Commitment, generate_commitment};
 pub use error::{PosError, Result};
 pub use hash::poseidon2_hash_bytes;
 pub use merkle::MerkleTree;

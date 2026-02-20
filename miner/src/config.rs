@@ -148,6 +148,13 @@ pub struct ValidatorConfig {
     /// Warden Node ID (Ed25519 public key) for PoS challenges
     pub warden_node_id: Option<String>,
 
+    /// Validator direct socket addresses for P2P address seeding
+    /// (comma-separated, e.g. "10.0.0.1:11220,192.168.1.1:11220")
+    ///
+    /// Override: `VALIDATOR_DIRECT_ADDRS` env var.
+    #[serde(default = "default_validator_direct_addrs")]
+    pub validator_direct_addrs: Option<String>,
+
     /// Heartbeat interval in seconds
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval_secs: u64,
@@ -162,12 +169,16 @@ impl Default for ValidatorConfig {
         Self {
             node_id: None,
             warden_node_id: None,
+            validator_direct_addrs: default_validator_direct_addrs(),
             heartbeat_interval_secs: default_heartbeat_interval(),
             registration_retry_secs: default_registration_retry(),
         }
     }
 }
 
+fn default_validator_direct_addrs() -> Option<String> {
+    Some("91.134.31.179:11220".to_string())
+}
 fn default_heartbeat_interval() -> u64 {
     30
 }
@@ -239,6 +250,12 @@ impl MinerConfig {
 
         if let Ok(val) = std::env::var("WARDEN_NODE_ID") {
             config.validator.warden_node_id = Some(val);
+        }
+
+        if let Ok(val) = std::env::var("VALIDATOR_DIRECT_ADDRS")
+            && !val.trim().is_empty()
+        {
+            config.validator.validator_direct_addrs = Some(val);
         }
 
         // Tuning env overrides

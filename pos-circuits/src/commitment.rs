@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::hash::poseidon2_hash_bytes;
 use crate::merkle::MerkleTree;
 use crate::types::Poseidon2Hash;
-use crate::{PosError, Result, DEFAULT_CHUNK_SIZE};
+use crate::{DEFAULT_CHUNK_SIZE, PosError, Result};
 
 /// A storage commitment for a shard.
 ///

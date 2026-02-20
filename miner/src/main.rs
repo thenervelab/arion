@@ -386,6 +386,29 @@ async fn run_miner(cli: Cli) -> Result<()> {
         })
         .transpose()?;
 
+    // Parse validator direct addresses for P2P seeding
+    let validator_direct_addrs: Vec<std::net::SocketAddr> = config
+        .validator
+        .validator_direct_addrs
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .filter_map(|s| {
+            s.trim().parse().map_err(|e| {
+                warn!(addr = %s.trim(), error = %e, "Ignoring invalid VALIDATOR_DIRECT_ADDRS entry");
+                e
+            }).ok()
+        })
+        .collect();
+
+    if !validator_direct_addrs.is_empty() {
+        info!(
+            addrs = ?validator_direct_addrs,
+            "Seeding validator direct addresses for P2P"
+        );
+    }
+
     // Initialize dynamic warden node IDs from config (will be updated by validator heartbeats)
     if let Some(wpk) = warden_pubkey {
         let mut ids = get_warden_node_ids().write().await;
@@ -405,6 +428,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
         &family_id,
         &data_dir,
         &config,
+        &validator_direct_addrs,
     )
     .await?;
 
@@ -442,6 +466,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
         config.storage.max_storage_gb,
         family_id.clone(),
         config.clone(),
+        validator_direct_addrs,
     );
 
     // 6. Start Self-Rebalance Loop (if enabled)
@@ -498,6 +523,24 @@ async fn run_miner(cli: Cli) -> Result<()> {
     // Keep process alive: miner runs purely on P2P
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+/// Build a validator `EndpointAddr` seeded with direct socket addresses
+/// and an optional relay URL so iroh can connect over UDP immediately
+/// instead of discovering the validator via relay first.
+fn build_validator_addr(
+    pubkey: &iroh::PublicKey,
+    direct_addrs: &[std::net::SocketAddr],
+    relay_url: &Option<iroh_base::RelayUrl>,
+) -> iroh::EndpointAddr {
+    let mut addr = iroh::EndpointAddr::new(*pubkey);
+    if !direct_addrs.is_empty() {
+        addr = addr.with_addrs(direct_addrs.iter().map(|a| iroh::TransportAddr::Ip(*a)));
+    }
+    if let Some(url) = relay_url {
+        addr = addr.with_relay_url(url.clone());
+    }
+    addr
 }
 
 /// Returns true if the miner has a direct UDP path to the validator.
@@ -570,6 +613,7 @@ async fn register_with_validator(
     family_id: &str,
     data_dir: &std::path::Path,
     config: &config::MinerConfig,
+    validator_direct_addrs: &[std::net::SocketAddr],
 ) -> Result<()> {
     // Give iroh time to establish a direct connection via hole-punching.
     // The initial relay connection triggers STUN discovery; this polls
@@ -598,12 +642,14 @@ async fn register_with_validator(
             family_id,
             data_dir,
             config,
+            validator_direct_addrs,
         )
         .await
         {
             Ok(()) => {
                 info!("Registered with validator via P2P");
-                let validator_addr = iroh::EndpointAddr::new(*validator_pubkey);
+                let validator_addr =
+                    build_validator_addr(validator_pubkey, validator_direct_addrs, relay_url);
                 {
                     let mut val_ep = get_validator_endpoint().write().await;
                     *val_ep = Some(validator_addr);
@@ -653,6 +699,7 @@ fn spawn_heartbeat_loop(
     max_storage_gb: u64,
     family_id: String,
     config: config::MinerConfig,
+    validator_direct_addrs: Vec<std::net::SocketAddr>,
 ) {
     let miner_uid = state::get_miner_uid();
 
@@ -661,7 +708,11 @@ fn spawn_heartbeat_loop(
         let mut consecutive_failures: u32 = 0;
         let mut current_validator_pubkey = validator_pubkey;
 
-        let mut heartbeat_validator_addr = iroh::EndpointAddr::new(current_validator_pubkey);
+        let mut heartbeat_validator_addr = build_validator_addr(
+            &current_validator_pubkey,
+            &validator_direct_addrs,
+            &relay_url,
+        );
 
         // Persistent connection: reuse a single QUIC connection across heartbeats
         // instead of creating a new one every 30s. Open a fresh bidi stream per
@@ -687,13 +738,18 @@ fn spawn_heartbeat_loop(
                     &family_id,
                     &data_dir,
                     &config,
+                    &validator_direct_addrs,
                 )
                 .await
                 {
                     Ok(()) => {
                         info!("Re-registration successful");
                         // Update stored validator endpoint
-                        let new_addr = iroh::EndpointAddr::new(current_validator_pubkey);
+                        let new_addr = build_validator_addr(
+                            &current_validator_pubkey,
+                            &validator_direct_addrs,
+                            &relay_url,
+                        );
                         {
                             let mut val_ep = get_validator_endpoint().write().await;
                             *val_ep = Some(new_addr.clone());
@@ -736,7 +792,11 @@ fn spawn_heartbeat_loop(
                     "Validator address refreshed from environment"
                 );
                 current_validator_pubkey = new_pubkey;
-                heartbeat_validator_addr = iroh::EndpointAddr::new(current_validator_pubkey);
+                heartbeat_validator_addr = build_validator_addr(
+                    &current_validator_pubkey,
+                    &validator_direct_addrs,
+                    &relay_url,
+                );
 
                 // Update stored validator endpoint
                 {
@@ -963,6 +1023,7 @@ async fn register_with_validator_once(
     family_id: &str,
     data_dir: &std::path::Path,
     config: &config::MinerConfig,
+    validator_direct_addrs: &[std::net::SocketAddr],
 ) -> Result<()> {
     // Calculate storage stats
     let available = free_space(data_dir).unwrap_or(0);
@@ -1053,8 +1114,8 @@ async fn register_with_validator_once(
         }
     };
 
-    // Connect to validator via P2P
-    let validator_addr = iroh::EndpointAddr::new(*validator_pubkey);
+    // Connect to validator via P2P with direct address hints
+    let validator_addr = build_validator_addr(validator_pubkey, validator_direct_addrs, relay_url);
 
     let conn = tokio::time::timeout(
         std::time::Duration::from_secs(10),

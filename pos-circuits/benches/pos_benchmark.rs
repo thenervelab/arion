@@ -4,9 +4,9 @@
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use pos_circuits::{
-    commitment::{generate_commitment, CommitmentWithTree},
+    commitment::{CommitmentWithTree, generate_commitment},
     hash::{poseidon2_hash_bytes, poseidon2_hash_two},
     merkle::MerkleTree,
     prover::generate_proof,

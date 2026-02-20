@@ -838,6 +838,7 @@ async fn rebalance_file(
     // Count shards that need to move for this file
     let mut shards_to_move = 0usize;
     let mut shards_confirmed = 0usize;
+    let mut shards_skipped = 0usize;
 
     for shard in manifest.shards.iter() {
         let stripe_idx = shard.index / shards_per_stripe;
@@ -868,6 +869,52 @@ async fn rebalance_file(
         }
 
         shards_to_move += 1;
+
+        // Pre-check: ask the source miner if it actually has the shard before
+        // telling the destination to pull.  This avoids noisy "Not found" errors
+        // and wasted connection overhead when the source already GC'd the blob.
+        let src_has_blob = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state
+                .endpoint
+                .connect(src.endpoint.clone(), b"hippius/miner-control"),
+        )
+        .await
+        {
+            Ok(Ok(conn)) => {
+                let check_msg = common::MinerControlMessage::CheckBlob {
+                    hash: shard.blob_hash.clone(),
+                };
+                let check_bytes = serde_json::to_vec(&check_msg)?;
+                match conn.open_bi().await {
+                    Ok((mut send, mut recv)) => {
+                        let _ = send.write_all(&check_bytes).await;
+                        let _ = send.finish();
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            recv.read_to_end(64),
+                        )
+                        .await
+                        {
+                            Ok(Ok(resp)) => resp == b"HAS:true",
+                            _ => false,
+                        }
+                    }
+                    Err(_) => false,
+                }
+            }
+            _ => false,
+        };
+
+        if !src_has_blob {
+            debug!(
+                shard = %&shard.blob_hash[..16.min(shard.blob_hash.len())],
+                src_uid = src.uid,
+                "CheckBlob: source does not have shard, skipping PullFromPeer"
+            );
+            shards_skipped += 1;
+            continue;
+        }
 
         // Register pending ACK before sending
         let ack_key = (to_epoch, pg_id, shard.blob_hash.clone());
@@ -949,6 +996,7 @@ async fn rebalance_file(
         to_epoch = to_epoch,
         shards_moved = shards_to_move,
         shards_confirmed = shards_confirmed,
+        shards_skipped = shards_skipped,
         "Rebalance file completed"
     );
 

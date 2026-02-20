@@ -488,9 +488,7 @@ pub enum MinerControlMessage {
         data_len: u64,
     },
     /// Lightweight metadata-only existence check (no data transfer)
-    CheckBlob {
-        hash: String,
-    },
+    CheckBlob { hash: String },
 }
 
 /// Magic byte for StoreV2 binary framing protocol.
@@ -2259,8 +2257,7 @@ impl P2pConnectionManager {
 
             match tokio::time::timeout(
                 std::time::Duration::from_secs(P2P_DEFAULT_TIMEOUT_SECS),
-                self.endpoint
-                    .connect(self.target_node_id, self.alpn),
+                self.endpoint.connect(self.target_node_id, self.alpn),
             )
             .await
             {

@@ -11,14 +11,14 @@
 use p3_air::{Air, AirBuilder, BaseAir};
 use p3_baby_bear::BabyBear;
 use p3_field::{Field, PrimeCharacteristicRing};
-use p3_matrix::dense::RowMajorMatrix;
 use p3_matrix::Matrix;
+use p3_matrix::dense::RowMajorMatrix;
 
+use crate::Result;
 use crate::config::{DIGEST_ELEMS, F};
 use crate::hash::poseidon2_hash_two;
 use crate::merkle::MerkleTree;
 use crate::types::{MerkleProof, Poseidon2Hash};
-use crate::Result;
 
 /// Width of the AIR trace for Merkle proof verification.
 /// Each row contains: current_hash (8) + sibling_hash (8) + path_bit (1) + is_active (1) = 18
