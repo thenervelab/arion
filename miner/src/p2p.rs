@@ -79,6 +79,31 @@ fn has_direct_path(endpoint: &Endpoint, node_id: iroh::PublicKey) -> bool {
     })
 }
 
+/// Wait briefly for a direct UDP path to a peer.
+/// Iroh connections transition relay → mixed → direct; this polls
+/// until Direct is confirmed or the timeout expires.
+/// Returns true if a direct path was established.
+async fn wait_for_direct_peer_path(
+    endpoint: &Endpoint,
+    node_id: iroh::PublicKey,
+    timeout_ms: u64,
+) -> bool {
+    if has_direct_path(endpoint, node_id) {
+        return true;
+    }
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
+
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        if has_direct_path(endpoint, node_id) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Result of attempting to acquire a semaphore permit with timeout
 enum PermitResult {
     Acquired(tokio::sync::OwnedSemaphorePermit),
@@ -1054,15 +1079,17 @@ pub async fn pull_blob_from_peer(
     let conn = crate::state::get_pooled_connection(&endpoint, &peer_addr, b"hippius/miner-control")
         .await?;
 
-    // Reject relay-only connections to prevent shard data from flowing through relay
-    if !has_direct_path(&endpoint, peer_addr.id) {
+    // Wait briefly for direct path — Iroh connections transition
+    // relay → mixed → direct; the mixed→direct hop typically takes
+    // 30-100ms after the initial connect.
+    if !wait_for_direct_peer_path(&endpoint, peer_addr.id, 500).await {
         warn!(
             peer = %peer_addr.id,
             hash = %truncate_for_log(&hash, 16),
-            "PullFromPeer aborted: relay-only connection to peer"
+            "PullFromPeer aborted: no direct path to peer after 500ms"
         );
         return Err(anyhow::anyhow!(
-            "Relay-only connection to peer {}, refusing data transfer",
+            "No direct path to peer {}, refusing data transfer",
             peer_addr.id
         ));
     }
@@ -1091,9 +1118,15 @@ pub async fn pull_blob_from_peer(
     })??;
 
     if !response.starts_with(b"DATA:") {
+        let peer_msg = std::str::from_utf8(&response)
+            .unwrap_or("<non-utf8>")
+            .chars()
+            .take(120)
+            .collect::<String>();
         return Err(anyhow::anyhow!(
-            "Peer did not return DATA for {}",
-            truncate_for_log(&hash, 16)
+            "Peer did not return DATA for {} (response: {})",
+            truncate_for_log(&hash, 16),
+            peer_msg
         ));
     }
 
