@@ -85,6 +85,12 @@ static MINER_UID: OnceLock<u32> = OnceLock::new();
 /// Populated on Store/Pull, used by Delete to skip full tag scan.
 static TAG_MAP: OnceLock<DashMap<iroh_blobs::Hash, iroh_blobs::api::Tag>> = OnceLock::new();
 
+/// Static discovery provider for seeding peer direct addresses into iroh's
+/// address book. Updated on ClusterMapUpdate so peer-to-peer connections
+/// (PullFromPeer, FetchBlob) resolve directly without relay discovery.
+static STATIC_DISCOVERY: OnceLock<iroh::discovery::static_provider::StaticProvider> =
+    OnceLock::new();
+
 /// Cached PG assignments: (epoch, pgs) — recomputed only when epoch changes
 static MY_PGS_CACHE: OnceLock<Arc<RwLock<(u64, Vec<u32>)>>> = OnceLock::new();
 
@@ -158,6 +164,14 @@ pub fn tag_map_insert(hash: iroh_blobs::Hash, tag: iroh_blobs::api::Tag) {
     if map.len() < MAX_TAG_MAP_ENTRIES {
         map.insert(hash, tag);
     }
+}
+
+pub fn init_static_discovery(discovery: iroh::discovery::static_provider::StaticProvider) {
+    let _ = STATIC_DISCOVERY.set(discovery);
+}
+
+pub fn get_static_discovery() -> Option<&'static iroh::discovery::static_provider::StaticProvider> {
+    STATIC_DISCOVERY.get()
 }
 
 pub fn get_my_pgs_cache() -> &'static Arc<RwLock<(u64, Vec<u32>)>> {

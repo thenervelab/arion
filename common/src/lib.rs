@@ -1727,6 +1727,61 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Returns true if the IP address is publicly routable.
+///
+/// Rejects loopback, link-local, private (RFC 1918), CGNAT (RFC 6598),
+/// multicast, reserved, and Docker/K8s internal addresses.
+pub fn is_routable_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !v4.is_loopback()
+                && !v4.is_link_local()
+                && !v4.is_broadcast()
+                && !v4.is_unspecified()
+                && !v4.is_multicast()
+                && !is_non_routable_v4(v4)
+        }
+        std::net::IpAddr::V6(v6) => {
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+                && !is_non_routable_v6(v6)
+        }
+    }
+}
+
+/// Non-routable IPv4 ranges:
+/// - 10.0.0.0/8       RFC 1918 (K8s pod CIDRs)
+/// - 172.16.0.0/12    RFC 1918 (Docker bridge 172.17.x.x)
+/// - 192.168.0.0/16   RFC 1918 (home LANs)
+/// - 100.64.0.0/10    RFC 6598 CGNAT (also Nebula VPN)
+/// - 240.0.0.0/4      Reserved/experimental
+fn is_non_routable_v4(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 10
+        || (o[0] == 172 && (o[1] & 0xf0) == 16)
+        || (o[0] == 192 && o[1] == 168)
+        || (o[0] == 100 && (o[1] & 0xc0) == 64)
+        || (o[0] & 0xf0) == 240
+}
+
+/// Non-routable IPv6 ranges:
+/// - fc00::/7   Unique Local Addresses (ULA)
+/// - fe80::/10  Link-local
+fn is_non_routable_v6(ip: std::net::Ipv6Addr) -> bool {
+    let s = ip.segments();
+    (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80
+}
+
+/// Returns true if the endpoint has at least one routable direct
+/// IP address. Relay-only endpoints return false.
+pub fn has_routable_direct_addr(addr: &iroh::EndpointAddr) -> bool {
+    addr.addrs.iter().any(|a| match a {
+        iroh::TransportAddr::Ip(sock) => is_routable_ip(sock.ip()),
+        _ => false,
+    })
+}
+
 /// Extract miner IP from EndpointAddr direct addresses
 /// or fall back to parsing the http_addr URL hostname.
 pub fn extract_miner_ip(

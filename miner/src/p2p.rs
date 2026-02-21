@@ -7,7 +7,7 @@ use crate::constants::{
 use crate::helpers::truncate_for_log;
 use crate::state::{
     get_blob_cache, get_blobs_dir, get_cluster_map, get_current_epoch, get_peer_cache,
-    get_warden_node_ids,
+    get_static_discovery, get_warden_node_ids,
 };
 use anyhow::Result;
 use futures::StreamExt;
@@ -941,6 +941,8 @@ async fn handle_cluster_map_update(
         trace!("Cleared peer cache on epoch change");
     }
 
+    let discovery = get_static_discovery();
+
     for (node_id, addr_json) in peers {
         // Enforce cache size limit
         if peer_cache.len() >= MAX_PEER_CACHE_ENTRIES {
@@ -952,6 +954,13 @@ async fn handle_cluster_map_update(
         }
 
         if let Ok(addr) = serde_json::from_str::<iroh::EndpointAddr>(&addr_json) {
+            // Seed iroh's discovery with peer direct addresses so
+            // PullFromPeer/FetchBlob connect directly without relay.
+            if let Some(disc) = discovery
+                && common::has_routable_direct_addr(&addr)
+            {
+                disc.add_endpoint_info(addr.clone());
+            }
             peer_cache.insert(node_id, addr);
         } else {
             debug!(node_id = %node_id, "Failed to parse peer endpoint address");
