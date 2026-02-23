@@ -17,8 +17,6 @@
 //! - `RwLock` for epoch, cluster map, and connection pool (allows concurrent reads)
 //! - `quick_cache::Cache` for bounded LRU blob cache (10k entries)
 
-// Some accessors are reserved for future use (rebalance, connection pooling)
-#![allow(dead_code)]
 #![allow(clippy::type_complexity)]
 
 use crate::constants::{
@@ -88,8 +86,7 @@ static TAG_MAP: OnceLock<DashMap<iroh_blobs::Hash, iroh_blobs::api::Tag>> = Once
 /// Static discovery provider for seeding peer direct addresses into iroh's
 /// address book. Updated on ClusterMapUpdate so peer-to-peer connections
 /// (PullFromPeer, FetchBlob) resolve directly without relay discovery.
-static STATIC_DISCOVERY: OnceLock<iroh::discovery::static_provider::StaticProvider> =
-    OnceLock::new();
+static STATIC_DISCOVERY: OnceLock<iroh::address_lookup::memory::MemoryLookup> = OnceLock::new();
 
 /// Cached PG assignments: (epoch, pgs) — recomputed only when epoch changes
 static MY_PGS_CACHE: OnceLock<Arc<RwLock<(u64, Vec<u32>)>>> = OnceLock::new();
@@ -166,11 +163,11 @@ pub fn tag_map_insert(hash: iroh_blobs::Hash, tag: iroh_blobs::api::Tag) {
     }
 }
 
-pub fn init_static_discovery(discovery: iroh::discovery::static_provider::StaticProvider) {
+pub fn init_static_discovery(discovery: iroh::address_lookup::memory::MemoryLookup) {
     let _ = STATIC_DISCOVERY.set(discovery);
 }
 
-pub fn get_static_discovery() -> Option<&'static iroh::discovery::static_provider::StaticProvider> {
+pub fn get_static_discovery() -> Option<&'static iroh::address_lookup::memory::MemoryLookup> {
     STATIC_DISCOVERY.get()
 }
 
@@ -182,6 +179,39 @@ pub fn get_pos_commitment_cache()
 -> &'static Arc<Cache<iroh_blobs::Hash, Arc<pos_circuits::commitment::CommitmentWithTree>>> {
     POS_COMMITMENT_CACHE
         .get_or_init(|| Arc::new(Cache::new(crate::constants::POS_COMMITMENT_CACHE_SIZE)))
+}
+
+/// Connect to a peer with timeout, ensuring iroh path IDs are released
+/// even if the connect completes after the timeout fires.
+///
+/// When `tokio::time::timeout` drops a `Connecting` future, iroh retains
+/// the internal path state until the QUIC idle timeout (~180s). Under
+/// sustained load this exhausts the path ID table (`MaxPathIdReached`).
+///
+/// This wrapper spawns the connect in a background task so late-arriving
+/// connections are properly closed instead of leaked.
+pub async fn connect_with_cleanup(
+    endpoint: &Endpoint,
+    addr: iroh::EndpointAddr,
+    alpn: &'static [u8],
+    timeout: std::time::Duration,
+) -> Result<iroh::endpoint::Connection> {
+    let endpoint = endpoint.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = endpoint.connect(addr, alpn).await;
+        match tx.send(result) {
+            Ok(()) => {}
+            Err(Ok(conn)) => conn.close(0u32.into(), b"timeout"),
+            Err(Err(_)) => {}
+        }
+    });
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(Ok(conn))) => Ok(conn),
+        Ok(Ok(Err(e))) => Err(anyhow::anyhow!("Connection failed: {e}")),
+        Ok(Err(_)) => Err(anyhow::anyhow!("Connection task panicked")),
+        Err(_) => Err(anyhow::anyhow!("Connection timeout")),
+    }
 }
 
 /// Get a pooled connection or create a new one
@@ -235,7 +265,8 @@ pub async fn get_pooled_connection(
             && now - *created < CONNECTION_TTL_SECS
             && existing_conn.closed().now_or_never().is_none()
         {
-            // Use existing connection, drop the one we just created
+            // Use existing connection, close the one we just created
+            conn.close(0u32.into(), b"stale");
             return Ok(existing_conn.clone());
         }
 
@@ -244,7 +275,13 @@ pub async fn get_pooled_connection(
             // First pass: cheap threshold-based cleanup (expired + closed)
             let threshold = now.saturating_sub(CONNECTION_TTL_SECS);
             pool.retain(|_, (conn, created)| {
-                *created > threshold && *created <= now && conn.closed().now_or_never().is_none()
+                let keep = *created > threshold
+                    && *created <= now
+                    && conn.closed().now_or_never().is_none();
+                if !keep && conn.close_reason().is_none() {
+                    conn.close(0u32.into(), b"stale");
+                }
+                keep
             });
             // If still over capacity after TTL cleanup, fall back to sort-based eviction
             if pool.len() >= MAX_CONNECTION_POOL_SIZE {
@@ -252,7 +289,9 @@ pub async fn get_pooled_connection(
                 let mut oldest: Vec<_> = pool.iter().map(|(k, (_, ts))| (*k, *ts)).collect();
                 oldest.sort_by_key(|(_, ts)| *ts);
                 for (evict_key, _) in oldest.into_iter().take(entries_to_remove) {
-                    pool.remove(&evict_key);
+                    if let Some((conn, _)) = pool.remove(&evict_key) {
+                        conn.close(0u32.into(), b"stale");
+                    }
                 }
             }
         }

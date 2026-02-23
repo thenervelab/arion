@@ -30,6 +30,7 @@
 pub mod attestation_bundle;
 pub mod merkle;
 pub mod middleware;
+pub mod stun;
 pub mod tls;
 
 // Re-export attestation bundle types at crate root for convenience
@@ -44,6 +45,7 @@ pub use merkle::{blake3_hash, build_merkle_tree, verify_merkle_proof};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::Hasher;
+use std::path::PathBuf;
 use tracing::debug;
 use xxhash_rust::xxh3;
 
@@ -222,13 +224,19 @@ impl ClusterMap {
     ///
     /// Default values: epoch=0, pg_count=16384, ec_k=10, ec_m=20
     pub fn new() -> Self {
-        Self {
-            epoch: 0,
-            miners: Vec::new(),
-            pg_count: default_pg_count(),
-            ec_k: default_ec_k(),
-            ec_m: default_ec_m(),
+        let backup_data_path = PathBuf::from("data/validator/cluster_map_backup.json");
+
+        if !backup_data_path.exists() {
+            return Self {
+                epoch: 0,
+                miners: Vec::new(),
+                pg_count: default_pg_count(),
+                ec_k: default_ec_k(),
+                ec_m: default_ec_m(),
+            };
         }
+
+        serde_json::from_str(&std::fs::read_to_string(backup_data_path).unwrap()).unwrap()
     }
 
     /// Ensure critical placement parameters are never zero.
@@ -270,9 +278,6 @@ pub struct ShardInfo {
     pub index: usize,
     /// BLAKE3 hash of the shard data (used for content addressing and verification)
     pub blob_hash: String,
-    /// Miner UID where shard was originally stored (optional, for debugging/migration)
-    #[serde(default)]
-    pub miner_uid: Option<u32>,
 }
 
 /// Manifest describing a stored file and its erasure-coded shards.
@@ -487,7 +492,10 @@ pub enum MinerControlMessage {
         /// Uses u64 for platform-independent wire format.
         data_len: u64,
     },
-    /// Lightweight metadata-only existence check (no data transfer)
+    /// Lightweight metadata-only existence check for a shard.
+    /// Returns `HAS:true` or `HAS:false` without reading blob data.
+    /// Used by the validator before PullFromPeer/FetchBlob to avoid
+    /// wasting P2P round-trips on miners that lost a shard.
     CheckBlob { hash: String },
 }
 
@@ -555,6 +563,9 @@ pub enum ValidatorControlMessage {
         public_key: String,
         /// Ed25519 signature of "HEARTBEAT:{public_key}:{timestamp}"
         signature: Vec<u8>,
+        /// Miner's full EndpointAddr including relay hints for NAT traversal
+        #[serde(default)]
+        endpoint_addr: Option<iroh::EndpointAddr>,
         /// Miner software version
         #[serde(default)]
         version: Option<String>,
@@ -1211,6 +1222,21 @@ pub struct WardenAuditBatch {
     pub reports: Vec<WardenAuditReport>,
 }
 
+/// A single shard commitment for batched push to warden.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WardenShardCommitment {
+    /// BLAKE3 hash of the shard
+    pub shard_hash: String,
+    /// Merkle root of the shard's chunk tree (8 x u32 = 256 bits)
+    pub merkle_root: [u32; 8],
+    /// Number of chunks in the shard
+    pub chunk_count: u32,
+    /// UID of the miner holding this shard
+    pub miner_uid: u32,
+    /// Miner's Iroh endpoint address (JSON-serialized)
+    pub miner_endpoint: String,
+}
+
 // ============================================================================
 // P2P Protocol Constants (Hybrid Migration)
 // ============================================================================
@@ -1397,6 +1423,18 @@ pub enum WardenControlMessage {
         shard_hash: String,
     },
 
+    /// Push a batch of shard commitments in a single message (replaces per-shard streams)
+    PushShardCommitmentsBatch {
+        /// List of shard commitments to store
+        commitments: Vec<WardenShardCommitment>,
+    },
+
+    /// Delete multiple shards in a single message (replaces per-shard streams)
+    DeleteShardsBatch {
+        /// List of shard hashes to remove from audit queue
+        shard_hashes: Vec<String>,
+    },
+
     // ========================================
     // Warden → Validator
     // ========================================
@@ -1496,6 +1534,39 @@ pub enum SubmitterControlMessage {
         /// Error description on failure
         error: Option<String>,
     },
+
+    // ========================================
+    // Warden → Chain-Submitter
+    // ========================================
+    /// Push a signed attestation for on-chain submission.
+    ///
+    /// The attestation is JSON-serialized to avoid coupling both crates
+    /// through a shared type in common. The chain-submitter already
+    /// deserializes from JSON via its HTTP endpoint — same format.
+    PushAttestation {
+        /// JSON-serialized SignedAttestation
+        attestation_json: String,
+    },
+
+    /// Acknowledge attestation receipt.
+    PushAttestationAck {
+        /// Whether the attestation was accepted and queued
+        success: bool,
+        /// Optional status message
+        message: Option<String>,
+    },
+}
+
+/// Compute a deterministic miner UID from a public key string.
+///
+/// Uses `DefaultHasher` with the `Hash` trait, matching the UID
+/// computation in deployed miners. Truncated to 31 bits to fit
+/// in i32 range.
+pub fn compute_miner_uid(public_key: &str) -> u32 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    public_key.hash(&mut hasher);
+    (hasher.finish() as u32) & 0x7FFF_FFFF
 }
 
 // ============================================================================
@@ -1617,10 +1688,162 @@ pub fn calculate_stripe_placement(
     }
 }
 
+// ============================================================================
+// Lightweight UID-only placement (avoids MinerNode cloning)
+// ============================================================================
+
+/// Like `calculate_placement_for_stripe` but returns only miner UIDs.
+///
+/// Avoids cloning MinerNode structs (6+ heap Strings each), reducing
+/// allocation pressure from ~28 KB/call to ~240 bytes/call. Use this
+/// for read-only statistics where only UIDs are needed.
+fn placement_uids_for_stripe(
+    file_hash: &str,
+    stripe_index: u64,
+    count: usize,
+    map: &ClusterMap,
+) -> Result<Vec<u32>, String> {
+    if map.miners.len() < count {
+        return Err(format!(
+            "Insufficient cluster capacity: need {} miners, have {}",
+            count,
+            map.miners.len()
+        ));
+    }
+
+    let mut hasher = xxh3::Xxh3::new();
+    hasher.write(file_hash.as_bytes());
+    hasher.write_u64(stripe_index);
+    let input = hasher.finish();
+
+    let mut families: HashMap<&str, Vec<(usize, &MinerNode)>> = HashMap::new();
+    for (idx, miner) in map.miners.iter().enumerate() {
+        families
+            .entry(miner.family_id.as_str())
+            .or_default()
+            .push((idx, miner));
+    }
+    for miners in families.values_mut() {
+        miners.sort_by_key(|(_, m)| m.uid);
+    }
+
+    let num_families = families.len();
+
+    if num_families >= count {
+        let selected_families = select_weighted_families(&families, count, input)?;
+        let mut uids = Vec::with_capacity(count);
+        for (idx, family_id) in selected_families.iter().enumerate() {
+            let miners_in_family = &families[family_id];
+            let family_input = input.wrapping_add(idx as u64);
+            let miner_uids = select_weighted_miner_uids(miners_in_family, 1, family_input, map)?;
+            uids.extend(miner_uids);
+        }
+        if uids.len() != count {
+            return Err(format!(
+                "Placement failed: needed {} miners but selected {}",
+                count,
+                uids.len()
+            ));
+        }
+        Ok(uids)
+    } else {
+        let selected_families = select_weighted_families(&families, num_families, input)?;
+        let mut uids = Vec::with_capacity(count);
+        let base_per_family = count / num_families;
+        let remainder = count % num_families;
+
+        for (idx, family_id) in selected_families.iter().enumerate() {
+            let miners_in_family = &families[family_id];
+            let to_take = if idx < remainder {
+                base_per_family + 1
+            } else {
+                base_per_family
+            }
+            .min(miners_in_family.len());
+
+            let family_input = input.wrapping_add(idx as u64);
+            let miner_uids =
+                select_weighted_miner_uids(miners_in_family, to_take, family_input, map)?;
+            uids.extend(miner_uids);
+            if uids.len() >= count {
+                break;
+            }
+        }
+        uids.truncate(count);
+        if uids.len() < count {
+            return Err(format!(
+                "Placement failed: needed {} miners but only selected {}",
+                count,
+                uids.len()
+            ));
+        }
+        Ok(uids)
+    }
+}
+
+/// Like `select_weighted_miners_from_family` but returns only UIDs (no clone).
+fn select_weighted_miner_uids(
+    miners_in_family: &[(usize, &MinerNode)],
+    count: usize,
+    seed: u64,
+    map: &ClusterMap,
+) -> Result<Vec<u32>, String> {
+    let mut available: Vec<(usize, u64)> = miners_in_family
+        .iter()
+        .map(|(idx, m)| (*idx, m.weight as u64))
+        .collect();
+
+    if available.iter().any(|(idx, _)| *idx >= map.miners.len()) {
+        return Err("Invalid miner index in family".to_string());
+    }
+
+    available.sort_by_key(|(idx, _)| map.miners[*idx].uid);
+
+    let mut selected = Vec::with_capacity(count);
+    let mut rng_seed = seed;
+
+    for _ in 0..count.min(available.len()) {
+        if available.iter().all(|(_, w)| *w == 0) {
+            break;
+        }
+        let selected_idx = weighted_select(&available, &mut rng_seed, "Weighted miner selection")?;
+        let (miner_idx, _) = available.remove(selected_idx);
+        selected.push(map.miners[miner_idx].uid);
+    }
+
+    Ok(selected)
+}
+
+/// PG-based placement returning only UIDs (no MinerNode cloning).
+///
+/// Used by `compute_shard_stats` and other read-only statistics paths.
+///
+/// # Performance
+///
+/// This function performs CRUSH calculations and is CPU-bound when called
+/// in a loop over all PGs (`pg_count`, typically 16,384). Callers in async
+/// contexts **must** wrap bulk invocations in `tokio::task::spawn_blocking`
+/// to avoid starving the tokio runtime.
+pub fn calculate_pg_placement_uids(
+    pg_id: u32,
+    shards_per_file: usize,
+    map: &ClusterMap,
+) -> Result<Vec<u32>, String> {
+    let pg_seed = format!("pg:{}", pg_id);
+    placement_uids_for_stripe(&pg_seed, 0, shards_per_file, map)
+}
+
 /// Calculate which Placement Groups a miner is responsible for.
 ///
 /// Used by miners during self-rebalancing to discover their workload.
 /// This is an expensive operation (O(pg_count * placement_cost)) - cache results.
+///
+/// # Performance
+///
+/// This function is CPU-bound (iterates all `pg_count` PGs with CRUSH
+/// calculations, typically 16,384). Callers in async contexts **must**
+/// wrap this in `tokio::task::spawn_blocking` to avoid starving the
+/// tokio runtime.
 ///
 /// # Arguments
 /// * `miner_uid` - UID of the miner to check
@@ -1641,76 +1864,6 @@ pub fn calculate_my_pgs(miner_uid: u32, map: &ClusterMap) -> Vec<u32> {
 }
 
 // ============================================================================
-// Store Failure Helpers (CRUSH-aware replacement)
-// ============================================================================
-
-/// Create a copy of the cluster map with specified miners' weights zeroed out.
-///
-/// Used before CRUSH placement to exclude soft-banned miners without altering
-/// the miner vec indices (critical for deterministic placement).
-pub fn cluster_map_with_zeroed_miners(
-    map: &ClusterMap,
-    zero_uids: &std::collections::HashSet<u32>,
-) -> ClusterMap {
-    let mut cloned = map.clone();
-    for miner in &mut cloned.miners {
-        if zero_uids.contains(&miner.uid) {
-            miner.weight = 0;
-        }
-    }
-    cloned
-}
-
-/// Select a replacement miner for a failed shard distribution.
-///
-/// Performs weighted random selection from miners not in `excluded_uids` and with `weight > 0`.
-/// The seed is non-deterministic (includes current timestamp) because replacement placement
-/// doesn't need to be reproducible — the manifest records the actual miner assignment.
-///
-/// # Returns
-/// `None` if all miners are excluded or have zero weight.
-pub fn select_replacement_miner(
-    map: &ClusterMap,
-    excluded_uids: &std::collections::HashSet<u32>,
-    file_hash: &str,
-    shard_index: usize,
-) -> Option<MinerNode> {
-    let candidates: Vec<&MinerNode> = map
-        .miners
-        .iter()
-        .filter(|m| m.weight > 0 && !excluded_uids.contains(&m.uid))
-        .collect();
-
-    if candidates.is_empty() {
-        return None;
-    }
-
-    // Non-deterministic seed: file_hash + shard_index + timestamp
-    let mut hasher = xxh3::Xxh3::new();
-    hasher.write(file_hash.as_bytes());
-    hasher.write_usize(shard_index);
-    hasher.write_u64(now_secs());
-    let seed = hasher.finish();
-
-    // Weighted random selection
-    let total_weight: u64 = candidates.iter().map(|m| m.weight as u64).sum();
-    if total_weight == 0 {
-        return None;
-    }
-    let target = seed % total_weight;
-    let mut cumulative: u64 = 0;
-    for candidate in &candidates {
-        cumulative += candidate.weight as u64;
-        if target < cumulative {
-            return Some((*candidate).clone());
-        }
-    }
-
-    // Fallback (should not happen due to modulo arithmetic)
-    Some((*candidates.last().unwrap()).clone())
-}
-
-// ============================================================================
 // Shared Utility Functions
 // ============================================================================
 
@@ -1726,6 +1879,10 @@ pub fn now_secs() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
+
+// ============================================================================
+// IP Routability Helpers
+// ============================================================================
 
 /// Returns true if the IP address is publicly routable.
 ///
@@ -2129,8 +2286,9 @@ pub const P2P_MAX_BACKOFF_MS: u64 = 5000;
 // Relay Configuration
 // ============================================================================
 
-/// Default Hippius relay URL - used when IROH_RELAY_URL is not set.
-pub const DEFAULT_RELAY_URL: &str = "https://relay.hippius.com";
+/// Default Hippius relay URLs - used when IROH_RELAY_URL is not set.
+pub const DEFAULT_RELAY_URLS: &[&str] =
+    &["https://relay.hippius.com", "https://relay2.hippius.com"];
 
 /// Maximum retries for initial endpoint binding.
 pub const ENDPOINT_BIND_MAX_RETRIES: u32 = 3;
@@ -2141,9 +2299,11 @@ pub const ENDPOINT_BIND_INITIAL_BACKOFF_MS: u64 = 500;
 /// Time to wait for relay connection after successful bind (seconds).
 pub const RELAY_CONNECTION_WAIT_SECS: u64 = 5;
 
-/// Load relay URL from environment variable or config, falling back to default.
+/// Load primary relay URL from environment variable or config, falling back
+/// to the first default. Use this when a single URL is needed (e.g.
+/// `EndpointAddr::with_relay_url`).
 ///
-/// Priority: config value > IROH_RELAY_URL env var > DEFAULT_RELAY_URL
+/// Priority: config value > IROH_RELAY_URL env var > first DEFAULT_RELAY_URLS
 pub fn get_relay_url(config_url: Option<&str>) -> iroh_base::RelayUrl {
     config_url
         .and_then(|s| s.parse().ok())
@@ -2152,18 +2312,40 @@ pub fn get_relay_url(config_url: Option<&str>) -> iroh_base::RelayUrl {
                 .ok()
                 .and_then(|s| s.parse().ok())
         })
-        .unwrap_or_else(|| DEFAULT_RELAY_URL.parse().expect("valid default relay URL"))
+        .unwrap_or_else(|| {
+            DEFAULT_RELAY_URLS[0]
+                .parse()
+                .expect("valid default relay URL")
+        })
 }
 
-/// Build RelayMode::Custom with the given URL using consistent RelayMap pattern.
-///
-/// This ensures all components use the same relay configuration pattern.
-pub fn build_relay_mode(url: &iroh_base::RelayUrl) -> iroh::endpoint::RelayMode {
-    let relay_config = iroh::RelayConfig {
-        url: url.clone(),
-        quic: None,
-    };
-    iroh::endpoint::RelayMode::Custom(iroh::RelayMap::from_iter([relay_config]))
+/// Load all relay URLs. If a config/env override is set, returns only that
+/// URL. Otherwise returns all `DEFAULT_RELAY_URLS`.
+pub fn get_relay_urls(config_url: Option<&str>) -> Vec<iroh_base::RelayUrl> {
+    if let Some(url) = config_url.and_then(|s| s.parse().ok()) {
+        return vec![url];
+    }
+    if let Ok(val) = std::env::var("IROH_RELAY_URL")
+        && let Ok(url) = val.parse()
+    {
+        return vec![url];
+    }
+    DEFAULT_RELAY_URLS
+        .iter()
+        .map(|s| s.parse().expect("valid default relay URL"))
+        .collect()
+}
+
+/// Build `RelayMode::Custom` from one or more relay URLs.
+pub fn build_relay_mode(urls: &[iroh_base::RelayUrl]) -> iroh::endpoint::RelayMode {
+    let configs: Vec<_> = urls
+        .iter()
+        .map(|url| iroh::RelayConfig {
+            url: url.clone(),
+            quic: None,
+        })
+        .collect();
+    iroh::endpoint::RelayMode::Custom(iroh::RelayMap::from_iter(configs))
 }
 
 /// Reusable P2P connection manager with connection pooling and retry logic.
@@ -2182,10 +2364,15 @@ pub struct P2pConnectionManager {
     alpn: &'static [u8],
     /// Cached connection: (connection, last_used_timestamp)
     connection: std::sync::Arc<tokio::sync::RwLock<Option<(iroh::endpoint::Connection, u64)>>>,
+    /// Serializes reconnect attempts so only one caller retries at a time,
+    /// without holding the `connection` RwLock during sleep/connect.
+    reconnect_mutex: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// Connection TTL in seconds
     connection_ttl_secs: u64,
     /// Counter for unhealthy connections detected (for metrics)
     unhealthy_connections: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Known direct socket addresses for the target node (P2P address seeding)
+    known_addrs: Vec<std::net::SocketAddr>,
 }
 
 impl Clone for P2pConnectionManager {
@@ -2195,8 +2382,10 @@ impl Clone for P2pConnectionManager {
             target_node_id: self.target_node_id,
             alpn: self.alpn,
             connection: self.connection.clone(),
+            reconnect_mutex: self.reconnect_mutex.clone(),
             connection_ttl_secs: self.connection_ttl_secs,
             unhealthy_connections: self.unhealthy_connections.clone(),
+            known_addrs: self.known_addrs.clone(),
         }
     }
 }
@@ -2213,9 +2402,20 @@ impl P2pConnectionManager {
             target_node_id,
             alpn,
             connection: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            reconnect_mutex: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             connection_ttl_secs: P2P_CONNECTION_TTL_SECS,
             unhealthy_connections: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            known_addrs: vec![],
         }
+    }
+
+    /// Seed known direct socket addresses for the target node.
+    ///
+    /// When set, `get_connection()` builds an `EndpointAddr` with these
+    /// addresses so iroh can connect directly without relay discovery.
+    pub fn with_known_addrs(mut self, addrs: Vec<std::net::SocketAddr>) -> Self {
+        self.known_addrs = addrs;
+        self
     }
 
     /// Get the target node ID.
@@ -2238,19 +2438,23 @@ impl P2pConnectionManager {
     ///
     /// Reuses cached connections within TTL, with health checking.
     /// On failure, retries with exponential backoff.
+    ///
+    /// The `connection` RwLock is only held for microseconds (cache
+    /// read/write). The `reconnect_mutex` serializes concurrent reconnect
+    /// attempts so only one caller drives the retry loop — other callers
+    /// wait on the mutex and then re-check the cache.
     pub async fn get_connection(&self) -> anyhow::Result<iroh::endpoint::Connection> {
         use std::sync::atomic::Ordering;
         use tracing::{debug, warn};
 
         let now = now_secs();
 
-        // Check if we have a valid cached connection
+        // Fast path: check cache under read-lock (microseconds)
         {
             let conn_guard = self.connection.read().await;
             if let Some((conn, last_used)) = conn_guard.as_ref()
                 && now.saturating_sub(*last_used) < self.connection_ttl_secs
             {
-                // Connection is still valid - verify it's healthy
                 if conn.close_reason().is_none() {
                     debug!(
                         target = %self.target_node_id,
@@ -2259,7 +2463,6 @@ impl P2pConnectionManager {
                     );
                     return Ok(conn.clone());
                 }
-                // Connection is unhealthy - track and log
                 self.unhealthy_connections.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     target = %self.target_node_id,
@@ -2269,28 +2472,34 @@ impl P2pConnectionManager {
                 );
             }
         }
+        // read-lock dropped
 
-        // Need to create a new connection
-        let mut conn_guard = self.connection.write().await;
+        // Serialize reconnect attempts — only one caller retries at a time.
+        // Other callers wait here and re-check the cache when the mutex is
+        // released. No I/O happens under the connection RwLock.
+        let _reconnect_guard = self.reconnect_mutex.lock().await;
 
-        // Double-check after acquiring write lock (another task may have connected)
-        if let Some((conn, last_used)) = conn_guard.as_ref()
-            && now.saturating_sub(*last_used) < self.connection_ttl_secs
-            && conn.close_reason().is_none()
+        // Re-check cache: another caller may have connected while we waited
         {
-            debug!(
-                target = %self.target_node_id,
-                conn_id = conn.stable_id(),
-                "Reusing cached P2P connection (after lock)"
-            );
-            return Ok(conn.clone());
+            let conn_guard = self.connection.read().await;
+            if let Some((conn, last_used)) = conn_guard.as_ref()
+                && now_secs().saturating_sub(*last_used) < self.connection_ttl_secs
+                && conn.close_reason().is_none()
+            {
+                debug!(
+                    target = %self.target_node_id,
+                    conn_id = conn.stable_id(),
+                    "Reusing cached P2P connection (after reconnect lock)"
+                );
+                return Ok(conn.clone());
+            }
         }
+        // read-lock dropped
 
-        // Create new connection with exponential backoff retries
+        // Retry loop — no lock on `connection` during sleep or connect
         let mut last_error = None;
         for attempt in 0..=P2P_MAX_CONNECT_RETRIES {
             if attempt > 0 {
-                // Calculate backoff: 100ms, 200ms, 400ms, ... capped at 5s
                 let backoff_ms = std::cmp::min(
                     P2P_INITIAL_BACKOFF_MS * (1 << (attempt - 1)),
                     P2P_MAX_BACKOFF_MS,
@@ -2310,9 +2519,15 @@ impl P2pConnectionManager {
                 "Connecting via P2P"
             );
 
+            let mut connect_target = iroh::EndpointAddr::new(self.target_node_id);
+            if !self.known_addrs.is_empty() {
+                connect_target = connect_target
+                    .with_addrs(self.known_addrs.iter().map(|a| iroh::TransportAddr::Ip(*a)));
+            }
+
             match tokio::time::timeout(
                 std::time::Duration::from_secs(P2P_DEFAULT_TIMEOUT_SECS),
-                self.endpoint.connect(self.target_node_id, self.alpn),
+                self.endpoint.connect(connect_target, self.alpn),
             )
             .await
             {
@@ -2322,7 +2537,13 @@ impl P2pConnectionManager {
                         conn_id = conn.stable_id(),
                         "P2P connection established"
                     );
-                    *conn_guard = Some((conn.clone(), now));
+                    // Write-lock only to store the new connection (microseconds).
+                    // Close any stale predecessor to free its Iroh path IDs.
+                    let mut conn_guard = self.connection.write().await;
+                    if let Some((old_conn, _)) = conn_guard.take() {
+                        old_conn.close(0u32.into(), b"replaced");
+                    }
+                    *conn_guard = Some((conn.clone(), now_secs()));
                     return Ok(conn);
                 }
                 Ok(Err(e)) => {
@@ -2346,6 +2567,23 @@ impl P2pConnectionManager {
         }
 
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Failed to connect after retries")))
+    }
+
+    /// Evict the cached connection so the next `get_connection()` creates a fresh one.
+    ///
+    /// Call this when a stream-level operation (open_bi, write, read) fails,
+    /// indicating the underlying QUIC connection may be dead even though
+    /// `close_reason()` hasn't propagated yet.
+    ///
+    /// The old connection is explicitly closed so Iroh releases its path IDs
+    /// immediately. Without this, stale connections hold path slots in Iroh's
+    /// remote_map until idle timeout, causing `MaxPathIdReached` when new
+    /// connections are created to the same peer.
+    pub async fn invalidate_connection(&self) {
+        let mut conn_guard = self.connection.write().await;
+        if let Some((conn, _)) = conn_guard.take() {
+            conn.close(0u32.into(), b"stale");
+        }
     }
 }
 
@@ -2528,6 +2766,57 @@ mod tests {
                 assert_eq!(batch.reports.len(), 1);
                 assert_eq!(batch.reports[0].miner_uid, 42);
                 assert_eq!(batch.reports[0].result, AuditResultType::Passed);
+            }
+            _ => panic!("Wrong variant"),
+        }
+
+        // Test PushShardCommitmentsBatch
+        let request = WardenControlMessage::PushShardCommitmentsBatch {
+            commitments: vec![
+                WardenShardCommitment {
+                    shard_hash: "shard1".to_string(),
+                    merkle_root: [1, 2, 3, 4, 5, 6, 7, 8],
+                    chunk_count: 100,
+                    miner_uid: 42,
+                    miner_endpoint: "http://127.0.0.1:3001".to_string(),
+                },
+                WardenShardCommitment {
+                    shard_hash: "shard2".to_string(),
+                    merkle_root: [8, 7, 6, 5, 4, 3, 2, 1],
+                    chunk_count: 200,
+                    miner_uid: 43,
+                    miner_endpoint: "http://127.0.0.1:3002".to_string(),
+                },
+            ],
+        };
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let decoded: WardenControlMessage = serde_json::from_slice(&bytes).unwrap();
+        match decoded {
+            WardenControlMessage::PushShardCommitmentsBatch { commitments } => {
+                assert_eq!(commitments.len(), 2);
+                assert_eq!(commitments[0].shard_hash, "shard1");
+                assert_eq!(commitments[0].miner_uid, 42);
+                assert_eq!(commitments[1].shard_hash, "shard2");
+                assert_eq!(commitments[1].chunk_count, 200);
+            }
+            _ => panic!("Wrong variant"),
+        }
+
+        // Test DeleteShardsBatch
+        let request = WardenControlMessage::DeleteShardsBatch {
+            shard_hashes: vec![
+                "hash1".to_string(),
+                "hash2".to_string(),
+                "hash3".to_string(),
+            ],
+        };
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let decoded: WardenControlMessage = serde_json::from_slice(&bytes).unwrap();
+        match decoded {
+            WardenControlMessage::DeleteShardsBatch { shard_hashes } => {
+                assert_eq!(shard_hashes.len(), 3);
+                assert_eq!(shard_hashes[0], "hash1");
+                assert_eq!(shard_hashes[2], "hash3");
             }
             _ => panic!("Wrong variant"),
         }
@@ -2750,87 +3039,6 @@ mod tests {
         assert_ne!(WARDEN_CONTROL_ALPN, SUBMITTER_CONTROL_ALPN);
     }
 
-    /// Helper: create a MinerNode with a deterministic endpoint from the UID.
-    fn test_miner(uid: u32, weight: u32) -> MinerNode {
-        let mut seed = [0u8; 32];
-        seed[0..4].copy_from_slice(&uid.to_le_bytes());
-        let secret_key = iroh::SecretKey::from_bytes(&seed);
-        let public_key = secret_key.public();
-        let endpoint = iroh::EndpointAddr::from(public_key);
-        MinerNode {
-            uid,
-            endpoint,
-            weight,
-            ip_subnet: String::new(),
-            ip_address: None,
-            http_addr: String::new(),
-            public_key: String::new(),
-            total_storage: 0,
-            available_storage: 0,
-            family_id: String::new(),
-            strikes: 0,
-            last_seen: 0,
-            heartbeat_count: 0,
-            registration_time: 0,
-            bandwidth_total: 0,
-            bandwidth_window_start: 0,
-            weight_manual_override: false,
-            reputation: 0.0,
-            consecutive_audit_passes: 0,
-            integrity_fails: 0,
-            version: String::new(),
-        }
-    }
-
-    #[test]
-    fn test_cluster_map_with_zeroed_miners() {
-        let mut map = ClusterMap::new();
-        map.miners = vec![test_miner(1, 100), test_miner(2, 200), test_miner(3, 300)];
-
-        let zero_uids: std::collections::HashSet<u32> = [2].into_iter().collect();
-        let zeroed = cluster_map_with_zeroed_miners(&map, &zero_uids);
-
-        assert_eq!(zeroed.miners[0].weight, 100, "UID 1 should be unchanged");
-        assert_eq!(zeroed.miners[1].weight, 0, "UID 2 should be zeroed");
-        assert_eq!(zeroed.miners[2].weight, 300, "UID 3 should be unchanged");
-        // Original map should be unmodified
-        assert_eq!(map.miners[1].weight, 200);
-    }
-
-    #[test]
-    fn test_select_replacement_excludes_banned() {
-        let mut map = ClusterMap::new();
-        map.miners = vec![test_miner(1, 100), test_miner(2, 100), test_miner(3, 100)];
-
-        let excluded: std::collections::HashSet<u32> = [1, 3].into_iter().collect();
-        // Run multiple times to cover randomness
-        for i in 0..20 {
-            let result = select_replacement_miner(&map, &excluded, "filehash", i);
-            let replacement = result.expect("Should find miner 2");
-            assert_eq!(replacement.uid, 2, "Only non-excluded miner is UID 2");
-        }
-    }
-
-    #[test]
-    fn test_select_replacement_none_when_all_excluded() {
-        let mut map = ClusterMap::new();
-        map.miners = vec![test_miner(1, 100), test_miner(2, 100)];
-
-        let excluded: std::collections::HashSet<u32> = [1, 2].into_iter().collect();
-        let result = select_replacement_miner(&map, &excluded, "filehash", 0);
-        assert!(result.is_none(), "No candidates when all excluded");
-    }
-
-    #[test]
-    fn test_select_replacement_none_when_all_zero_weight() {
-        let mut map = ClusterMap::new();
-        map.miners = vec![test_miner(1, 0), test_miner(2, 0)];
-
-        let excluded: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        let result = select_replacement_miner(&map, &excluded, "filehash", 0);
-        assert!(result.is_none(), "No candidates when all have zero weight");
-    }
-
     #[test]
     fn test_extract_miner_ip_from_direct_addr() {
         let secret = iroh::SecretKey::from_bytes(&[1u8; 32]);
@@ -2897,5 +3105,61 @@ mod tests {
     fn test_extract_miner_ip_from_https_addr() {
         let result = extract_miner_ip(None, "https://203.0.113.5:3001");
         assert_eq!(result, Some("203.0.113.5".to_string()));
+    }
+
+    #[test]
+    fn test_pg_placement_uids_matches_full_placement() {
+        let miners: Vec<MinerNode> = (0..30)
+            .map(|i| {
+                let sk = iroh::SecretKey::from_bytes(&[i as u8 + 1; 32]);
+                MinerNode {
+                    uid: i,
+                    weight: 100,
+                    family_id: format!("family-{}", i % 10),
+                    endpoint: iroh::EndpointAddr::from(sk.public()),
+                    ip_subnet: String::new(),
+                    ip_address: None,
+                    http_addr: format!("http://10.0.0.{}:3001", i),
+                    public_key: format!("{:064x}", i),
+                    total_storage: 1_000_000,
+                    available_storage: 500_000,
+                    strikes: 0,
+                    last_seen: 0,
+                    heartbeat_count: 0,
+                    registration_time: 0,
+                    bandwidth_total: 0,
+                    bandwidth_window_start: 0,
+                    weight_manual_override: false,
+                    reputation: 0.0,
+                    consecutive_audit_passes: 0,
+                    integrity_fails: 0,
+                    version: String::new(),
+                }
+            })
+            .collect();
+
+        let map = ClusterMap {
+            miners,
+            pg_count: 64,
+            ec_k: 10,
+            ec_m: 20,
+            ..ClusterMap::default()
+        };
+
+        for pg_id in 0..64 {
+            let full = calculate_pg_placement(pg_id, 30, &map).expect("full");
+            let uids = calculate_pg_placement_uids(pg_id, 30, &map).expect("uids");
+
+            let full_uids: Vec<u32> = full.iter().map(|m| m.uid).collect();
+            assert_eq!(full_uids, uids, "PG {} mismatch", pg_id);
+        }
+    }
+
+    #[test]
+    fn compute_miner_uid_deterministic() {
+        let key = "abc123def456";
+        assert_eq!(compute_miner_uid(key), compute_miner_uid(key));
+        assert_ne!(compute_miner_uid(key), compute_miner_uid("xyz789"));
+        assert!(compute_miner_uid(key) <= 0x7FFF_FFFF);
     }
 }

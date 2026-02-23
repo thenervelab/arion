@@ -13,18 +13,18 @@ path = "src/bin/verify_attestations.rs"
 
 [dependencies]
 common = { path = "../common" }
-anyhow = "1.0"
-clap = { version = "4.4", features = ["derive", "env"] }
-parity-scale-codec = { version = "3.6", features = ["derive"] }
-subxt = "0.37"
-iroh-base = { version = "0.95", features = ["key"] }
-hex = "0.4"
-chrono = "0.4"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio = { version = "1.32", features = ["full"] }
-reqwest = { version = "0.11", features = ["json"] }
-blake3 = "1"
-ed25519-dalek = "2"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+anyhow = { workspace = true }
+clap = { workspace = true }
+parity-scale-codec = { workspace = true }
+subxt = { workspace = true }
+iroh-base = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

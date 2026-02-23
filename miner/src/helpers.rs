@@ -18,6 +18,16 @@ use anyhow::Result;
 use iroh::SecretKey;
 use tracing::{debug, warn};
 
+/// Returns true if the connection has a direct IP path (not relay-only).
+///
+/// In iroh 0.96+, `remote_info().addrs()` only reflects the address book
+/// (discovery), not live paths discovered via NAT traversal. Use
+/// `Connection::paths()` to inspect actual live paths on a connection.
+pub fn has_direct_ip_path(conn: &iroh::endpoint::Connection) -> bool {
+    use iroh::Watcher as _;
+    conn.paths().get().iter().any(|p| p.is_ip())
+}
+
 /// Safely truncate a string for logging (handles non-ASCII gracefully)
 pub fn truncate_for_log(s: &str, max_chars: usize) -> &str {
     match s.char_indices().nth(max_chars) {
@@ -63,4 +73,63 @@ pub async fn load_keypair(data_dir: &std::path::Path) -> Result<SecretKey> {
 
     debug!(path = %keypair_path.display(), "Generated new keypair");
     Ok(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_within_limit() {
+        assert_eq!(truncate_for_log("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_exact_limit() {
+        assert_eq!(truncate_for_log("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_over_limit() {
+        assert_eq!(truncate_for_log("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_empty() {
+        assert_eq!(truncate_for_log("", 5), "");
+    }
+
+    #[test]
+    fn truncate_zero_limit() {
+        assert_eq!(truncate_for_log("hello", 0), "");
+    }
+
+    #[test]
+    fn truncate_multibyte_chars() {
+        // Each emoji is 4 bytes but 1 char — must not split mid-codepoint
+        let emoji = "😀😁😂";
+        assert_eq!(truncate_for_log(emoji, 2), "😀😁");
+    }
+
+    #[test]
+    fn truncate_mixed_ascii_multibyte() {
+        let mixed = "ab😀cd";
+        assert_eq!(truncate_for_log(mixed, 3), "ab😀");
+    }
+
+    #[tokio::test]
+    async fn load_keypair_generates_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let key1 = load_keypair(dir.path()).await.unwrap();
+        let key2 = load_keypair(dir.path()).await.unwrap();
+        assert_eq!(key1.public(), key2.public());
+    }
+
+    #[tokio::test]
+    async fn load_keypair_rejects_corrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keypair.bin");
+        std::fs::write(&path, b"too_short").unwrap();
+        assert!(load_keypair(dir.path()).await.is_err());
+    }
 }

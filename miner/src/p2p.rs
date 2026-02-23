@@ -1,10 +1,40 @@
 //! P2P protocol handler for the miner.
+//!
+//! Handles all inbound messages on the `hippius/miner-control` ALPN, including
+//! shard storage, deletion, serving, peer pulls, cluster map updates, and
+//! proof-of-storage challenges.
+//!
+//! # Protocol Framing
+//!
+//! Two framing modes share a single stream, disambiguated by the first byte:
+//!
+//! - **V1 (JSON):** First byte is `{` (0x7B). The entire message is a
+//!   JSON-encoded [`MinerControlMessage`]. Used for most control messages.
+//! - **V2 (binary):** First byte is `0x02` ([`STORE_V2_MAGIC`]). Followed by
+//!   4-byte LE header length, a JSON header, and raw blob bytes. Used for
+//!   `StoreV2` to avoid base64 overhead.
+//!
+//! # Backpressure
+//!
+//! Semaphores bound concurrent work per category:
+//! - `store_sem` — validator-pushed Store operations
+//! - `pull_sem` — peer-to-peer shard downloads
+//! - `fetch_sem` — FetchBlob responses to gateways/miners
+//! - `pos_sem` — CPU-intensive proof-of-storage generation
+//! - `HANDLER_SEMAPHORE` — global cap on spawned stream handlers (2048)
+//!
+//! # Connection Model
+//!
+//! Each inbound connection loops accepting bidirectional QUIC streams,
+//! spawning a task per stream for concurrent request handling. Data-plane
+//! operations (Store, FetchBlob, PullFromPeer) require a direct UDP path;
+//! relay-only connections are rejected to avoid saturating relay servers.
 
 use crate::constants::{
     DEFAULT_READ_TIMEOUT_SECS, MAX_CLUSTER_MAP_JSON_SIZE, MAX_CONCURRENT_HANDLERS, MAX_EPOCH_JUMP,
     MAX_FETCH_RESPONSE_SIZE, MAX_MESSAGE_SIZE, MAX_PEER_CACHE_ENTRIES, MAX_V2_DATA_SIZE,
 };
-use crate::helpers::truncate_for_log;
+use crate::helpers::{has_direct_ip_path, truncate_for_log};
 use crate::state::{
     get_blob_cache, get_blobs_dir, get_cluster_map, get_current_epoch, get_peer_cache,
     get_static_discovery, get_warden_node_ids,
@@ -44,7 +74,12 @@ async fn send_response(send: &mut iroh::endpoint::SendStream, data: &[u8]) -> Re
     finish_stream(send).await
 }
 
-/// Check if the remote node is authorized (must be the validator)
+/// Check if the remote node is authorized (must be the validator).
+///
+/// SAFETY: When `validator_node_id` is `None` (no validator configured),
+/// this returns `true` for ANY peer. This is intentional for local/dev
+/// testing but means an unconfigured miner accepts Store/Delete from
+/// anyone. Production deployments MUST set `VALIDATOR_NODE_ID`.
 fn is_authorized(
     remote_node_id: &iroh::PublicKey,
     validator_node_id: Option<&iroh::PublicKey>,
@@ -69,39 +104,28 @@ async fn is_authorized_for_pos(
     warden_ids.iter().any(|w| remote_node_id == w)
 }
 
-/// Returns true if the endpoint has a direct UDP path to the given node.
-/// Mixed (has relay fallback), relay-only, and unknown connections return false.
-/// Used to prevent shard data from flowing through relay servers.
-fn has_direct_path(endpoint: &Endpoint, node_id: iroh::PublicKey) -> bool {
-    use iroh::Watcher as _;
-    endpoint.conn_type(node_id).is_some_and(|mut watcher| {
-        matches!(watcher.get(), iroh::endpoint::ConnectionType::Direct(_))
-    })
-}
-
-/// Wait briefly for a direct UDP path to a peer.
-/// Iroh connections transition relay → mixed → direct; this polls
-/// until Direct is confirmed or the timeout expires.
-/// Returns true if a direct path was established.
-async fn wait_for_direct_peer_path(
-    endpoint: &Endpoint,
-    node_id: iroh::PublicKey,
-    timeout_ms: u64,
-) -> bool {
-    if has_direct_path(endpoint, node_id) {
+/// Wait briefly for a connection to establish a direct IP path.
+/// Uses `Watcher::updated()` to wake on path changes instead of polling.
+async fn wait_for_direct_peer_path(conn: &iroh::endpoint::Connection, timeout_ms: u64) -> bool {
+    if has_direct_ip_path(conn) {
         return true;
     }
 
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
-
-    while tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        if has_direct_path(endpoint, node_id) {
-            return true;
+    let deadline = tokio::time::Duration::from_millis(timeout_ms);
+    let mut watcher = conn.paths();
+    tokio::time::timeout(deadline, async {
+        loop {
+            use iroh::Watcher;
+            if watcher.updated().await.is_err() {
+                return false;
+            }
+            if watcher.get().iter().any(|p| p.is_ip()) {
+                return true;
+            }
         }
-    }
-
-    false
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Result of attempting to acquire a semaphore permit with timeout
@@ -128,8 +152,12 @@ async fn acquire_permit_with_timeout(
     }
 }
 
-/// P2P protocol handler for miner control messages
-#[derive(Debug)]
+/// P2P protocol handler for miner control messages.
+///
+/// Implements [`iroh::protocol::ProtocolHandler`] for the `hippius/miner-control`
+/// ALPN. All fields are cheaply cloneable (Arc internals) so the handler can be
+/// cloned per-connection without data duplication.
+#[derive(Debug, Clone)]
 pub struct MinerControlHandler {
     pub store: FsStore,
     pub endpoint: Endpoint,
@@ -146,45 +174,23 @@ impl iroh::protocol::ProtocolHandler for MinerControlHandler {
         conn: iroh::endpoint::Connection,
     ) -> impl futures::Future<Output = Result<(), iroh::protocol::AcceptError>> + Send {
         trace!(remote = %conn.remote_id(), "MinerControlHandler::accept called");
-        let store = self.store.clone();
-        let endpoint = self.endpoint.clone();
-        let store_sem = self.store_sem.clone();
-        let pull_sem = self.pull_sem.clone();
-        let fetch_sem = self.fetch_sem.clone();
-        let pos_sem = self.pos_sem.clone();
-        let validator_node_id = self.validator_node_id;
+        let handler = self.clone();
         async move {
-            handle_miner_control(
-                conn,
-                store,
-                endpoint,
-                store_sem,
-                pull_sem,
-                fetch_sem,
-                pos_sem,
-                validator_node_id,
-            )
-            .await
-            .map_err(|e| iroh::protocol::AcceptError::from_err(std::io::Error::other(e)))
+            handle_miner_control(conn, handler)
+                .await
+                .map_err(|e| iroh::protocol::AcceptError::from_err(std::io::Error::other(e)))
         }
     }
 }
 
-/// Handle incoming miner control messages
+/// Handle incoming miner control messages.
 ///
-/// This function loops accepting multiple bidirectional streams on the connection,
-/// spawning each as a concurrent task. This allows QUIC multiplexing so the gateway
-/// can reuse a single connection for multiple parallel shard fetches.
-#[allow(clippy::too_many_arguments)]
+/// Loops accepting bidirectional streams on the connection, spawning each as a
+/// concurrent task. This allows QUIC multiplexing so the gateway can reuse a
+/// single connection for multiple parallel shard fetches.
 pub async fn handle_miner_control(
     connection: iroh::endpoint::Connection,
-    store: FsStore,
-    endpoint: Endpoint,
-    store_sem: Arc<tokio::sync::Semaphore>,
-    pull_sem: Arc<tokio::sync::Semaphore>,
-    fetch_sem: Arc<tokio::sync::Semaphore>,
-    pos_sem: Arc<tokio::sync::Semaphore>,
-    validator_node_id: Option<iroh::PublicKey>,
+    handler: MinerControlHandler,
 ) -> Result<()> {
     let remote_node_id = connection.remote_id();
     trace!(remote = %remote_node_id, "Accepted MinerControl connection");
@@ -216,32 +222,16 @@ pub async fn handle_miner_control(
             }
         };
 
-        // Clone state for the spawned task
-        let store = store.clone();
-        let endpoint = endpoint.clone();
-        let store_sem = store_sem.clone();
-        let pull_sem = pull_sem.clone();
-        let fetch_sem = fetch_sem.clone();
-        let pos_sem = pos_sem.clone();
+        let handler = handler.clone();
+        let conn_clone = connection.clone();
 
         // Spawn handler for this stream so multiple streams can be processed concurrently
         tokio::spawn(async move {
             // Hold permit until handler completes
             let _permit = handler_permit;
 
-            if let Err(e) = handle_single_stream(
-                send,
-                recv,
-                &remote_node_id,
-                validator_node_id.as_ref(),
-                &store,
-                &endpoint,
-                &store_sem,
-                &pull_sem,
-                &fetch_sem,
-                &pos_sem,
-            )
-            .await
+            if let Err(e) =
+                handle_single_stream(send, recv, &remote_node_id, &handler, &conn_clone).await
             {
                 warn!(remote = %remote_node_id, error = %e, "Stream handler error");
             }
@@ -252,18 +242,12 @@ pub async fn handle_miner_control(
 }
 
 /// Handle a single bidirectional stream (one request-response)
-#[allow(clippy::too_many_arguments)]
 async fn handle_single_stream(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     remote_node_id: &iroh::PublicKey,
-    validator_node_id: Option<&iroh::PublicKey>,
-    store: &FsStore,
-    endpoint: &Endpoint,
-    store_sem: &Arc<tokio::sync::Semaphore>,
-    pull_sem: &Arc<tokio::sync::Semaphore>,
-    fetch_sem: &Arc<tokio::sync::Semaphore>,
-    pos_sem: &Arc<tokio::sync::Semaphore>,
+    handler: &MinerControlHandler,
+    connection: &iroh::endpoint::Connection,
 ) -> Result<()> {
     // Read the first byte to detect V1 (JSON) vs V2 (binary framing) protocol.
     // SAFETY: JSON-encoded MinerControlMessage always starts with '{' (0x7B),
@@ -350,7 +334,7 @@ async fn handle_single_stream(
             data,
             source_miner,
         } => {
-            if !has_direct_path(endpoint, *remote_node_id) {
+            if !has_direct_ip_path(connection) {
                 warn!(
                     remote = %remote_node_id,
                     hash = %truncate_for_log(&hash, 16),
@@ -358,25 +342,20 @@ async fn handle_single_stream(
                 );
                 return send_response(&mut send, b"ERROR: RELAY_ONLY").await;
             }
-            handle_store(
+            handle_store(remote_node_id, handler, &mut send, hash, data, source_miner).await?;
+        }
+        common::MinerControlMessage::Delete { hash } => {
+            handle_delete(
                 remote_node_id,
-                validator_node_id,
+                handler.validator_node_id.as_ref(),
                 &mut send,
-                store,
-                endpoint,
-                store_sem,
-                pull_sem,
+                &handler.store,
                 hash,
-                data,
-                source_miner,
             )
             .await?;
         }
-        common::MinerControlMessage::Delete { hash } => {
-            handle_delete(remote_node_id, validator_node_id, &mut send, store, hash).await?;
-        }
         common::MinerControlMessage::FetchBlob { hash } => {
-            if !has_direct_path(endpoint, *remote_node_id) {
+            if !has_direct_ip_path(connection) {
                 warn!(
                     remote = %remote_node_id,
                     hash = %truncate_for_log(&hash, 16),
@@ -384,7 +363,7 @@ async fn handle_single_stream(
                 );
                 return send_response(&mut send, b"ERROR: RELAY_ONLY").await;
             }
-            handle_fetch_blob(&mut send, store, fetch_sem, hash).await?;
+            handle_fetch_blob(&mut send, &handler.store, &handler.fetch_sem, hash).await?;
         }
         common::MinerControlMessage::ClusterMapUpdate {
             epoch,
@@ -394,7 +373,7 @@ async fn handle_single_stream(
         } => {
             handle_cluster_map_update(
                 remote_node_id,
-                validator_node_id,
+                handler.validator_node_id.as_ref(),
                 &mut send,
                 epoch,
                 peers,
@@ -415,17 +394,7 @@ async fn handle_single_stream(
                     return send_response(&mut send, b"ERROR: Invalid peer_endpoint").await;
                 }
             };
-            handle_pull_from_peer(
-                remote_node_id,
-                validator_node_id,
-                &mut send,
-                store,
-                endpoint,
-                pull_sem,
-                hash,
-                peer_addr,
-            )
-            .await?;
+            handle_pull_from_peer(remote_node_id, handler, &mut send, hash, peer_addr).await?;
         }
         common::MinerControlMessage::QueryPgFiles { .. }
         | common::MinerControlMessage::PgFilesResponse { .. } => {
@@ -441,13 +410,13 @@ async fn handle_single_stream(
         } => {
             // Authorization: Only allow PoS challenges from validator or warden
             // This prevents DoS attacks and information disclosure from arbitrary peers
-            if !is_authorized_for_pos(remote_node_id, validator_node_id).await {
+            if !is_authorized_for_pos(remote_node_id, handler.validator_node_id.as_ref()).await {
                 debug!(remote = %remote_node_id, "PosChallenge rejected: unauthorized sender");
                 return send_response(&mut send, b"ERROR: UNAUTHORIZED").await;
             }
 
             // Backpressure: Proof generation is CPU-intensive
-            let _permit = match pos_sem.clone().try_acquire_owned() {
+            let _permit = match handler.pos_sem.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
                     debug!(shard = %truncate_for_log(&shard_hash, 16), "PosChallenge rate limited");
@@ -457,7 +426,7 @@ async fn handle_single_stream(
 
             handle_pos_challenge(
                 &mut send,
-                store,
+                &handler.store,
                 shard_hash,
                 chunk_indices,
                 nonce,
@@ -467,7 +436,7 @@ async fn handle_single_stream(
             .await?;
         }
         common::MinerControlMessage::CheckBlob { hash } => {
-            handle_check_blob(&mut send, store, hash).await?;
+            handle_check_blob(&mut send, &handler.store, hash).await?;
         }
         common::MinerControlMessage::StoreV2 { .. } => {
             // V1 JSON path: a raw JSON StoreV2 message (without V2 binary framing) is invalid.
@@ -481,21 +450,16 @@ async fn handle_single_stream(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_store(
     remote_node_id: &iroh::PublicKey,
-    validator_node_id: Option<&iroh::PublicKey>,
+    handler: &MinerControlHandler,
     send: &mut iroh::endpoint::SendStream,
-    store: &FsStore,
-    endpoint: &Endpoint,
-    store_sem: &Arc<tokio::sync::Semaphore>,
-    pull_sem: &Arc<tokio::sync::Semaphore>,
     hash: String,
     data: Option<Vec<u8>>,
     source_miner: Option<String>,
 ) -> Result<()> {
     // Only validator should be allowed to issue Store commands
-    if !is_authorized(remote_node_id, validator_node_id) {
+    if !is_authorized(remote_node_id, handler.validator_node_id.as_ref()) {
         error!(remote = %remote_node_id, "Store rejected: non-validator controller");
         return send_response(send, b"ERROR: UNAUTHORIZED").await;
     }
@@ -506,7 +470,7 @@ async fn handle_store(
         // CASE 1: Push from validator (initial upload)
         (Some(blob_data), None) => {
             // Backpressure: bound concurrent Store ops
-            let _permit = match acquire_permit_with_timeout(store_sem.clone(), 30).await {
+            let _permit = match acquire_permit_with_timeout(handler.store_sem.clone(), 30).await {
                 PermitResult::Acquired(p) => p,
                 PermitResult::Closed => {
                     error!("Store semaphore closed unexpectedly");
@@ -530,7 +494,7 @@ async fn handle_store(
             };
 
             // Store blob (persistent with FsStore)
-            let outcome = match store.add_bytes(blob_data).await {
+            let outcome = match handler.store.add_bytes(blob_data).await {
                 Ok(o) => o,
                 Err(e) => {
                     error!(hash = %hash, error = %e, "Failed to store blob");
@@ -561,7 +525,7 @@ async fn handle_store(
         // CASE 2: Pull from another miner (rebalancing)
         (None, Some(miner_id)) => {
             // Backpressure: bound concurrent peer pulls
-            let permit = match acquire_permit_with_timeout(pull_sem.clone(), 30).await {
+            let permit = match acquire_permit_with_timeout(handler.pull_sem.clone(), 30).await {
                 PermitResult::Acquired(p) => p,
                 PermitResult::Closed => {
                     error!("Pull semaphore closed unexpectedly");
@@ -578,7 +542,12 @@ async fn handle_store(
             // Await download completion BEFORE sending ACK
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                download_from_peer_miner(&miner_id, &hash, store.clone(), endpoint.clone()),
+                download_from_peer_miner(
+                    &miner_id,
+                    &hash,
+                    handler.store.clone(),
+                    handler.endpoint.clone(),
+                ),
             )
             .await;
 
@@ -983,7 +952,7 @@ async fn handle_cluster_map_update(
                     *map_guard = Some(Arc::new(map));
                 }
                 Err(e) => {
-                    debug!(error = %e, "Failed to parse cluster_map_json");
+                    warn!(error = %e, "Failed to parse cluster_map_json");
                 }
             }
         }
@@ -1015,19 +984,15 @@ async fn handle_cluster_map_update(
     send_response(send, b"OK").await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_pull_from_peer(
     remote_node_id: &iroh::PublicKey,
-    validator_node_id: Option<&iroh::PublicKey>,
+    handler: &MinerControlHandler,
     send: &mut iroh::endpoint::SendStream,
-    store: &FsStore,
-    endpoint: &Endpoint,
-    pull_sem: &Arc<tokio::sync::Semaphore>,
     hash: String,
     peer_endpoint: iroh::EndpointAddr,
 ) -> Result<()> {
     // Only validator should be allowed to issue PullFromPeer commands
-    if !is_authorized(remote_node_id, validator_node_id) {
+    if !is_authorized(remote_node_id, handler.validator_node_id.as_ref()) {
         error!(remote = %remote_node_id, "PullFromPeer rejected: non-validator controller");
         return send_response(send, b"ERROR: UNAUTHORIZED").await;
     }
@@ -1035,7 +1000,7 @@ async fn handle_pull_from_peer(
     trace!(hash = %truncate_for_log(&hash, 32), "Received PullFromPeer command");
 
     // Backpressure: bound concurrent peer pulls
-    let permit = match acquire_permit_with_timeout(pull_sem.clone(), 30).await {
+    let permit = match acquire_permit_with_timeout(handler.pull_sem.clone(), 30).await {
         PermitResult::Acquired(p) => p,
         PermitResult::Closed => {
             error!("Pull semaphore closed unexpectedly");
@@ -1050,7 +1015,12 @@ async fn handle_pull_from_peer(
     // Await download completion BEFORE sending ACK
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        pull_blob_from_peer(store.clone(), endpoint.clone(), peer_endpoint, hash.clone()),
+        pull_blob_from_peer(
+            handler.store.clone(),
+            handler.endpoint.clone(),
+            peer_endpoint,
+            hash.clone(),
+        ),
     )
     .await;
 
@@ -1088,10 +1058,9 @@ pub async fn pull_blob_from_peer(
     let conn = crate::state::get_pooled_connection(&endpoint, &peer_addr, b"hippius/miner-control")
         .await?;
 
-    // Wait briefly for direct path — Iroh connections transition
-    // relay → mixed → direct; the mixed→direct hop typically takes
-    // 30-100ms after the initial connect.
-    if !wait_for_direct_peer_path(&endpoint, peer_addr.id, 500).await {
+    // Wait briefly for direct path — after the initial relay
+    // connect, hole-punching typically resolves in 30-100ms.
+    if !wait_for_direct_peer_path(&conn, 500).await {
         warn!(
             peer = %peer_addr.id,
             hash = %truncate_for_log(&hash, 16),
@@ -1194,7 +1163,6 @@ pub async fn download_from_peer_miner(
 /// Handle a proof-of-storage challenge from a Warden.
 ///
 /// Generates a ZK proof demonstrating possession of the challenged chunks.
-#[allow(clippy::too_many_arguments)]
 async fn handle_pos_challenge(
     send: &mut iroh::endpoint::SendStream,
     store: &FsStore,
@@ -1288,8 +1256,8 @@ async fn handle_pos_challenge(
         expires_at,
     };
 
-    // Clone commitment for the blocking task (Arc clone = cheap refcount bump)
-    let commitment_for_proof = (*commitment).clone();
+    // Arc clone for the blocking task (cheap refcount bump, not a deep copy)
+    let commitment_for_proof = commitment.clone();
 
     // Generate proof on blocking thread pool to avoid starving the async executor.
     // With pos_sem=2, this can block 2 executor threads for 500ms+ — spawn_blocking

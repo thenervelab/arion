@@ -5,36 +5,36 @@ edition = "2024"
 
 [dependencies]
 common = { path = "../common" }
-iroh = "0.95.1"
-iroh-blobs = "0.97.0"
-iroh-docs = { git = "https://github.com/n0-computer/iroh-docs.git", rev = "0445e55" }
-iroh-gossip = "0.95"
-iroh-base = { version = "0.95.1", features = ["key"] }
-tokio = { version = "1.0", features = ["full"] }
-tokio-util = { version = "0.7", features = ["io"] }
-axum = { version = "0.7", features = ["multipart"] }
-anyhow = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tower-http = { version = "0.5", features = ["cors", "limit"] }
-async-stream = "0.3"
-futures = "0.3"
-bytes = "1.0"
-reed-solomon-erasure = "6.0"
-reqwest = { version = "0.11", features = ["json", "multipart", "stream"] }
-clap = { version = "4.0", features = ["derive", "env"] }
-rand = "0.9"
-blake3 = "1.8.2"
-crc32fast = "1.5.0"
-bao-tree = "0.16.0"
-prometheus-client = "0.22"
-sysinfo = "0.30"
-uuid = { version = "1.0", features = ["v4"] }
-dashmap = "6"
-quick_cache = "0.6"
-parking_lot = "0.12"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-axum-server = { version = "0.7", features = ["tls-openssl"] }
-openssl = { version = "0.10", features = ["vendored"] }
-tempfile = "3"
+iroh = { workspace = true }
+iroh-blobs = { workspace = true }
+iroh-docs = { workspace = true }
+iroh-gossip = { workspace = true }
+iroh-base = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+axum = { workspace = true }
+axum-server = { workspace = true }
+openssl = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tower-http = { workspace = true }
+async-stream = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+reed-solomon-erasure = { workspace = true }
+reqwest = { workspace = true }
+clap = { workspace = true }
+rand = { workspace = true }
+blake3 = { workspace = true }
+crc32fast = { workspace = true }
+bao-tree = { workspace = true }
+prometheus-client = { workspace = true }
+sysinfo = { workspace = true }
+uuid = { workspace = true }
+dashmap = { workspace = true }
+quick_cache = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tempfile = { workspace = true }

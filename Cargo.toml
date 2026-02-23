@@ -49,13 +49,20 @@ serde-big-array = "0.5"
 # ============================================
 # HTTP Client
 # ============================================
-reqwest = { version = "0.13.1", default-features = false, features = ["json", "multipart", "stream", "rustls"] }
+reqwest = { version = "0.13.1", default-features = false, features = [
+    "json",
+    "multipart",
+    "stream",
+    "rustls",
+] }
 
 # ============================================
 # Cryptography
 # ============================================
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+blake2b_simd = "1"
 blake3 = "1.8.2"
+bs58 = "0.5"
 sha2 = "0.10"
 chacha20poly1305 = "0.10.1"
 ring = "0.17.14"
@@ -70,21 +77,27 @@ openssl = { version = "0.10", features = ["vendored"] }
 # ============================================
 # Iroh P2P
 # ============================================
-iroh = "0.95.1"
-iroh-base = { version = "0.95.1", features = ["key"] }
-iroh-blobs = { version = "0.97.0", features = ["fs-store"] }
-iroh-gossip = "0.95"
-iroh-docs = { git = "https://github.com/n0-computer/iroh-docs.git", rev = "0445e55" }
+iroh = "0.96.1"
+iroh-base = { version = "0.96.1", features = ["key"] }
+iroh-blobs = { version = "0.98.0", features = ["fs-store"] }
+iroh-gossip = "0.96.0"
+iroh-docs = "0.96.0"
 
 # ============================================
 # Database
 # ============================================
 sled = "0.34"
-redb = "2"
+
+
+# ============================================
+# System
+# ============================================
+libc = "0.2"
 
 # ============================================
 # Concurrency
 # ============================================
+arc-swap = "1"
 dashmap = "6"
 quick_cache = "0.6"
 parking_lot = "0.12"
@@ -147,12 +160,17 @@ sysinfo = "0.30"
 # ============================================
 # S3 Storage
 # ============================================
-rust-s3 = { version = "0.35", default-features = false, features = ["use-tokio-native-tls"] }
+rust-s3 = { version = "0.35", default-features = false, features = [
+    "use-tokio-native-tls",
+] }
 
 # ============================================
 # Substrate/Blockchain
 # ============================================
-subxt = { version = "0.44", default-features = false, features = ["native", "jsonrpsee"] }
+subxt = { version = "0.44", default-features = false, features = [
+    "native",
+    "jsonrpsee",
+] }
 subxt-signer = "0.44"
 bip39 = { version = "2.2.2", features = ["rand", "unicode-normalization"] }
 

@@ -1,3 +1,10 @@
+//! Version checking against GitHub releases.
+//!
+//! Runs once at startup (spawned as a background task) to compare the
+//! running binary version against the latest GitHub release. Logs a
+//! warning if a newer version is available. Non-blocking — failures
+//! are silently swallowed so they never affect miner operation.
+
 use semver::Version;
 use tracing::{debug, info, warn};
 

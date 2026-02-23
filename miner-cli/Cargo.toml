@@ -4,22 +4,19 @@ version = "0.1.1"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0"
-tokio = { version = "1.32", features = ["full"] }
-clap = { version = "4.4", features = ["derive", "env"] }
-dotenvy = "0.15"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+dotenvy = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 # Chain client
-subxt = { version = "0.44", default-features = false, features = [
-    "native",
-    "jsonrpsee",
-] }
-subxt-signer = "0.44"
-bip39 = "2.2"
-parity-scale-codec = { version = "3", features = ["derive"] }
-hex = "0.4"
+subxt = { workspace = true }
+subxt-signer = { workspace = true }
+bip39 = { workspace = true }
+parity-scale-codec = { workspace = true }
+hex = { workspace = true }
 
 # Miner node key (ed25519)
-iroh-base = { version = "0.95.1", features = ["key"] }
+iroh-base = { workspace = true }

@@ -1,7 +1,21 @@
 //! Self-rebalancing logic for the miner.
 //!
-//! Miners periodically check which PGs they are responsible for,
-//! query the validator for files in those PGs, and pull any missing shards.
+//! Runs on a configurable tick (default 300s) with startup jitter to
+//! desynchronize miners. Each cycle:
+//!
+//! 1. **PG calculation**: Compute which Placement Groups this miner is
+//!    responsible for using CRUSH over the current cluster map (cached by epoch).
+//! 2. **Manifest fetch**: Query the validator for all files in those PGs
+//!    via chunked `QueryPgFilesBatch` requests (500 PGs per chunk).
+//! 3. **Shard verification**: For each file, fetch the manifest and walk
+//!    stripes to identify shards this miner should hold (CRUSH placement
+//!    with stripe rotation). Compare against a pre-built set of locally
+//!    present blobs (directory walk, O(1) lookups).
+//! 4. **Orphan GC**: Any local blob not in the expected set is tracked as
+//!    an orphan. After a 1-hour grace period, orphans are deleted from disk.
+//!
+//! Missing shards are only logged — the validator handles migration via
+//! `PullFromPeer` commands. The miner does not self-heal.
 
 use crate::constants::{
     DEFAULT_CONNECT_TIMEOUT_SECS, MAX_BATCH_PG_RESPONSE_SIZE, MAX_ORPHAN_ENTRIES,
@@ -22,7 +36,7 @@ use tracing::{debug, error, info, trace, warn};
 
 /// PG-based self-rebalancing: Calculate which PGs this miner is responsible for,
 /// query validator for files in each PG, and pull any missing shards
-pub async fn self_rebalance_pg(_store: FsStore, endpoint: Endpoint) -> Result<()> {
+pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()> {
     if !get_validator_reachable().load(std::sync::atomic::Ordering::Relaxed) {
         debug!("Skipping rebalance: validator not reachable");
         return Ok(());
@@ -89,8 +103,6 @@ pub async fn self_rebalance_pg(_store: FsStore, endpoint: Endpoint) -> Result<()
     trace!(pgs = ?my_pgs.iter().take(10).collect::<Vec<_>>(), "My PG assignments (first 10)");
 
     // Query validator for files in ALL our PGs in a single batch request
-    let mut total_files = 0;
-    let mut files_processed = 0;
     let mut missing_shards = 0;
     let mut expected_shards: std::collections::HashSet<iroh_blobs::Hash> =
         std::collections::HashSet::new();
@@ -99,80 +111,75 @@ pub async fn self_rebalance_pg(_store: FsStore, endpoint: Endpoint) -> Result<()
     let mut pg_files_map: std::collections::HashMap<u32, Vec<String>> =
         std::collections::HashMap::with_capacity(my_pgs.len());
 
-    // Connect to validator via P2P with timeout
+    // Single P2P connection for both PG queries and manifest fetches.
+    // QUIC natively multiplexes streams on one connection.
     let connect_timeout = std::time::Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS);
     let read_timeout = std::time::Duration::from_secs(60); // Longer timeout for batch response
+
+    let validator_conn = match crate::state::connect_with_cleanup(
+        &endpoint,
+        validator_addr.clone(),
+        b"hippius/validator-control",
+        connect_timeout,
+    )
+    .await
+    {
+        Ok(conn) => conn,
+        Err(e) => {
+            error!(error = %e, "Failed to connect to validator for rebalance");
+            return Ok(());
+        }
+    };
 
     debug!(
         pg_count = my_pgs.len(),
         "Querying validator for files in assigned PGs (chunked batch)"
     );
 
-    // Single connection for all PG queries
-    match tokio::time::timeout(
-        connect_timeout,
-        endpoint.connect(validator_addr.clone(), b"hippius/validator-control"),
-    )
-    .await
-    {
-        Ok(Ok(conn)) => {
-            // Process PGs in chunks to prevent validator OOM
-            // 500 PGs * ~17 files/PG * 64 bytes/hash ≈ 544 KB per chunk (very safe)
-            for chunk in my_pgs.chunks(500) {
-                let query_msg = common::ValidatorControlMessage::QueryPgFilesBatch {
-                    pg_ids: chunk.to_vec(),
-                };
+    // Process PGs in chunks to prevent validator OOM
+    // 500 PGs * ~17 files/PG * 64 bytes/hash ≈ 544 KB per chunk (very safe)
+    for chunk in my_pgs.chunks(500) {
+        let query_msg = common::ValidatorControlMessage::QueryPgFilesBatch {
+            pg_ids: chunk.to_vec(),
+        };
 
-                let result: Result<std::collections::HashMap<u32, Vec<String>>> = async {
-                    let (mut send, mut recv) = conn.open_bi().await?;
-                    let msg_bytes = serde_json::to_vec(&query_msg)?;
-                    send.write_all(&msg_bytes).await?;
-                    send.finish()?;
+        let result: Result<std::collections::HashMap<u32, Vec<String>>> = async {
+            let (mut send, mut recv) = validator_conn.open_bi().await?;
+            let msg_bytes = serde_json::to_vec(&query_msg)?;
+            send.write_all(&msg_bytes).await?;
+            send.finish()?;
 
-                    // Buffer for batch response
-                    let response_bytes = tokio::time::timeout(
-                        read_timeout,
-                        recv.read_to_end(MAX_BATCH_PG_RESPONSE_SIZE),
-                    )
+            // Buffer for batch response
+            let response_bytes =
+                tokio::time::timeout(read_timeout, recv.read_to_end(MAX_BATCH_PG_RESPONSE_SIZE))
                     .await
                     .map_err(|_| anyhow::anyhow!("QueryPgFilesBatch read timeout"))??;
 
-                    let files: std::collections::HashMap<u32, Vec<String>> =
-                        serde_json::from_slice(&response_bytes)?;
+            let files: std::collections::HashMap<u32, Vec<String>> =
+                serde_json::from_slice(&response_bytes)?;
 
-                    // Validate deserialized size to prevent memory exhaustion
-                    let total_entries: usize = files.values().map(|v| v.len()).sum();
-                    if total_entries > 100_000 {
-                        anyhow::bail!(
-                            "PG batch response too large: {} file entries (max 100000)",
-                            total_entries
-                        );
-                    }
+            // Validate deserialized size to prevent memory exhaustion
+            let total_entries: usize = files.values().map(|v| v.len()).sum();
+            if total_entries > 100_000 {
+                anyhow::bail!(
+                    "PG batch response too large: {} file entries (max 100000)",
+                    total_entries
+                );
+            }
 
-                    Ok(files)
-                }
-                .await;
+            Ok(files)
+        }
+        .await;
 
-                match result {
-                    Ok(f) => {
-                        for (k, v) in f {
-                            pg_files_map.insert(k, v);
-                        }
-                    }
-                    Err(e) => {
-                        error!(error = %e, "Batch PG chunk query failed");
-                        // Continue to next chunk or abort? Better to continue
-                    }
+        match result {
+            Ok(f) => {
+                for (k, v) in f {
+                    pg_files_map.insert(k, v);
                 }
             }
-        }
-        Ok(Err(e)) => {
-            error!(error = %e, "Failed to connect for batch PG query");
-            return Ok(());
-        }
-        Err(_) => {
-            error!("Connection timeout for batch PG query");
-            return Ok(());
+            Err(e) => {
+                error!(error = %e, "Batch PG chunk query failed");
+            }
         }
     }
 
@@ -181,72 +188,45 @@ pub async fn self_rebalance_pg(_store: FsStore, endpoint: Endpoint) -> Result<()
         "Received batch PG query response"
     );
 
-    // Pre-build set of locally present hashes by walking the blobs data directory once.
-    // This replaces per-shard store.has() async I/O with O(1) in-memory lookups and
-    // is also reused by gc_orphan_shards to avoid a redundant directory walk.
-    let local_hashes: std::collections::HashSet<iroh_blobs::Hash> = {
-        let blobs_path = {
-            let bd = get_blobs_dir().read().await;
-            bd.clone()
-        };
-        let mut set = std::collections::HashSet::new();
-        if let Some(ref blobs_dir) = blobs_path {
-            let data_dir = blobs_dir.join("data");
-            if let Ok(mut entries) = tokio::fs::read_dir(&data_dir).await {
-                while let Ok(Some(dir_entry)) = entries.next_entry().await {
-                    if let Some(filename) = dir_entry.file_name().to_str() {
-                        let hash_str = filename.strip_suffix(".data").unwrap_or(filename);
-                        if let Ok(h) = iroh_blobs::Hash::from_str(hash_str) {
-                            set.insert(h);
-                        }
-                    }
+    // Pre-build map of locally present hashes and their tags via FsStore API.
+    // This is authoritative (unlike directory walks which can miss inlined blobs)
+    // and also provides tags for gc_orphan_shards to delete properly.
+    let local_hash_tags: std::collections::HashMap<iroh_blobs::Hash, iroh_blobs::api::Tag> = {
+        use futures::StreamExt;
+        let mut map = std::collections::HashMap::new();
+        match store.tags().list().await {
+            Ok(mut tag_stream) => {
+                while let Some(Ok(tag_info)) = tag_stream.next().await {
+                    map.insert(tag_info.hash, tag_info.name);
                 }
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to list tags from store");
             }
         }
         trace!(
-            local_blobs = set.len(),
-            "Built local hash set from blobs directory"
+            local_blobs = map.len(),
+            "Built local hash set from FsStore tags"
         );
-        set
+        map
     };
+    let local_hashes: std::collections::HashSet<iroh_blobs::Hash> =
+        local_hash_tags.keys().copied().collect();
 
-    // Establish one P2P connection for all manifest fetches.
-    // QUIC natively multiplexes streams, so 16 concurrent bidi streams on one connection is safe.
-    let manifest_conn: Option<iroh::endpoint::Connection> = match tokio::time::timeout(
-        connect_timeout,
-        endpoint.connect(validator_addr.clone(), b"hippius/validator-control"),
-    )
-    .await
+    // Reuse the same validator connection for manifest fetches.
+    let total_files: usize = pg_files_map.values().map(|v| v.len()).sum();
+    let file_entries: Vec<String> = pg_files_map
+        .values()
+        .flat_map(|files| files.iter().cloned())
+        .take(REBALANCE_MAX_FILES_PER_CYCLE)
+        .collect();
+    let files_processed = file_entries.len();
     {
-        Ok(Ok(conn)) => Some(conn),
-        Ok(Err(e)) => {
-            error!(
-                error = %e,
-                "Failed to connect for manifest fetches"
-            );
-            None
-        }
-        Err(_) => {
-            error!("Connection timeout for manifest fetches");
-            None
-        }
-    };
-
-    if let Some(conn) = manifest_conn {
-        // Collect all file hashes (owned), respecting the per-cycle limit
-        total_files = pg_files_map.values().map(|v| v.len()).sum();
-        let file_entries: Vec<String> = pg_files_map
-            .values()
-            .flat_map(|files| files.iter().cloned())
-            .take(REBALANCE_MAX_FILES_PER_CYCLE)
-            .collect();
-        files_processed = file_entries.len();
-
         // Fetch manifests concurrently (16 parallel QUIC streams on one connection)
         use futures::stream::StreamExt;
         let mut manifest_stream = futures::stream::iter(file_entries.into_iter())
             .map(|file_hash| {
-                let conn = conn.clone();
+                let conn = validator_conn.clone();
                 async move {
                     let result = fetch_manifest_on_conn(&conn, &file_hash).await;
                     (file_hash, result)
@@ -345,21 +325,23 @@ pub async fn self_rebalance_pg(_store: FsStore, endpoint: Endpoint) -> Result<()
         "Self-rebalance summary"
     );
 
-    // GC: Walk blobs directory, identify orphans, delete after grace period
-    gc_orphan_shards(&expected_shards, &local_hashes).await;
+    // GC: Identify orphan shards, delete tags and files after grace period
+    gc_orphan_shards(&expected_shards, &local_hash_tags, &store).await;
 
+    validator_conn.close(0u32.into(), b"done");
     info!("PG-based self-rebalance complete");
     Ok(())
 }
 
 /// Garbage collect orphan shards.
 ///
-/// Uses the pre-built `local_hashes` set from the rebalance directory walk
-/// to avoid a redundant directory scan. Only needs to touch the filesystem
-/// to delete confirmed orphans.
+/// Uses the pre-built `local_hash_tags` map from the rebalance tag listing.
+/// Deletes orphans by removing both the FsStore tag (so the blob becomes
+/// eligible for store-level GC) and the on-disk data file.
 async fn gc_orphan_shards(
     expected_shards: &std::collections::HashSet<iroh_blobs::Hash>,
-    local_hashes: &std::collections::HashSet<iroh_blobs::Hash>,
+    local_hash_tags: &std::collections::HashMap<iroh_blobs::Hash, iroh_blobs::api::Tag>,
+    store: &FsStore,
 ) {
     let now = now_secs();
 
@@ -383,22 +365,23 @@ async fn gc_orphan_shards(
     let mut orphan_count = 0;
     let mut deleted_count = 0;
     let mut kept_count = 0;
+    let mut skipped_at_capacity = 0u64;
 
     // Use DashMap for lock-free orphan tracking
     let orphan_map = get_orphan_shards();
 
-    // Iterate over pre-built local hash set (no directory walk needed)
-    for &blob_hash in local_hashes {
-        if expected_shards.contains(&blob_hash) {
+    // Iterate over pre-built local hash/tag map (no directory walk needed)
+    for (blob_hash, tag) in local_hash_tags {
+        if expected_shards.contains(blob_hash) {
             // This is expected - remove from orphan tracking
-            orphan_map.remove(&blob_hash);
+            orphan_map.remove(blob_hash);
             kept_count += 1;
         } else {
             // Potential orphan
             orphan_count += 1;
             let hash_str = blob_hash.to_string();
 
-            if let Some(orphan_entry) = orphan_map.get(&blob_hash) {
+            if let Some(orphan_entry) = orphan_map.get(blob_hash) {
                 let first_seen = *orphan_entry;
                 drop(orphan_entry);
 
@@ -408,21 +391,39 @@ async fn gc_orphan_shards(
                         hash = %truncate_for_log(&hash_str, 16),
                         "Clock skew detected: removing corrupted orphan entry"
                     );
-                    orphan_map.remove(&blob_hash);
+                    orphan_map.remove(blob_hash);
                     continue;
                 }
 
                 // Check if grace period expired
                 if now - first_seen > ORPHAN_GRACE_PERIOD_SECS {
-                    // Delete this orphan — try both filename formats
                     trace!(
                         hash = %truncate_for_log(&hash_str, 16),
                         age_secs = now - first_seen,
                         "GC: Deleting orphan"
                     );
+
+                    let mut removed = false;
+
+                    // Delete the tag first so the blob becomes eligible for store-level GC
+                    match store.tags().delete(tag).await {
+                        Ok(_) => {
+                            removed = true;
+                            // Also remove from TAG_MAP cache
+                            crate::state::get_tag_map().remove(blob_hash);
+                        }
+                        Err(e) => {
+                            warn!(
+                                hash = %truncate_for_log(&hash_str, 16),
+                                error = %e,
+                                "Failed to delete tag for orphan"
+                            );
+                        }
+                    }
+
+                    // Best-effort remove data file from disk
                     let p1 = data_dir.join(format!("{}.data", hash_str));
                     let p2 = data_dir.join(&hash_str);
-                    let mut removed = false;
                     for p in [p1, p2] {
                         match tokio::fs::remove_file(&p).await {
                             Ok(()) => {
@@ -434,14 +435,15 @@ async fn gc_orphan_shards(
                                 error!(
                                     hash = %truncate_for_log(&hash_str, 16),
                                     error = %e,
-                                    "Failed to delete orphan"
+                                    "Failed to delete orphan file"
                                 );
                             }
                         }
                     }
+
                     if removed {
                         deleted_count += 1;
-                        orphan_map.remove(&blob_hash);
+                        orphan_map.remove(blob_hash);
                     }
                 }
                 // else: still in grace period, keep tracking
@@ -449,16 +451,20 @@ async fn gc_orphan_shards(
                 // New orphan - start tracking with timestamp
                 // Bound orphan map size to prevent unbounded memory growth
                 if orphan_map.len() < MAX_ORPHAN_ENTRIES {
-                    orphan_map.insert(blob_hash, now);
+                    orphan_map.insert(*blob_hash, now);
                 } else {
-                    warn!(
-                        capacity = MAX_ORPHAN_ENTRIES,
-                        hash = %truncate_for_log(&hash_str, 16),
-                        "Orphan map at capacity, skipping tracking"
-                    );
+                    skipped_at_capacity += 1;
                 }
             }
         }
+    }
+
+    if skipped_at_capacity > 0 {
+        warn!(
+            capacity = MAX_ORPHAN_ENTRIES,
+            skipped = skipped_at_capacity,
+            "Orphan map at capacity, skipped tracking new orphans"
+        );
     }
 
     if orphan_count > 0 || deleted_count > 0 {

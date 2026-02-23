@@ -61,6 +61,7 @@ pub fn miner_node_strategy() -> impl Strategy<Value = MinerNode> {
                 endpoint,
                 weight,
                 ip_subnet: format!("192.168.{}.0/24", uid % 256),
+                ip_address: None,
                 http_addr: format!("http://127.0.0.1:{}", 3000 + uid),
                 public_key: hex::encode(public_key.as_bytes()),
                 total_storage: 1_000_000_000_000,   // 1 TB
@@ -75,6 +76,8 @@ pub fn miner_node_strategy() -> impl Strategy<Value = MinerNode> {
                 weight_manual_override: false,
                 reputation: 0.0,
                 consecutive_audit_passes: 0,
+                integrity_fails: 0,
+                version: String::new(),
             }
         })
 }
@@ -126,6 +129,7 @@ pub fn miners_with_unique_families(count: usize) -> impl Strategy<Value = Vec<Mi
                         endpoint,
                         weight,
                         ip_subnet: format!("192.168.{}.0/24", uid % 256),
+                        ip_address: None,
                         http_addr: format!("http://127.0.0.1:{}", 3000 + uid),
                         public_key: hex::encode(public_key.as_bytes()),
                         total_storage: 1_000_000_000_000,
@@ -140,6 +144,8 @@ pub fn miners_with_unique_families(count: usize) -> impl Strategy<Value = Vec<Mi
                         weight_manual_override: false,
                         reputation: 0.0,
                         consecutive_audit_passes: 0,
+                        integrity_fails: 0,
+                        version: String::new(),
                     }
                 })
                 .collect()

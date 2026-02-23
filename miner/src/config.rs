@@ -42,6 +42,38 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tracing::warn;
 
+/// Read an env var, parse it, and apply it to `target`. Logs a warning on parse failure.
+fn env_parse<T: std::str::FromStr>(var: &str, target: &mut T) {
+    if let Ok(val) = std::env::var(var) {
+        match val.parse() {
+            Ok(parsed) => *target = parsed,
+            Err(_) => warn!(
+                env = var,
+                value = %val,
+                expected_type = std::any::type_name::<T>(),
+                "Invalid env var value, using default"
+            ),
+        }
+    }
+}
+
+/// Read an env var as a string and set an `Option<String>` field.
+fn env_string_opt(var: &str, target: &mut Option<String>) {
+    if let Ok(val) = std::env::var(var) {
+        *target = Some(val);
+    }
+}
+
+/// Read an env var, trim whitespace, and set an `Option<String>` field (skips empty values).
+fn env_trimmed_opt(var: &str, target: &mut Option<String>) {
+    if let Ok(val) = std::env::var(var) {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            *target = Some(trimmed.to_string());
+        }
+    }
+}
+
 /// Root configuration structure
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct MinerConfig {
@@ -84,6 +116,16 @@ pub struct NetworkConfig {
     /// Family ID for CRUSH placement grouping
     #[serde(default = "default_family_id")]
     pub family_id: String,
+
+    /// Automatically detect public IP via STUN for hostname and bind
+    /// address configuration. When enabled, the miner queries STUN
+    /// servers at startup to discover its public IP. The detected IP
+    /// is used as a fallback when hostname/bind_ipv4/bind_ipv6 are
+    /// not explicitly configured. Manual overrides always win.
+    ///
+    /// Override: `STUN_ENABLED` env var (`true`/`false`/`0`/`1`).
+    #[serde(default = "default_auto_detect_ip")]
+    pub auto_detect_ip: bool,
 }
 
 impl Default for NetworkConfig {
@@ -95,6 +137,7 @@ impl Default for NetworkConfig {
             bind_ipv4: None,
             bind_ipv6: None,
             family_id: default_family_id(),
+            auto_detect_ip: default_auto_detect_ip(),
         }
     }
 }
@@ -104,6 +147,9 @@ fn default_p2p_port() -> u16 {
 }
 fn default_family_id() -> String {
     "default".to_string()
+}
+fn default_auto_detect_ip() -> bool {
+    true
 }
 
 /// Storage configuration
@@ -188,100 +234,52 @@ impl MinerConfig {
             MinerConfig::default()
         };
 
-        // Environment variable overrides
-        if let Ok(val) = std::env::var("P2P_PORT") {
-            match val.parse() {
-                Ok(port) => config.network.p2p_port = port,
-                Err(_) => warn!(value = %val, "Invalid P2P_PORT value, using default"),
-            }
-        }
-
-        if let Ok(val) = std::env::var("HOSTNAME") {
-            config.network.hostname = Some(val);
-        }
-
-        if let Ok(val) = std::env::var("IROH_RELAY_URL") {
-            config.network.relay_url = Some(val);
-        }
-
-        if let Ok(val) = std::env::var("P2P_BIND_IPV4") {
-            let trimmed = val.trim();
-            if !trimmed.is_empty() {
-                config.network.bind_ipv4 = Some(trimmed.to_string());
-            }
-        }
-
-        if let Ok(val) = std::env::var("P2P_BIND_IPV6") {
-            let trimmed = val.trim();
-            if !trimmed.is_empty() {
-                config.network.bind_ipv6 = Some(trimmed.to_string());
-            }
-        }
-
+        // Environment variable overrides (network)
+        env_parse("P2P_PORT", &mut config.network.p2p_port);
+        env_string_opt("HOSTNAME", &mut config.network.hostname);
+        env_string_opt("IROH_RELAY_URL", &mut config.network.relay_url);
+        env_trimmed_opt("P2P_BIND_IPV4", &mut config.network.bind_ipv4);
+        env_trimmed_opt("P2P_BIND_IPV6", &mut config.network.bind_ipv6);
         if let Ok(val) = std::env::var("FAMILY_ID") {
             config.network.family_id = val;
         }
+        if let Ok(val) = std::env::var("STUN_ENABLED") {
+            config.network.auto_detect_ip = val != "0" && val.to_lowercase() != "false";
+        }
 
+        // Storage overrides
         if let Ok(val) = std::env::var("STORAGE_PATH") {
             config.storage.path = val;
         }
+        env_parse("MAX_STORAGE_GB", &mut config.storage.max_storage_gb);
 
-        if let Ok(val) = std::env::var("MAX_STORAGE_GB") {
-            match val.parse() {
-                Ok(gb) => config.storage.max_storage_gb = gb,
-                Err(_) => warn!(value = %val, "Invalid MAX_STORAGE_GB value, using default"),
-            }
-        }
+        // Validator overrides
+        env_string_opt("VALIDATOR_NODE_ID", &mut config.validator.node_id);
+        env_string_opt("WARDEN_NODE_ID", &mut config.validator.warden_node_id);
 
-        if let Ok(val) = std::env::var("VALIDATOR_NODE_ID") {
-            config.validator.node_id = Some(val);
-        }
-
-        if let Ok(val) = std::env::var("WARDEN_NODE_ID") {
-            config.validator.warden_node_id = Some(val);
-        }
-
-        // Tuning env overrides
-        if let Ok(val) = std::env::var("MINER_STORE_CONCURRENCY") {
-            match val.parse() {
-                Ok(n) => config.tuning.store_concurrency = n,
-                Err(_) => {
-                    warn!(value = %val, "Invalid MINER_STORE_CONCURRENCY value, using default")
-                }
-            }
-        }
-        if let Ok(val) = std::env::var("MINER_PULL_CONCURRENCY") {
-            match val.parse() {
-                Ok(n) => config.tuning.pull_concurrency = n,
-                Err(_) => {
-                    warn!(value = %val, "Invalid MINER_PULL_CONCURRENCY value, using default")
-                }
-            }
-        }
-        if let Ok(val) = std::env::var("MINER_FETCH_CONCURRENCY") {
-            match val.parse() {
-                Ok(n) => config.tuning.fetch_concurrency = n,
-                Err(_) => {
-                    warn!(value = %val, "Invalid MINER_FETCH_CONCURRENCY value, using default")
-                }
-            }
-        }
+        // Tuning overrides
+        env_parse(
+            "MINER_STORE_CONCURRENCY",
+            &mut config.tuning.store_concurrency,
+        );
+        env_parse(
+            "MINER_PULL_CONCURRENCY",
+            &mut config.tuning.pull_concurrency,
+        );
+        env_parse(
+            "MINER_FETCH_CONCURRENCY",
+            &mut config.tuning.fetch_concurrency,
+        );
+        env_parse(
+            "MINER_REBALANCE_TICK_SECS",
+            &mut config.tuning.rebalance_tick_secs,
+        );
+        env_parse(
+            "P2P_DIRECT_WAIT_SECS",
+            &mut config.tuning.p2p_direct_wait_secs,
+        );
         if let Ok(val) = std::env::var("MINER_REBALANCE_ENABLED") {
             config.tuning.rebalance_enabled = val != "0" && val.to_lowercase() != "false";
-        }
-        if let Ok(val) = std::env::var("MINER_REBALANCE_TICK_SECS") {
-            match val.parse() {
-                Ok(n) => config.tuning.rebalance_tick_secs = n,
-                Err(_) => {
-                    warn!(value = %val, "Invalid MINER_REBALANCE_TICK_SECS value, using default")
-                }
-            }
-        }
-        if let Ok(val) = std::env::var("P2P_DIRECT_WAIT_SECS") {
-            match val.parse() {
-                Ok(n) => config.tuning.p2p_direct_wait_secs = n,
-                Err(_) => warn!(value = %val, "Invalid P2P_DIRECT_WAIT_SECS, using default"),
-            }
         }
 
         Ok(config)
@@ -377,4 +375,76 @@ fn default_rebalance_tick_secs() -> u64 {
 }
 fn default_p2p_direct_wait_secs() -> u64 {
     30
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // SAFETY: `set_var`/`remove_var` are unsafe in Rust 2024 edition because
+    // concurrent env modification is UB. Each test uses a unique prefixed
+    // name (`_MTEST_*`) so no two tests touch the same variable, making
+    // concurrent execution safe regardless of thread count.
+
+    #[test]
+    fn env_parse_valid_u16() {
+        let mut val: u16 = 0;
+        unsafe { std::env::set_var("_MTEST_PARSE_U16", "8080") };
+        env_parse("_MTEST_PARSE_U16", &mut val);
+        assert_eq!(val, 8080);
+        unsafe { std::env::remove_var("_MTEST_PARSE_U16") };
+    }
+
+    #[test]
+    fn env_parse_invalid_leaves_default() {
+        let mut val: u16 = 42;
+        unsafe { std::env::set_var("_MTEST_PARSE_INV", "not_a_number") };
+        env_parse("_MTEST_PARSE_INV", &mut val);
+        assert_eq!(val, 42);
+        unsafe { std::env::remove_var("_MTEST_PARSE_INV") };
+    }
+
+    #[test]
+    fn env_parse_missing_leaves_default() {
+        let mut val: u16 = 42;
+        unsafe { std::env::remove_var("_MTEST_PARSE_MISS") };
+        env_parse("_MTEST_PARSE_MISS", &mut val);
+        assert_eq!(val, 42);
+    }
+
+    #[test]
+    fn env_string_opt_sets_value() {
+        let mut val: Option<String> = None;
+        unsafe { std::env::set_var("_MTEST_STRING_OPT", "hello") };
+        env_string_opt("_MTEST_STRING_OPT", &mut val);
+        assert_eq!(val.as_deref(), Some("hello"));
+        unsafe { std::env::remove_var("_MTEST_STRING_OPT") };
+    }
+
+    #[test]
+    fn env_trimmed_opt_trims_and_skips_empty() {
+        let mut val: Option<String> = None;
+
+        unsafe { std::env::set_var("_MTEST_TRIM", "  10.0.0.1  ") };
+        env_trimmed_opt("_MTEST_TRIM", &mut val);
+        assert_eq!(val.as_deref(), Some("10.0.0.1"));
+
+        val = None;
+        unsafe { std::env::set_var("_MTEST_TRIM", "   ") };
+        env_trimmed_opt("_MTEST_TRIM", &mut val);
+        assert_eq!(val, None);
+
+        unsafe { std::env::remove_var("_MTEST_TRIM") };
+    }
+
+    #[test]
+    fn default_config_has_sane_values() {
+        let config = MinerConfig::default();
+        assert_eq!(config.network.p2p_port, 11220);
+        assert_eq!(config.network.family_id, "default");
+        assert_eq!(config.tuning.store_concurrency, 1024);
+        assert_eq!(config.tuning.fetch_concurrency, 256);
+        assert_eq!(config.tuning.rebalance_tick_secs, 300);
+        assert!(config.tuning.rebalance_enabled);
+    }
 }
