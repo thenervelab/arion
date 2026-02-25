@@ -218,6 +218,27 @@ encode_stripe(data: &[u8], config: &StripeConfig) -> Result<Vec<Vec<u8>>>
 decode_stripe(shards: &[Option<Vec<u8>>], config: &StripeConfig) -> Result<Vec<u8>>
 ```
 
+## IP and Path Helpers
+
+```rust
+// Check if IP is suitable for self-advertisement (rejects loopback,
+// unspecified, link-local, broadcast, multicast; allows private/CGNAT/ULA)
+pub fn is_advertisable_ip(ip: IpAddr) -> bool
+
+// Check if endpoint has at least one direct IP address (not relay-only).
+// Does NOT filter by IP routability — Iroh handles path selection.
+pub fn has_direct_addr(addr: &EndpointAddr) -> bool
+
+// Check if a live connection has a direct IP path (not relay-only)
+pub fn has_direct_ip_path(conn: &Connection) -> bool
+
+// Wait for a direct IP path within timeout (watcher-based, no polling)
+pub async fn wait_for_direct_ip_path(conn: &Connection, timeout: Duration) -> bool
+
+// Legacy: check if IP is publicly routable (retained for diagnostics)
+pub fn is_routable_ip(ip: IpAddr) -> bool
+```
+
 ## Utility Functions
 
 ```rust

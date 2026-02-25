@@ -27,6 +27,7 @@ use state::{
 };
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -239,6 +240,9 @@ struct MinerContext {
     family_id: String,
     data_dir: std::path::PathBuf,
     config: config::MinerConfig,
+    /// STUN-detected public IP, used as fallback when hostname resolves to
+    /// a non-routable address (e.g. `--hostname 0.0.0.0`).
+    stun_public_ip: Option<std::net::IpAddr>,
 }
 
 impl MinerContext {
@@ -269,15 +273,31 @@ impl MinerContext {
     /// Build our `EndpointAddr` with relay URL and resolved direct address hints.
     /// Reused by both registration and heartbeat so the validator always has
     /// up-to-date addressing even when NAT traversal fails.
+    ///
+    /// Only includes routable public IPs — unspecified (0.0.0.0), loopback,
+    /// and private addresses are excluded since the validator can't reach them.
+    /// Falls back to STUN-detected public IP when hostname is non-routable.
     fn build_endpoint_addr(&self) -> iroh::EndpointAddr {
         let node_id = self.endpoint.secret_key().public();
         let mut addr = iroh::EndpointAddr::new(node_id);
         if let Some(url) = &self.relay_url {
             addr = addr.with_relay_url(url.clone());
         }
-        if let Some(ip) = self.resolve_hostname_ip() {
+        // Resolve direct address: hostname first, STUN fallback second.
+        let resolved_ip = self
+            .resolve_hostname_ip()
+            .filter(|ip| common::is_advertisable_ip(*ip))
+            .or(self.stun_public_ip);
+        if let Some(ip) = resolved_ip {
             let direct_addr = std::net::SocketAddr::new(ip, self.config.network.p2p_port);
             addr = addr.with_addrs(vec![iroh::TransportAddr::Ip(direct_addr)]);
+        } else {
+            warn!(
+                hostname = %self.hostname,
+                stun_ip = ?self.stun_public_ip,
+                "No advertisable IP for endpoint: hostname resolved to unusable address \
+                 and STUN detection unavailable. Set --hostname to your public IP."
+            );
         }
         addr
     }
@@ -304,7 +324,9 @@ async fn run_miner(cli: Cli) -> Result<()> {
         if let Some(ref r) = result {
             info!(ip = %r.ip, "STUN detected public IPv4");
         } else {
-            warn!("STUN IPv4 detection returned no result — falling back to manual config or defaults");
+            warn!(
+                "STUN IPv4 detection returned no result — falling back to manual config or defaults"
+            );
         }
         result
     } else {
@@ -347,13 +369,16 @@ async fn run_miner(cli: Cli) -> Result<()> {
     // Primary relay URL for EndpointAddr hints (single URL required by the API)
     let relay_url: Option<iroh_base::RelayUrl> = relay_urls.first().cloned();
 
-    // Bind to specific IP if configured, otherwise UNSPECIFIED (all interfaces).
-    // When bound to UNSPECIFIED, iroh scans all interfaces and advertises every
-    // detected address — including unreachable private IPs (Docker bridge, K8s
-    // internal). Binding to a specific public IP makes iroh advertise only that
-    // address, which is required for direct P2P connections.
+    // Bind to a specific IP so iroh advertises only that address during
+    // hole punching. Binding to 0.0.0.0 makes iroh scan ALL interfaces
+    // and advertise every detected IP (docker0, veth*, cni0, etc.),
+    // which exhausts the QUIC multipath path limit during NAT traversal.
     //
-    // Fallback chain: config/env bind_ipv4 > STUN IPv4 (if local interface) > 0.0.0.0
+    // Fallback chain:
+    //   1. config/env bind_ipv4 (explicit operator choice)
+    //   2. STUN IPv4 if it's a local interface (bare metal with public IP)
+    //   3. Default-route interface IP (picks the primary outbound interface)
+    //   4. 0.0.0.0 (last resort — will advertise all interfaces)
     let bind_ipv4: std::net::Ipv4Addr = config
         .network
         .bind_ipv4
@@ -365,18 +390,27 @@ async fn run_miner(cli: Cli) -> Result<()> {
         })
         .or_else(|| {
             stun_ipv4.as_ref().and_then(|r| match r.ip {
-                std::net::IpAddr::V4(v4)
-                    if common::stun::is_local_interface_ip(r.ip) =>
-                {
+                std::net::IpAddr::V4(v4) if common::stun::is_local_interface_ip(r.ip) => {
                     info!(ip = %v4, "Using STUN-detected IPv4 as bind address (local interface)");
                     Some(v4)
                 }
                 std::net::IpAddr::V4(v4) => {
-                    debug!(ip = %v4, "STUN IPv4 is not a local interface — using 0.0.0.0 (behind NAT)");
+                    debug!(ip = %v4, "STUN IPv4 is not a local interface (behind NAT)");
                     None
                 }
                 _ => None,
             })
+        })
+        .or_else(|| {
+            let ip = common::stun::detect_default_route_ipv4();
+            if let Some(v4) = ip {
+                info!(
+                    ip = %v4,
+                    "Using default-route interface as bind address \
+                     (prevents iroh from advertising all interfaces)"
+                );
+            }
+            ip
         })
         .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
 
@@ -409,8 +443,10 @@ async fn run_miner(cli: Cli) -> Result<()> {
     }
 
     if bind_ipv4.is_unspecified() {
-        info!(
-            "P2P binding to 0.0.0.0:{} (all interfaces — set P2P_BIND_IPV4 to restrict)",
+        warn!(
+            "P2P binding to 0.0.0.0:{} — iroh will advertise ALL interface IPs, \
+             which may exhaust QUIC multipath path limits. \
+             Set P2P_BIND_IPV4 to your server's primary IP.",
             config.network.p2p_port
         );
     } else {
@@ -421,6 +457,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
     // QuicTransportConfig uses a builder pattern (immutable after build).
     let transport_config = iroh::endpoint::QuicTransportConfig::builder()
         .keep_alive_interval(std::time::Duration::from_secs(15))
+        .default_path_keep_alive_interval(std::time::Duration::from_secs(5))
         .max_idle_timeout(Some(
             std::time::Duration::from_secs(120)
                 .try_into()
@@ -436,6 +473,10 @@ async fn run_miner(cli: Cli) -> Result<()> {
         .stream_receive_window((2u32 * 1024 * 1024).into())
         // 64MB receive_window bounds aggregate receive capacity per connection.
         .receive_window((64u32 * 1024 * 1024).into())
+        // Allow 128 QUIC multipath paths per connection for hole punching
+        // on multi-homed nodes (default 13 is too low when nodes have multiple virtual IPs).
+        .max_concurrent_multipath_paths(128)
+        .set_max_remote_nat_traversal_addresses(32)
         .build();
 
     endpoint_builder = endpoint_builder.transport_config(transport_config);
@@ -529,7 +570,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
         pos_sem: Arc::new(tokio::sync::Semaphore::new(pos_concurrency)),
         validator_node_id: Some(validator_pubkey),
     };
-    let _router = Router::builder(endpoint.clone())
+    let router = Router::builder(endpoint.clone())
         .accept(iroh_blobs::ALPN, blobs.clone())
         .accept(b"hippius/miner-control", miner_control_handler)
         .spawn();
@@ -542,6 +583,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
         family_id,
         data_dir,
         config: config.clone(),
+        stun_public_ip: stun_ipv4.map(|r| r.ip),
     };
 
     // 4. Register with Validator via P2P
@@ -551,14 +593,16 @@ async fn run_miner(cli: Cli) -> Result<()> {
     register_with_validator(&ctx).await?;
 
     // 5. Start P2P Heartbeat Loop
-    let shutdown = Arc::new(tokio::sync::Notify::new());
-    spawn_heartbeat_loop(ctx.clone(), shutdown.clone());
+    let shutdown_token = CancellationToken::new();
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    spawn_heartbeat_loop(ctx.clone(), shutdown_notify.clone(), shutdown_token.clone());
 
     // 6. Start Self-Rebalance Loop (if enabled)
     if config.tuning.rebalance_enabled {
         let store_rebalance = store.clone();
         let endpoint_rebalance = endpoint.clone();
         let tick_secs = config.tuning.rebalance_tick_secs;
+        let rebalance_token = shutdown_token.clone();
 
         tokio::spawn(async move {
             // Initial randomized jitter delay to let the miner settle after startup
@@ -576,7 +620,13 @@ async fn run_miner(cli: Cli) -> Result<()> {
                 jitter_secs = jitter_secs,
                 "Waiting for randomized jitter before first self-rebalance"
             );
-            tokio::time::sleep(std::time::Duration::from_secs(jitter_secs)).await;
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(jitter_secs)) => {}
+                () = rebalance_token.cancelled() => {
+                    info!("Rebalance loop received shutdown signal during initial jitter");
+                    return;
+                }
+            }
 
             loop {
                 if let Err(e) = rebalance::self_rebalance_pg(
@@ -588,7 +638,13 @@ async fn run_miner(cli: Cli) -> Result<()> {
                     error!(error = %e, "Self-rebalance failed");
                 }
 
-                tokio::time::sleep(std::time::Duration::from_secs(tick_secs)).await;
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(tick_secs)) => {}
+                    () = rebalance_token.cancelled() => {
+                        info!("Rebalance loop received shutdown signal");
+                        break;
+                    }
+                }
                 // Add a small randomized delay between ticks to prevent miners
                 // that started close together from perfectly synchronizing over time.
                 let loop_jitter_secs = {
@@ -596,7 +652,13 @@ async fn run_miner(cli: Cli) -> Result<()> {
                     let mut rng = rand::rng();
                     rng.random_range(0..30)
                 };
-                tokio::time::sleep(std::time::Duration::from_secs(loop_jitter_secs)).await;
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(loop_jitter_secs)) => {}
+                    () = rebalance_token.cancelled() => {
+                        info!("Rebalance loop received shutdown signal");
+                        break;
+                    }
+                }
             }
         });
 
@@ -605,19 +667,43 @@ async fn run_miner(cli: Cli) -> Result<()> {
         info!("Miner self-rebalance disabled (set MINER_REBALANCE_ENABLED=true to enable)");
     }
 
-    // Keep process alive until Ctrl+C or fatal shutdown signal
+    // Keep process alive until Ctrl+C, SIGTERM, or fatal shutdown signal
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("Received Ctrl+C, shutting down");
-        }
-        _ = shutdown.notified() => {
-            error!("Fatal error in heartbeat loop, shutting down");
-        }
+        () = ctrl_c => info!("Received Ctrl+C, initiating graceful shutdown"),
+        () = terminate => info!("Received SIGTERM, initiating graceful shutdown"),
+        () = shutdown_notify.notified() => error!("Fatal error in heartbeat loop, shutting down"),
     }
 
-    // Close P2P endpoint so peers see ApplicationClosed instead of TimedOut
+    // 1. Signal all background loops to stop
+    shutdown_token.cancel();
+
+    // 2. Grace period for in-flight operations
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // 3. Stop Router accept loop (drains in-flight handler tasks)
+    if let Err(e) = router.shutdown().await {
+        warn!(error = %e, "Router shutdown error");
+    }
+
+    // 4. Close P2P endpoint so peers see ApplicationClosed instead of TimedOut
     info!("Closing P2P endpoint...");
     endpoint.close().await;
+    info!("Shutdown complete");
 
     Ok(())
 }
@@ -638,42 +724,20 @@ fn build_validator_addr(
 
 /// Wait for a connection to establish a direct IP path via NAT traversal.
 ///
-/// After connecting (possibly via relay), iroh runs NAT traversal in the
-/// background to discover a direct UDP path. Uses `Watcher::updated()` to
-/// wake on path changes instead of polling.
+/// Delegates core waiting to `common::wait_for_direct_ip_path` and adds
+/// miner-specific logging (troubleshooting hints on long registration
+/// waits, debug-level for heartbeat probes).
 async fn wait_for_direct_path(
     conn: &iroh::endpoint::Connection,
     endpoint: &iroh::Endpoint,
     timeout_secs: u64,
 ) -> bool {
-    if has_direct_ip_path(conn) {
-        return true;
-    }
+    let found =
+        common::wait_for_direct_ip_path(conn, tokio::time::Duration::from_secs(timeout_secs)).await;
 
-    let deadline = tokio::time::Duration::from_secs(timeout_secs);
-    let mut watcher = conn.paths();
-    let found = tokio::time::timeout(deadline, async {
-        loop {
-            use iroh::Watcher;
-            if watcher.updated().await.is_err() {
-                return false;
-            }
-            let paths = watcher.get();
-            if paths.iter().any(|p| p.is_ip()) {
-                info!("Direct IP path to validator confirmed");
-                return true;
-            }
-            debug!(
-                path_count = paths.len(),
-                ip_paths = paths.iter().filter(|p| p.is_ip()).count(),
-                "Waiting for direct IP path to validator"
-            );
-        }
-    })
-    .await
-    .unwrap_or(false);
-
-    if !found {
+    if found {
+        info!("Direct IP path to validator confirmed");
+    } else {
         // Only log full troubleshooting advice during registration (long waits).
         // Heartbeat probes use shorter timeouts and log their own context.
         if timeout_secs >= 20 {
@@ -753,7 +817,11 @@ const VALIDATOR_ADDR_REFRESH_INTERVAL: u32 = 10;
 /// direct-address hints to the validator.
 const REREGISTER_AFTER_RELAY_FAILURES: u32 = 3;
 
-fn spawn_heartbeat_loop(ctx: MinerContext, shutdown: Arc<tokio::sync::Notify>) {
+fn spawn_heartbeat_loop(
+    ctx: MinerContext,
+    shutdown: Arc<tokio::sync::Notify>,
+    cancel_token: CancellationToken,
+) {
     let miner_uid = state::get_miner_uid();
     let cached_endpoint_addr = ctx.build_endpoint_addr();
 
@@ -1046,6 +1114,9 @@ fn spawn_heartbeat_loop(ctx: MinerContext, shutdown: Arc<tokio::sync::Notify>) {
                             continue;
                         }
                         Ok(Err(e)) if e.to_string() == "FAMILY_REJECTED" => {
+                            if let Some(conn) = cached_conn.take() {
+                                conn.close(0u32.into(), b"shutdown");
+                            }
                             shutdown.notify_one();
                             return;
                         }
@@ -1083,11 +1154,19 @@ fn spawn_heartbeat_loop(ctx: MinerContext, shutdown: Arc<tokio::sync::Notify>) {
                 std::cmp::min(120, 30u64 << consecutive_failures.min(2))
             };
             let jitter_ms = rand::rng().random_range(0..5000u64);
-            tokio::time::sleep(
-                tokio::time::Duration::from_secs(backoff_secs)
-                    + tokio::time::Duration::from_millis(jitter_ms),
-            )
-            .await;
+            tokio::select! {
+                () = tokio::time::sleep(
+                    tokio::time::Duration::from_secs(backoff_secs)
+                        + tokio::time::Duration::from_millis(jitter_ms),
+                ) => {}
+                () = cancel_token.cancelled() => {
+                    info!("Heartbeat loop received shutdown signal");
+                    if let Some(conn) = cached_conn.take() {
+                        conn.close(0u32.into(), b"shutdown");
+                    }
+                    return;
+                }
+            }
         }
     });
 }
@@ -1142,11 +1221,15 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<()> {
 
         // Send the resolved IP in http_addr when available.
         // For localhost keep the original URL (validator uses it for local
-        // testing hints). For everything else, send just the IP.
+        // testing hints). Non-routable IPs (0.0.0.0, private) are useless
+        // for the chain-submitter — use STUN IP fallback, then original addr.
         let resolved_http_addr = match resolved_ip {
             Some(ip) if ip.is_loopback() => http_addr.clone(),
-            Some(ip) => ip.to_string(),
-            None => http_addr,
+            Some(ip) if common::is_advertisable_ip(ip) => ip.to_string(),
+            _ => ctx
+                .stun_public_ip
+                .map(|ip| ip.to_string())
+                .unwrap_or(http_addr),
         };
 
         common::ValidatorControlMessage::Register {

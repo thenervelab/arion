@@ -219,7 +219,7 @@ pub async fn connect_with_cleanup(
 pub async fn get_pooled_connection(
     endpoint: &Endpoint,
     peer_addr: &iroh::EndpointAddr,
-    alpn: &[u8],
+    alpn: &'static [u8],
 ) -> Result<iroh::endpoint::Connection> {
     use futures::future::FutureExt;
 
@@ -229,10 +229,13 @@ pub async fn get_pooled_connection(
 
     // Guard: if clock skew detected (now_secs returns 0), skip pool and create new connection
     if now == 0 {
-        return endpoint
-            .connect(peer_addr.clone(), alpn)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to connect to peer: {}", e));
+        return connect_with_cleanup(
+            endpoint,
+            peer_addr.clone(),
+            alpn,
+            std::time::Duration::from_secs(crate::constants::DEFAULT_CONNECT_TIMEOUT_SECS),
+        )
+        .await;
     }
 
     // Try pool first (read lock - faster for common case)
@@ -249,11 +252,14 @@ pub async fn get_pooled_connection(
         }
     }
 
-    // Create new connection
-    let conn = endpoint
-        .connect(peer_addr.clone(), alpn)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to peer: {}", e))?;
+    // Create new connection (with cleanup to prevent iroh path ID exhaustion)
+    let conn = connect_with_cleanup(
+        endpoint,
+        peer_addr.clone(),
+        alpn,
+        std::time::Duration::from_secs(crate::constants::DEFAULT_CONNECT_TIMEOUT_SECS),
+    )
+    .await?;
 
     // Store in pool with double-check to avoid race condition
     {
@@ -272,26 +278,22 @@ pub async fn get_pooled_connection(
 
         // Enforce hard cap on pool size to prevent OOM
         if pool.len() >= MAX_CONNECTION_POOL_SIZE {
-            // First pass: cheap threshold-based cleanup (expired + closed)
+            // First pass: cheap threshold-based cleanup (expired + closed).
+            // Don't call conn.close() on eviction — it races with
+            // concurrent I/O on cloned handles, triggering quinn slab
+            // panics. Dropped connections drain via idle timeout.
             let threshold = now.saturating_sub(CONNECTION_TTL_SECS);
             pool.retain(|_, (conn, created)| {
-                let keep = *created > threshold
-                    && *created <= now
-                    && conn.closed().now_or_never().is_none();
-                if !keep && conn.close_reason().is_none() {
-                    conn.close(0u32.into(), b"stale");
-                }
-                keep
+                *created > threshold && *created <= now && conn.closed().now_or_never().is_none()
             });
             // If still over capacity after TTL cleanup, fall back to sort-based eviction
             if pool.len() >= MAX_CONNECTION_POOL_SIZE {
                 let entries_to_remove = pool.len() / 10 + 1;
                 let mut oldest: Vec<_> = pool.iter().map(|(k, (_, ts))| (*k, *ts)).collect();
                 oldest.sort_by_key(|(_, ts)| *ts);
+                // Don't call conn.close() — see retain comment above.
                 for (evict_key, _) in oldest.into_iter().take(entries_to_remove) {
-                    if let Some((conn, _)) = pool.remove(&evict_key) {
-                        conn.close(0u32.into(), b"stale");
-                    }
+                    pool.remove(&evict_key);
                 }
             }
         }

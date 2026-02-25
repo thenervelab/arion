@@ -190,10 +190,7 @@ fn parse_binding_response(response: &[u8], expected_txn_id: &[u8; 12]) -> Option
 /// the desired address family. On dual-stack hosts, `getaddrinfo` may
 /// return AAAA records before A records, which causes `send_to` on an
 /// IPv4 socket to fail with EAFNOSUPPORT. Filtering explicitly avoids this.
-async fn resolve_matching_addr(
-    server: &str,
-    want_ipv4: bool,
-) -> Option<SocketAddr> {
+async fn resolve_matching_addr(server: &str, want_ipv4: bool) -> Option<SocketAddr> {
     let addrs = tokio::net::lookup_host(server).await.ok()?;
     for addr in addrs {
         if want_ipv4 && addr.is_ipv4() {
@@ -218,10 +215,7 @@ async fn query_stun_server(
     let target = match resolve_matching_addr(server, want_ipv4).await {
         Some(addr) => addr,
         None => {
-            debug!(
-                server,
-                want_ipv4, "No DNS record matching address family"
-            );
+            debug!(server, want_ipv4, "No DNS record matching address family");
             return None;
         }
     };
@@ -319,6 +313,28 @@ pub async fn detect_public_ipv6(timeout: Duration) -> Option<StunResult> {
 /// public IP) or only as an advertised hostname (behind NAT).
 pub fn is_local_interface_ip(ip: IpAddr) -> bool {
     UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+}
+
+/// Detect the IPv4 address of the default-route interface.
+///
+/// Creates a UDP socket and "connects" to a well-known external address
+/// (8.8.8.8:80). No packets are sent — the kernel just picks the source
+/// address it would use, which is the primary outbound interface IP.
+///
+/// Returns `None` if no default route exists or the result is loopback /
+/// unspecified. Used as a fallback when `bind_ipv4` is not configured:
+/// binding to a single interface prevents iroh from advertising every
+/// address on the host (docker0, veth*, cni0, etc.), which would exhaust
+/// the QUIC multipath path limit during NAT traversal.
+pub fn detect_default_route_ipv4() -> Option<Ipv4Addr> {
+    let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).ok()?;
+    socket
+        .connect(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80))
+        .ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(v4) if !v4.is_unspecified() && !v4.is_loopback() => Some(v4),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -421,6 +437,20 @@ mod tests {
         assert!(!is_local_interface_ip(IpAddr::V4(Ipv4Addr::new(
             198, 51, 100, 1
         ))));
+    }
+
+    #[test]
+    fn default_route_returns_non_loopback() {
+        // On any machine with a default route, this should return a
+        // non-loopback, non-unspecified IPv4 address.
+        if let Some(ip) = detect_default_route_ipv4() {
+            assert!(!ip.is_loopback(), "default route IP should not be loopback");
+            assert!(
+                !ip.is_unspecified(),
+                "default route IP should not be unspecified"
+            );
+        }
+        // If None, the machine has no default route — that's fine in CI.
     }
 
     #[tokio::test]

@@ -64,7 +64,6 @@ fn get_handler_semaphore() -> &'static Arc<tokio::sync::Semaphore> {
 /// Helper to finish a send stream and wait for remote acknowledgment
 async fn finish_stream(send: &mut iroh::endpoint::SendStream) -> Result<()> {
     send.finish()?;
-    let _ = send.stopped().await;
     Ok(())
 }
 
@@ -105,27 +104,9 @@ async fn is_authorized_for_pos(
 }
 
 /// Wait briefly for a connection to establish a direct IP path.
-/// Uses `Watcher::updated()` to wake on path changes instead of polling.
+/// Delegates to `common::wait_for_direct_ip_path`.
 async fn wait_for_direct_peer_path(conn: &iroh::endpoint::Connection, timeout_ms: u64) -> bool {
-    if has_direct_ip_path(conn) {
-        return true;
-    }
-
-    let deadline = tokio::time::Duration::from_millis(timeout_ms);
-    let mut watcher = conn.paths();
-    tokio::time::timeout(deadline, async {
-        loop {
-            use iroh::Watcher;
-            if watcher.updated().await.is_err() {
-                return false;
-            }
-            if watcher.get().iter().any(|p| p.is_ip()) {
-                return true;
-            }
-        }
-    })
-    .await
-    .unwrap_or(false)
+    common::wait_for_direct_ip_path(conn, tokio::time::Duration::from_millis(timeout_ms)).await
 }
 
 /// Result of attempting to acquire a semaphore permit with timeout
@@ -926,7 +907,7 @@ async fn handle_cluster_map_update(
             // Seed iroh's discovery with peer direct addresses so
             // PullFromPeer/FetchBlob connect directly without relay.
             if let Some(disc) = discovery
-                && common::has_routable_direct_addr(&addr)
+                && common::has_direct_addr(&addr)
             {
                 disc.add_endpoint_info(addr.clone());
             }
@@ -1079,7 +1060,6 @@ pub async fn pull_blob_from_peer(
     let request_bytes = serde_json::to_vec(&request)?;
     send.write_all(&request_bytes).await?;
     send.finish()?;
-    let _ = send.stopped().await;
 
     // Read response with timeout
     let response = tokio::time::timeout(

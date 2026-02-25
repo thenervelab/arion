@@ -1930,13 +1930,88 @@ fn is_non_routable_v6(ip: std::net::Ipv6Addr) -> bool {
     (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80
 }
 
-/// Returns true if the endpoint has at least one routable direct
-/// IP address. Relay-only endpoints return false.
-pub fn has_routable_direct_addr(addr: &iroh::EndpointAddr) -> bool {
-    addr.addrs.iter().any(|a| match a {
-        iroh::TransportAddr::Ip(sock) => is_routable_ip(sock.ip()),
-        _ => false,
+/// Returns true if the IP address is suitable for self-advertisement.
+///
+/// Rejects loopback, unspecified, link-local, broadcast, and multicast.
+/// Allows private (RFC 1918), CGNAT (RFC 6598), and ULA IPv6 — Iroh
+/// handles path selection and hole-punching for these ranges.
+pub fn is_advertisable_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !v4.is_loopback()
+                && !v4.is_link_local()
+                && !v4.is_broadcast()
+                && !v4.is_unspecified()
+                && !v4.is_multicast()
+                && !is_reserved_v4(v4)
+        }
+        std::net::IpAddr::V6(v6) => {
+            !v6.is_loopback() && !v6.is_unspecified() && !v6.is_multicast() && !is_link_local_v6(v6)
+        }
+    }
+}
+
+/// Link-local IPv6: fe80::/10
+fn is_link_local_v6(ip: std::net::Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfe80
+}
+
+/// Reserved/experimental IPv4: 240.0.0.0/4
+fn is_reserved_v4(ip: std::net::Ipv4Addr) -> bool {
+    (ip.octets()[0] & 0xf0) == 240
+}
+
+/// Returns true if the endpoint has at least one direct IP address
+/// (not relay-only). Iroh handles path selection for all IP ranges.
+pub fn has_direct_addr(addr: &iroh::EndpointAddr) -> bool {
+    addr.addrs
+        .iter()
+        .any(|a| matches!(a, iroh::TransportAddr::Ip(_)))
+}
+
+/// Returns true if a path is a direct IP path (not relay).
+fn is_direct_path(p: &iroh::endpoint::PathInfo) -> bool {
+    matches!(p.remote_addr(), iroh::TransportAddr::Ip(_))
+}
+
+/// Returns true if the connection has a direct IP path (not relay-only).
+///
+/// Checks `Connection::paths()` for actual live transport paths, not just
+/// the address book (discovery metadata). Any `TransportAddr::Ip` path
+/// counts — Iroh handles path selection for all IP ranges including
+/// private and CGNAT.
+pub fn has_direct_ip_path(conn: &iroh::endpoint::Connection) -> bool {
+    use iroh::Watcher as _;
+    conn.paths().get().iter().any(is_direct_path)
+}
+
+/// Wait for a connection to establish a direct IP path within `timeout`.
+///
+/// Uses `Watcher::updated()` to wake on path changes (no polling).
+/// Returns `true` if a direct IP path is found within the timeout,
+/// `false` otherwise.
+pub async fn wait_for_direct_ip_path(
+    conn: &iroh::endpoint::Connection,
+    timeout: std::time::Duration,
+) -> bool {
+    if has_direct_ip_path(conn) {
+        return true;
+    }
+
+    let mut watcher = conn.paths();
+    tokio::time::timeout(timeout, async {
+        loop {
+            use iroh::Watcher;
+            if watcher.updated().await.is_err() {
+                return false;
+            }
+            if watcher.get().iter().any(is_direct_path) {
+                return true;
+            }
+        }
     })
+    .await
+    .unwrap_or(false)
 }
 
 /// Extract miner IP from EndpointAddr direct addresses
@@ -2162,6 +2237,12 @@ pub const P2P_DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Default connection TTL for P2P connection pooling in seconds.
 pub const P2P_CONNECTION_TTL_SECS: u64 = 60;
 
+/// Timeout for the write+flush phase of `p2p_send_response` in seconds.
+/// 30s matches the QUIC idle timeout default and is generous enough for large
+/// responses (~10 MB at modest bandwidth) while preventing indefinite stalls
+/// when the remote stops reading mid-response (QUIC flow control).
+pub const P2P_RESPONSE_WRITE_TIMEOUT_SECS: u64 = 30;
+
 /// Timeout for waiting on stream finish acknowledgment in seconds.
 /// Short timeout to allow graceful stream termination without blocking.
 pub const P2P_RESPONSE_FINISH_TIMEOUT_SECS: u64 = 1;
@@ -2182,8 +2263,21 @@ pub async fn p2p_send_response(
     data: &[u8],
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
-    send.write_all(data).await?;
-    send.flush().await?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(P2P_RESPONSE_WRITE_TIMEOUT_SECS),
+        async {
+            send.write_all(data).await?;
+            send.flush().await?;
+            Ok::<(), std::io::Error>(())
+        },
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "P2P response write timed out after \
+             {P2P_RESPONSE_WRITE_TIMEOUT_SECS}s"
+        )
+    })??;
     send.finish()?;
     // Wait briefly for remote to receive before closing
     let _ = tokio::time::timeout(
@@ -2340,10 +2434,7 @@ pub fn get_relay_urls(config_url: Option<&str>) -> Vec<iroh_base::RelayUrl> {
 pub fn build_relay_mode(urls: &[iroh_base::RelayUrl]) -> iroh::endpoint::RelayMode {
     let configs: Vec<_> = urls
         .iter()
-        .map(|url| iroh::RelayConfig {
-            url: url.clone(),
-            quic: None,
-        })
+        .map(|url| iroh::RelayConfig::from(url.clone()))
         .collect();
     iroh::endpoint::RelayMode::Custom(iroh::RelayMap::from_iter(configs))
 }
@@ -2373,6 +2464,9 @@ pub struct P2pConnectionManager {
     unhealthy_connections: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Known direct socket addresses for the target node (P2P address seeding)
     known_addrs: Vec<std::net::SocketAddr>,
+    /// Relay URL hint for the target node (speeds up failover when direct
+    /// addresses are unreachable — skips relay discovery via DNS)
+    relay_url: Option<iroh_base::RelayUrl>,
 }
 
 impl Clone for P2pConnectionManager {
@@ -2386,6 +2480,7 @@ impl Clone for P2pConnectionManager {
             connection_ttl_secs: self.connection_ttl_secs,
             unhealthy_connections: self.unhealthy_connections.clone(),
             known_addrs: self.known_addrs.clone(),
+            relay_url: self.relay_url.clone(),
         }
     }
 }
@@ -2406,6 +2501,7 @@ impl P2pConnectionManager {
             connection_ttl_secs: P2P_CONNECTION_TTL_SECS,
             unhealthy_connections: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             known_addrs: vec![],
+            relay_url: None,
         }
     }
 
@@ -2415,6 +2511,16 @@ impl P2pConnectionManager {
     /// addresses so iroh can connect directly without relay discovery.
     pub fn with_known_addrs(mut self, addrs: Vec<std::net::SocketAddr>) -> Self {
         self.known_addrs = addrs;
+        self
+    }
+
+    /// Set the relay URL hint for the target node.
+    ///
+    /// When set, `get_connection()` includes this relay URL in the
+    /// `EndpointAddr` so iroh can fall back to relay without a DNS
+    /// discovery roundtrip if direct addresses are unreachable.
+    pub fn with_relay_url(mut self, url: iroh_base::RelayUrl) -> Self {
+        self.relay_url = Some(url);
         self
     }
 
@@ -2520,6 +2626,9 @@ impl P2pConnectionManager {
             );
 
             let mut connect_target = iroh::EndpointAddr::new(self.target_node_id);
+            if let Some(ref url) = self.relay_url {
+                connect_target = connect_target.with_relay_url(url.clone());
+            }
             if !self.known_addrs.is_empty() {
                 connect_target = connect_target
                     .with_addrs(self.known_addrs.iter().map(|a| iroh::TransportAddr::Ip(*a)));
@@ -3161,5 +3270,66 @@ mod tests {
         assert_eq!(compute_miner_uid(key), compute_miner_uid(key));
         assert_ne!(compute_miner_uid(key), compute_miner_uid("xyz789"));
         assert!(compute_miner_uid(key) <= 0x7FFF_FFFF);
+    }
+
+    #[test]
+    fn test_is_advertisable_ip_accepts_private_ranges() {
+        use std::net::IpAddr;
+        // RFC 1918
+        assert!(is_advertisable_ip("10.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_advertisable_ip("172.16.5.1".parse::<IpAddr>().unwrap()));
+        assert!(is_advertisable_ip("192.168.1.1".parse::<IpAddr>().unwrap()));
+        // CGNAT (RFC 6598)
+        assert!(is_advertisable_ip("100.64.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_advertisable_ip(
+            "100.127.255.254".parse::<IpAddr>().unwrap()
+        ));
+        // Public
+        assert!(is_advertisable_ip("203.0.113.5".parse::<IpAddr>().unwrap()));
+        // ULA IPv6
+        assert!(is_advertisable_ip("fd00::1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn test_is_advertisable_ip_rejects_unusable() {
+        use std::net::IpAddr;
+        assert!(!is_advertisable_ip("127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(!is_advertisable_ip("0.0.0.0".parse::<IpAddr>().unwrap()));
+        assert!(!is_advertisable_ip(
+            "169.254.1.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(!is_advertisable_ip(
+            "255.255.255.255".parse::<IpAddr>().unwrap()
+        ));
+        assert!(!is_advertisable_ip("224.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(!is_advertisable_ip("::1".parse::<IpAddr>().unwrap()));
+        assert!(!is_advertisable_ip("::".parse::<IpAddr>().unwrap()));
+        assert!(!is_advertisable_ip("fe80::1".parse::<IpAddr>().unwrap()));
+        assert!(!is_advertisable_ip("ff02::1".parse::<IpAddr>().unwrap()));
+        // Reserved/experimental 240.0.0.0/4
+        assert!(!is_advertisable_ip("240.0.0.1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn test_has_direct_addr_accepts_any_ip() {
+        let secret = iroh::SecretKey::from_bytes(&[99u8; 32]);
+        let public = secret.public();
+        // Private IP should pass (was previously rejected by has_routable_direct_addr)
+        let private_sock = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            3001,
+        );
+        let addr = iroh::EndpointAddr::from(public)
+            .with_addrs(vec![iroh::TransportAddr::Ip(private_sock)]);
+        assert!(has_direct_addr(&addr));
+    }
+
+    #[test]
+    fn test_has_direct_addr_rejects_relay_only() {
+        let secret = iroh::SecretKey::from_bytes(&[100u8; 32]);
+        let public = secret.public();
+        // No direct addrs at all
+        let addr = iroh::EndpointAddr::from(public);
+        assert!(!has_direct_addr(&addr));
     }
 }

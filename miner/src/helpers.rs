@@ -20,13 +20,9 @@ use tracing::{debug, warn};
 
 /// Returns true if the connection has a direct IP path (not relay-only).
 ///
-/// In iroh 0.96+, `remote_info().addrs()` only reflects the address book
-/// (discovery), not live paths discovered via NAT traversal. Use
-/// `Connection::paths()` to inspect actual live paths on a connection.
-pub fn has_direct_ip_path(conn: &iroh::endpoint::Connection) -> bool {
-    use iroh::Watcher as _;
-    conn.paths().get().iter().any(|p| p.is_ip())
-}
+/// Re-exported from common — checks `Connection::paths()` for actual live
+/// transport paths, not just address book metadata.
+pub use common::has_direct_ip_path;
 
 /// Safely truncate a string for logging (handles non-ASCII gracefully)
 pub fn truncate_for_log(s: &str, max_chars: usize) -> &str {

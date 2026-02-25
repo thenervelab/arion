@@ -23,8 +23,10 @@ pub const MAX_ORPHAN_ENTRIES: usize = 100_000;
 /// Maximum epoch jump to accept (prevents malformed updates)
 pub const MAX_EPOCH_JUMP: u64 = 100;
 
-/// Connection pool TTL in seconds
-pub const CONNECTION_TTL_SECS: u64 = 60;
+/// Connection pool TTL in seconds.
+/// Must match or exceed `max_idle_timeout` in transport config (120s)
+/// to avoid evicting connections that QUIC still considers alive.
+pub const CONNECTION_TTL_SECS: u64 = 120;
 
 /// Blob cache size (number of entries)
 pub const BLOB_CACHE_SIZE: usize = 10_000;
