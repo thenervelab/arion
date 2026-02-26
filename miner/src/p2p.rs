@@ -51,7 +51,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Global semaphore to limit concurrent P2P stream handlers
 /// Prevents OOM from connection flood attacks spawning unbounded tasks
@@ -174,7 +174,32 @@ pub async fn handle_miner_control(
     handler: MinerControlHandler,
 ) -> Result<()> {
     let remote_node_id = connection.remote_id();
-    trace!(remote = %remote_node_id, "Accepted MinerControl connection");
+    {
+        use iroh::Watcher as _;
+        let paths = connection.paths().get();
+        let path_details: Vec<String> = paths
+            .iter()
+            .map(|p| format!("{:?} (rtt={}ms)", p.remote_addr(), p.rtt().as_millis()))
+            .collect();
+        let has_direct = paths
+            .iter()
+            .any(|p| matches!(p.remote_addr(), iroh::TransportAddr::Ip(_)));
+        if has_direct {
+            info!(
+                remote = %remote_node_id,
+                path_count = paths.len(),
+                paths = ?path_details,
+                "Inbound connection accepted with direct P2P path"
+            );
+        } else {
+            debug!(
+                remote = %remote_node_id,
+                path_count = paths.len(),
+                paths = ?path_details,
+                "Inbound connection accepted via relay only (no direct path)"
+            );
+        }
+    }
 
     // Loop accepting streams until connection is closed
     loop {

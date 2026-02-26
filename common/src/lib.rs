@@ -2014,6 +2014,32 @@ pub async fn wait_for_direct_ip_path(
     .unwrap_or(false)
 }
 
+/// Connect to a peer and ensure a direct IP path.
+///
+/// Returns `Err` if the connection is relay-only after the
+/// `direct_path_timeout` expires. Callers already set
+/// `max_tls_tickets(0)` to disable 0-RTT, so a single connect
+/// attempt is sufficient.
+pub async fn connect_with_direct_path(
+    endpoint: &iroh::Endpoint,
+    addr: iroh::EndpointAddr,
+    alpn: &[u8],
+    connect_timeout: std::time::Duration,
+    direct_path_timeout: std::time::Duration,
+) -> anyhow::Result<iroh::endpoint::Connection> {
+    let conn = tokio::time::timeout(connect_timeout, endpoint.connect(addr, alpn))
+        .await
+        .map_err(|_| anyhow::anyhow!("connect timeout"))?
+        .map_err(|e| anyhow::anyhow!("connect error: {e}"))?;
+
+    if wait_for_direct_ip_path(&conn, direct_path_timeout).await {
+        return Ok(conn);
+    }
+
+    conn.close(0u32.into(), b"no_direct_path");
+    Err(anyhow::anyhow!("no direct IP path after timeout"))
+}
+
 /// Extract miner IP from EndpointAddr direct addresses
 /// or fall back to parsing the http_addr URL hostname.
 pub fn extract_miner_ip(
@@ -2634,13 +2660,19 @@ impl P2pConnectionManager {
                     .with_addrs(self.known_addrs.iter().map(|a| iroh::TransportAddr::Ip(*a)));
             }
 
-            match tokio::time::timeout(
+            // Uses connect_with_direct_path to ensure a direct IP path
+            // before use — closes the connection if relay-only after
+            // timeout.
+            match connect_with_direct_path(
+                &self.endpoint,
+                connect_target,
+                self.alpn,
                 std::time::Duration::from_secs(P2P_DEFAULT_TIMEOUT_SECS),
-                self.endpoint.connect(connect_target, self.alpn),
+                std::time::Duration::from_secs(5),
             )
             .await
             {
-                Ok(Ok(conn)) => {
+                Ok(conn) => {
                     debug!(
                         target = %self.target_node_id,
                         conn_id = conn.stable_id(),
@@ -2655,22 +2687,14 @@ impl P2pConnectionManager {
                     *conn_guard = Some((conn.clone(), now_secs()));
                     return Ok(conn);
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     warn!(
                         target = %self.target_node_id,
                         attempt = attempt,
                         error = %e,
                         "P2P connection failed"
                     );
-                    last_error = Some(anyhow::anyhow!("Failed to connect: {}", e));
-                }
-                Err(_) => {
-                    warn!(
-                        target = %self.target_node_id,
-                        attempt = attempt,
-                        "P2P connection timed out"
-                    );
-                    last_error = Some(anyhow::anyhow!("Connection timeout"));
+                    last_error = Some(e);
                 }
             }
         }

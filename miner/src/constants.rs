@@ -77,3 +77,15 @@ pub const MAX_TAG_MAP_ENTRIES: usize = 200_000;
 
 /// PoS commitment cache size (number of entries, ~200KB each ≈ 20MB max)
 pub const POS_COMMITMENT_CACHE_SIZE: usize = 100;
+
+/// How often to check relay status after detecting loss (seconds).
+/// Between checks, the monitor calls endpoint.online() to nudge reconnection.
+pub const RELAY_CHECK_INTERVAL_SECS: u64 = 15;
+
+/// Max time without any relay before triggering clean exit (seconds).
+/// After this duration of continuous relay loss, the miner exits so systemd
+/// can restart it with a fresh iroh endpoint.
+pub const RELAY_LOSS_EXIT_TIMEOUT_SECS: u64 = 300;
+
+/// Timeout for each endpoint.online() nudge attempt (seconds).
+pub const RELAY_ONLINE_NUDGE_TIMEOUT_SECS: u64 = 10;

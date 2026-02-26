@@ -18,8 +18,8 @@
 //! `PullFromPeer` commands. The miner does not self-heal.
 
 use crate::constants::{
-    DEFAULT_CONNECT_TIMEOUT_SECS, MAX_BATCH_PG_RESPONSE_SIZE, MAX_ORPHAN_ENTRIES,
-    ORPHAN_GRACE_PERIOD_SECS, REBALANCE_MAX_FILES_PER_CYCLE,
+    MAX_BATCH_PG_RESPONSE_SIZE, MAX_ORPHAN_ENTRIES, ORPHAN_GRACE_PERIOD_SECS,
+    REBALANCE_MAX_FILES_PER_CYCLE,
 };
 use crate::helpers::truncate_for_log;
 use crate::state::{
@@ -113,14 +113,13 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
 
     // Single P2P connection for both PG queries and manifest fetches.
     // QUIC natively multiplexes streams on one connection.
-    let connect_timeout = std::time::Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS);
+    // Reuses the pooled validator connection to avoid extra QUIC handshakes.
     let read_timeout = std::time::Duration::from_secs(60); // Longer timeout for batch response
 
-    let validator_conn = match crate::state::connect_with_cleanup(
+    let validator_conn = match crate::state::get_pooled_connection(
         &endpoint,
-        validator_addr.clone(),
+        &validator_addr,
         b"hippius/validator-control",
-        connect_timeout,
     )
     .await
     {
@@ -328,7 +327,6 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
     // GC: Identify orphan shards, delete tags and files after grace period
     gc_orphan_shards(&expected_shards, &local_hash_tags, &store).await;
 
-    validator_conn.close(0u32.into(), b"done");
     info!("PG-based self-rebalance complete");
     Ok(())
 }

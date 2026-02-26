@@ -22,8 +22,8 @@ use iroh_blobs::store::fs::FsStore;
 use p2p::MinerControlHandler;
 use rand::Rng as _;
 use state::{
-    get_blobs_dir, get_needs_reregistration, get_validator_endpoint, get_validator_reachable,
-    get_warden_node_ids,
+    get_blobs_dir, get_needs_reregistration, get_relay_connected, get_validator_endpoint,
+    get_validator_reachable, get_warden_node_ids,
 };
 use std::str::FromStr;
 use std::sync::Arc;
@@ -422,6 +422,8 @@ async fn run_miner(cli: Cli) -> Result<()> {
 
     let mut endpoint_builder = iroh::Endpoint::builder()
         .secret_key(secret_key)
+        .max_tls_tickets(0) // Disable 0-RTT: prevents NAT traversal race (Iroh #3917)
+        .clear_address_lookup() // Remove N0 preset's Pkarr/DNS publishing to dns.iroh.link
         .address_lookup(static_discovery)
         .bind_addr(std::net::SocketAddrV4::new(
             bind_ipv4,
@@ -473,10 +475,11 @@ async fn run_miner(cli: Cli) -> Result<()> {
         .stream_receive_window((2u32 * 1024 * 1024).into())
         // 64MB receive_window bounds aggregate receive capacity per connection.
         .receive_window((64u32 * 1024 * 1024).into())
-        // Allow 128 QUIC multipath paths per connection for hole punching
-        // on multi-homed nodes (default 13 is too low when nodes have multiple virtual IPs).
-        .max_concurrent_multipath_paths(128)
-        .set_max_remote_nat_traversal_addresses(32)
+        // Use iroh defaults for multipath (13 paths) and NAT traversal (12 addresses).
+        // Higher values exhaust the CID budget (CidQueue::LEN=5 in iroh-quinn-proto)
+        // causing "remoted CIDs exhausted" errors during hole punching.
+        .send_observed_address_reports(true)
+        .receive_observed_address_reports(true)
         .build();
 
     endpoint_builder = endpoint_builder.transport_config(transport_config);
@@ -506,6 +509,74 @@ async fn run_miner(cli: Cli) -> Result<()> {
             timeout_secs = common::RELAY_CONNECTION_WAIT_SECS,
             "Relay connection not established within timeout, proceeding anyway"
         ),
+    }
+
+    // Wait for direct address discovery (STUN/port mapping) before
+    // registering with the validator. This ensures our public IPv4 (and
+    // IPv6 when configured) is known so that the validator can establish
+    // direct paths to us instead of relay-only connections.
+    let ipv6_enabled = config.network.bind_ipv6.is_some();
+    {
+        use iroh::Watcher as _;
+        if ipv6_enabled {
+            info!("Waiting for direct address discovery (IPv4 + IPv6)...");
+        } else {
+            info!("Waiting for direct address discovery (IPv4)...");
+        }
+        let mut watcher = endpoint.watch_addr();
+        match tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let addr = watcher.get();
+                let has_v4 = addr.ip_addrs().any(|a| a.is_ipv4());
+                let has_v6 = addr.ip_addrs().any(|a| a.is_ipv6());
+                if has_v4 && (!ipv6_enabled || has_v6) {
+                    return addr;
+                }
+                if watcher.updated().await.is_err() {
+                    return watcher.get();
+                }
+            }
+        })
+        .await
+        {
+            Ok(addr) => {
+                let v4: Vec<String> = addr
+                    .ip_addrs()
+                    .filter(|a| a.is_ipv4())
+                    .map(|a| a.to_string())
+                    .collect();
+                let v6: Vec<String> = addr
+                    .ip_addrs()
+                    .filter(|a| a.is_ipv6())
+                    .map(|a| a.to_string())
+                    .collect();
+                info!(
+                    ipv4 = ?v4,
+                    ipv6 = ?v6,
+                    "Direct addresses discovered"
+                );
+            }
+            Err(_) => {
+                let addr = endpoint.addr();
+                let v4: Vec<String> = addr
+                    .ip_addrs()
+                    .filter(|a| a.is_ipv4())
+                    .map(|a| a.to_string())
+                    .collect();
+                let v6: Vec<String> = addr
+                    .ip_addrs()
+                    .filter(|a| a.is_ipv6())
+                    .map(|a| a.to_string())
+                    .collect();
+                warn!(
+                    ipv4 = ?v4,
+                    ipv6 = ?v6,
+                    ipv6_enabled,
+                    "Direct address discovery timed out after 15s \
+                     — proceeding with partial addresses"
+                );
+            }
+        }
     }
     info!("Ready for P2P connections");
 
@@ -597,6 +668,13 @@ async fn run_miner(cli: Cli) -> Result<()> {
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     spawn_heartbeat_loop(ctx.clone(), shutdown_notify.clone(), shutdown_token.clone());
 
+    // 5b. Start relay health monitor
+    spawn_relay_health_monitor(
+        endpoint.clone(),
+        shutdown_notify.clone(),
+        shutdown_token.clone(),
+    );
+
     // 6. Start Self-Rebalance Loop (if enabled)
     if config.tuning.rebalance_enabled {
         let store_rebalance = store.clone();
@@ -686,7 +764,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
     tokio::select! {
         () = ctrl_c => info!("Received Ctrl+C, initiating graceful shutdown"),
         () = terminate => info!("Received SIGTERM, initiating graceful shutdown"),
-        () = shutdown_notify.notified() => error!("Fatal error in heartbeat loop, shutting down"),
+        () = shutdown_notify.notified() => error!("Fatal shutdown signal received, shutting down"),
     }
 
     // 1. Signal all background loops to stop
@@ -720,6 +798,48 @@ fn build_validator_addr(
         addr = addr.with_relay_url(url.clone());
     }
     addr
+}
+
+/// Extract the validator's direct IP addresses from a live connection and
+/// seed them into the miner's static discovery. On the next `endpoint.connect()`
+/// iroh will try these addresses first, establishing a direct connection
+/// without needing relay-based multipath path promotion.
+fn seed_validator_discovery(
+    conn: &iroh::endpoint::Connection,
+    validator_pubkey: &iroh::PublicKey,
+    relay_url: &Option<iroh_base::RelayUrl>,
+) {
+    use iroh::Watcher as _;
+    let Some(discovery) = state::get_static_discovery() else {
+        return;
+    };
+
+    let direct_addrs: Vec<iroh::TransportAddr> = conn
+        .paths()
+        .get()
+        .iter()
+        .filter_map(|p| match p.remote_addr() {
+            iroh::TransportAddr::Ip(sock) if common::is_advertisable_ip(sock.ip()) => {
+                Some(iroh::TransportAddr::Ip(*sock))
+            }
+            _ => None,
+        })
+        .collect();
+
+    if direct_addrs.is_empty() {
+        return;
+    }
+
+    let mut addr = iroh::EndpointAddr::new(*validator_pubkey);
+    if let Some(url) = relay_url {
+        addr = addr.with_relay_url(url.clone());
+    }
+    addr = addr.with_addrs(direct_addrs.clone());
+    discovery.set_endpoint_info(addr);
+    debug!(
+        addrs = ?direct_addrs,
+        "Seeded validator direct addresses into static discovery"
+    );
 }
 
 /// Wait for a connection to establish a direct IP path via NAT traversal.
@@ -807,6 +927,120 @@ async fn register_with_validator(ctx: &MinerContext) -> Result<()> {
             }
         }
     }
+}
+
+/// Monitor relay connectivity using iroh's `watch_addr()` watcher.
+///
+/// When all relay connections are lost, this task:
+/// 1. Sets `RELAY_CONNECTED = false` so the heartbeat loop skips connection attempts
+/// 2. Periodically nudges `endpoint.online()` to encourage reconnection
+/// 3. After `RELAY_LOSS_EXIT_TIMEOUT_SECS` of continuous loss, triggers
+///    `shutdown_notify` for a clean process exit (systemd restarts with fresh state)
+fn spawn_relay_health_monitor(
+    endpoint: iroh::Endpoint,
+    shutdown_notify: Arc<tokio::sync::Notify>,
+    cancel_token: CancellationToken,
+) {
+    use constants::{
+        RELAY_CHECK_INTERVAL_SECS, RELAY_LOSS_EXIT_TIMEOUT_SECS, RELAY_ONLINE_NUDGE_TIMEOUT_SECS,
+    };
+    use iroh::Watcher as _;
+
+    tokio::spawn(async move {
+        let mut watcher = endpoint.watch_addr();
+        let initial = watcher.get();
+        let initial_relay_count = initial.relay_urls().count();
+        info!(
+            relay_count = initial_relay_count,
+            "Relay health monitor started"
+        );
+
+        loop {
+            // Block until address state changes (zero CPU when healthy)
+            tokio::select! {
+                _ = watcher.updated() => {}
+                () = cancel_token.cancelled() => {
+                    debug!("Relay health monitor shutting down");
+                    return;
+                }
+            }
+
+            let addr = watcher.get();
+            if addr.relay_urls().next().is_some() {
+                // Still connected to at least one relay
+                get_relay_connected().store(true, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+
+            // All relays lost
+            warn!("All relay connections lost, monitoring for recovery");
+            get_relay_connected().store(false, std::sync::atomic::Ordering::Relaxed);
+            let lost_at = tokio::time::Instant::now();
+
+            // Recovery sub-loop: check periodically until relay returns or timeout
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(
+                        tokio::time::Duration::from_secs(RELAY_CHECK_INTERVAL_SECS)
+                    ) => {}
+                    () = cancel_token.cancelled() => {
+                        debug!("Relay health monitor shutting down");
+                        return;
+                    }
+                }
+
+                // Check watcher first (cheapest)
+                let addr = watcher.get();
+                let relay_count = addr.relay_urls().count();
+                if relay_count > 0 {
+                    let downtime = lost_at.elapsed().as_secs();
+                    info!(
+                        downtime_secs = downtime,
+                        relay_count, "Relay connection recovered"
+                    );
+                    get_relay_connected().store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+
+                // Nudge iroh to retry relay connection
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(RELAY_ONLINE_NUDGE_TIMEOUT_SECS),
+                    endpoint.online(),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        let downtime = lost_at.elapsed().as_secs();
+                        info!(
+                            downtime_secs = downtime,
+                            "Relay connection recovered (via online nudge)"
+                        );
+                        get_relay_connected().store(true, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                    Err(_) => {
+                        let downtime = lost_at.elapsed().as_secs();
+                        info!(
+                            downtime_secs = downtime,
+                            "Relay still disconnected, waiting for recovery"
+                        );
+                    }
+                }
+
+                // Check timeout
+                if lost_at.elapsed().as_secs() >= RELAY_LOSS_EXIT_TIMEOUT_SECS {
+                    error!(
+                        downtime_secs = lost_at.elapsed().as_secs(),
+                        timeout_secs = RELAY_LOSS_EXIT_TIMEOUT_SECS,
+                        "Relay connection lost too long, triggering clean exit \
+                         for systemd restart"
+                    );
+                    shutdown_notify.notify_one();
+                    return;
+                }
+            }
+        }
+    });
 }
 
 /// Interval (in heartbeat cycles) at which to refresh validator address from environment
@@ -920,6 +1154,26 @@ fn spawn_heartbeat_loop(
                 continue;
             }
 
+            // Skip heartbeat when relay is known to be down — the relay
+            // health monitor handles escalation and eventual clean exit.
+            if !get_relay_connected().load(std::sync::atomic::Ordering::Relaxed) {
+                debug!("Relay disconnected, skipping heartbeat attempt");
+                get_validator_reachable().store(false, std::sync::atomic::Ordering::Relaxed);
+                tokio::select! {
+                    () = tokio::time::sleep(
+                        tokio::time::Duration::from_secs(30)
+                    ) => {}
+                    () = cancel_token.cancelled() => {
+                        info!("Heartbeat loop received shutdown signal");
+                        if let Some(conn) = cached_conn.take() {
+                            conn.close(0u32.into(), b"shutdown");
+                        }
+                        return;
+                    }
+                }
+                continue;
+            }
+
             let timestamp = now_secs();
 
             // Calculate available storage
@@ -950,8 +1204,8 @@ fn spawn_heartbeat_loop(
             };
 
             // Reuse cached connection or establish a new one.
-            // Track whether this is a fresh connection so the direct-path
-            // check knows whether to wait for NAT traversal.
+            // Fresh connections use connect_with_direct_path which
+            // ensures a direct IP path before use.
             let mut is_fresh_conn = false;
             let conn = match cached_conn.as_ref() {
                 Some(c) if c.close_reason().is_none() => Ok(c.clone()),
@@ -960,10 +1214,11 @@ fn spawn_heartbeat_loop(
                         old.close(0u32.into(), b"stale");
                     }
                     is_fresh_conn = true;
-                    match state::connect_with_cleanup(
+                    match common::connect_with_direct_path(
                         &ctx.endpoint,
                         heartbeat_validator_addr.clone(),
                         b"hippius/validator-control",
+                        std::time::Duration::from_secs(10),
                         std::time::Duration::from_secs(10),
                     )
                     .await
@@ -979,20 +1234,37 @@ fn spawn_heartbeat_loop(
 
             match conn {
                 Ok(conn) => {
-                    // Check direct IP path on the live connection. If the
-                    // path isn't there yet (fresh connection), give Iroh
-                    // up to 10s for NAT traversal to complete. On a reused
-                    // cached connection the path should already be present,
-                    // so use a short 2s grace period.
+                    // For fresh connections, connect_with_direct_path already
+                    // ensured a direct path. For cached connections, verify
+                    // the path is still live.
                     let direct = if is_fresh_conn {
-                        wait_for_direct_path(&conn, &ctx.endpoint, 10).await
+                        use iroh::Watcher as _;
+                        let paths = conn.paths().get();
+                        let path_details: Vec<String> = paths
+                            .iter()
+                            .map(|p| {
+                                format!("{:?} (rtt={}ms)", p.remote_addr(), p.rtt().as_millis())
+                            })
+                            .collect();
+                        info!(
+                            path_count = paths.len(),
+                            paths = ?path_details,
+                            "Heartbeat: fresh direct P2P connection to validator established"
+                        );
+                        true
                     } else if !has_direct_ip_path(&conn) {
-                        // Cached connection lost its direct path — give a
-                        // brief window for Iroh to re-establish it.
-                        wait_for_direct_path(&conn, &ctx.endpoint, 2).await
+                        // Cached connection lost its direct path — give
+                        // Iroh time to re-traverse NAT before giving up.
+                        wait_for_direct_path(&conn, &ctx.endpoint, 10).await
                     } else {
                         true
                     };
+
+                    // Seed the validator's direct addresses into static
+                    // discovery so future connect() calls try direct first.
+                    if direct {
+                        seed_validator_discovery(&conn, &current_validator_pubkey, &ctx.relay_url);
+                    }
 
                     if !direct {
                         use iroh::Watcher as _;
@@ -1245,28 +1517,39 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<()> {
         }
     };
 
-    // Connect to validator via P2P (relay-assisted hole-punching)
+    // Connect to validator via P2P with direct path guarantee.
+    // Uses connect_with_direct_path which ensures a direct IP path
+    // before use — closes the connection if relay-only after timeout.
     let validator_addr = ctx.validator_addr();
+    let direct_wait = std::time::Duration::from_secs(ctx.config.tuning.p2p_direct_wait_secs);
 
-    let conn = state::connect_with_cleanup(
+    let conn = common::connect_with_direct_path(
         &ctx.endpoint,
         validator_addr,
         b"hippius/validator-control",
         std::time::Duration::from_secs(10),
+        direct_wait,
     )
     .await?;
 
-    // Wait for NAT traversal to establish a direct IP path.
-    // Relay-only miners cannot receive shards.
-    let result: anyhow::Result<()> = async {
-        if !wait_for_direct_path(&conn, &ctx.endpoint, ctx.config.tuning.p2p_direct_wait_secs).await
-        {
-            return Err(anyhow::anyhow!(
-                "No UDP path to validator (relay-only or no connection). \
-                 Waiting for hole-punching to complete."
-            ));
-        }
+    {
+        use iroh::Watcher as _;
+        let paths = conn.paths().get();
+        let path_details: Vec<String> = paths
+            .iter()
+            .map(|p| format!("{:?} (rtt={}ms)", p.remote_addr(), p.rtt().as_millis()))
+            .collect();
+        info!(
+            path_count = paths.len(),
+            paths = ?path_details,
+            "Registration: direct P2P connection to validator established"
+        );
+    }
 
+    // Seed validator's direct addresses for future connections
+    seed_validator_discovery(&conn, &ctx.validator_pubkey, &ctx.relay_url);
+
+    let result: anyhow::Result<()> = async {
         let (mut send, mut recv) = conn.open_bi().await?;
         let msg_bytes = serde_json::to_vec(&register_msg)?;
         send.write_all(&msg_bytes).await?;

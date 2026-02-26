@@ -76,6 +76,9 @@ static WARDEN_NODE_IDS: OnceLock<Arc<RwLock<Vec<iroh::PublicKey>>>> = OnceLock::
 /// Whether the validator is currently reachable (set by heartbeat loop, read by rebalance loop)
 static VALIDATOR_REACHABLE: OnceLock<AtomicBool> = OnceLock::new();
 
+/// Whether at least one relay server is connected (set by relay health monitor)
+static RELAY_CONNECTED: OnceLock<AtomicBool> = OnceLock::new();
+
 /// Miner UID computed once from public key hash (avoids repeated hashing + heap alloc)
 static MINER_UID: OnceLock<u32> = OnceLock::new();
 
@@ -141,6 +144,10 @@ pub fn get_validator_reachable() -> &'static AtomicBool {
     VALIDATOR_REACHABLE.get_or_init(|| AtomicBool::new(false))
 }
 
+pub fn get_relay_connected() -> &'static AtomicBool {
+    RELAY_CONNECTED.get_or_init(|| AtomicBool::new(true))
+}
+
 pub fn set_miner_uid(uid: u32) {
     let _ = MINER_UID.set(uid);
 }
@@ -181,39 +188,6 @@ pub fn get_pos_commitment_cache()
         .get_or_init(|| Arc::new(Cache::new(crate::constants::POS_COMMITMENT_CACHE_SIZE)))
 }
 
-/// Connect to a peer with timeout, ensuring iroh path IDs are released
-/// even if the connect completes after the timeout fires.
-///
-/// When `tokio::time::timeout` drops a `Connecting` future, iroh retains
-/// the internal path state until the QUIC idle timeout (~180s). Under
-/// sustained load this exhausts the path ID table (`MaxPathIdReached`).
-///
-/// This wrapper spawns the connect in a background task so late-arriving
-/// connections are properly closed instead of leaked.
-pub async fn connect_with_cleanup(
-    endpoint: &Endpoint,
-    addr: iroh::EndpointAddr,
-    alpn: &'static [u8],
-    timeout: std::time::Duration,
-) -> Result<iroh::endpoint::Connection> {
-    let endpoint = endpoint.clone();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let result = endpoint.connect(addr, alpn).await;
-        match tx.send(result) {
-            Ok(()) => {}
-            Err(Ok(conn)) => conn.close(0u32.into(), b"timeout"),
-            Err(Err(_)) => {}
-        }
-    });
-    match tokio::time::timeout(timeout, rx).await {
-        Ok(Ok(Ok(conn))) => Ok(conn),
-        Ok(Ok(Err(e))) => Err(anyhow::anyhow!("Connection failed: {e}")),
-        Ok(Err(_)) => Err(anyhow::anyhow!("Connection task panicked")),
-        Err(_) => Err(anyhow::anyhow!("Connection timeout")),
-    }
-}
-
 /// Get a pooled connection or create a new one
 /// Uses read lock for initial check, write lock only when needed
 pub async fn get_pooled_connection(
@@ -227,13 +201,14 @@ pub async fn get_pooled_connection(
     let key = peer_addr.id;
     let now = now_secs();
 
-    // Guard: if clock skew detected (now_secs returns 0), skip pool and create new connection
+    // Guard: if clock skew detected (now_secs returns 0), skip pool and create new connection.
     if now == 0 {
-        return connect_with_cleanup(
+        return common::connect_with_direct_path(
             endpoint,
             peer_addr.clone(),
             alpn,
             std::time::Duration::from_secs(crate::constants::DEFAULT_CONNECT_TIMEOUT_SECS),
+            std::time::Duration::from_secs(5),
         )
         .await;
     }
@@ -252,12 +227,13 @@ pub async fn get_pooled_connection(
         }
     }
 
-    // Create new connection (with cleanup to prevent iroh path ID exhaustion)
-    let conn = connect_with_cleanup(
+    // Create new connection with direct path guarantee.
+    let conn = common::connect_with_direct_path(
         endpoint,
         peer_addr.clone(),
         alpn,
         std::time::Duration::from_secs(crate::constants::DEFAULT_CONNECT_TIMEOUT_SECS),
+        std::time::Duration::from_secs(5),
     )
     .await?;
 
