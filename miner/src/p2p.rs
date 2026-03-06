@@ -8,11 +8,12 @@
 //!
 //! Two framing modes share a single stream, disambiguated by the first byte:
 //!
-//! - **V1 (JSON):** First byte is `{` (0x7B). The entire message is a
-//!   JSON-encoded [`MinerControlMessage`]. Used for most control messages.
-//! - **V2 (binary):** First byte is `0x02` ([`STORE_V2_MAGIC`]). Followed by
+//! - **Binary store:** First byte is `0x02` ([`STORE_V2_MAGIC`]). Followed by
 //!   4-byte LE header length, a JSON header, and raw blob bytes. Used for
-//!   `StoreV2` to avoid base64 overhead.
+//!   shard storage — the only supported store path.
+//! - **JSON control:** First byte is `{` (0x7B). The entire message is a
+//!   JSON-encoded [`MinerControlMessage`]. Used for all other control messages
+//!   (Delete, FetchBlob, ClusterMapUpdate, PullFromPeer, PosChallenge, CheckBlob).
 //!
 //! # Backpressure
 //!
@@ -31,8 +32,11 @@
 //! relay-only connections are rejected to avoid saturating relay servers.
 
 use crate::constants::{
-    DEFAULT_READ_TIMEOUT_SECS, MAX_CLUSTER_MAP_JSON_SIZE, MAX_CONCURRENT_HANDLERS, MAX_EPOCH_JUMP,
-    MAX_FETCH_RESPONSE_SIZE, MAX_MESSAGE_SIZE, MAX_PEER_CACHE_ENTRIES, MAX_V2_DATA_SIZE,
+    DATA_FRAME_READ_TIMEOUT_SECS, DEFAULT_READ_TIMEOUT_SECS, LOG_STRING_TRUNCATE_LEN,
+    MAX_CLUSTER_MAP_JSON_SIZE, MAX_CONCURRENT_HANDLERS, MAX_EPOCH_JUMP, MAX_FETCH_RESPONSE_SIZE,
+    MAX_MESSAGE_SIZE, MAX_PEER_CACHE_ENTRIES, MAX_V2_DATA_SIZE, PEER_BLOB_DOWNLOAD_TIMEOUT_SECS,
+    PEER_DATA_RECEPTION_TIMEOUT_SECS, PULL_DIRECT_PATH_WAIT_MS, PULL_PERMIT_TIMEOUT_SECS,
+    STORE_PERMIT_TIMEOUT_SECS,
 };
 use crate::helpers::{has_direct_ip_path, truncate_for_log};
 use crate::state::{
@@ -255,14 +259,14 @@ async fn handle_single_stream(
     handler: &MinerControlHandler,
     connection: &iroh::endpoint::Connection,
 ) -> Result<()> {
-    // Read the first byte to detect V1 (JSON) vs V2 (binary framing) protocol.
-    // SAFETY: JSON-encoded MinerControlMessage always starts with '{' (0x7B),
-    // so 0x02 is an unambiguous V2 discriminant that can never appear in V1.
+    // Read the first byte to detect binary store (0x02) vs JSON control (0x7B).
+    // JSON-encoded MinerControlMessage always starts with '{' (0x7B),
+    // so 0x02 is an unambiguous binary store discriminant.
     // Data timeout (55s) is slightly shorter than the validator's write timeout (default 60s)
     // to ensure the miner times out before the validator, producing a clean error.
     // DEFAULT_READ_TIMEOUT_SECS (30s) is used for header/first-byte reads (small payloads).
     let header_timeout = std::time::Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS);
-    let data_timeout = std::time::Duration::from_secs(55);
+    let data_timeout = std::time::Duration::from_secs(DATA_FRAME_READ_TIMEOUT_SECS);
 
     let mut first_byte = [0u8; 1];
     tokio::time::timeout(header_timeout, recv.read_exact(&mut first_byte))
@@ -270,8 +274,8 @@ async fn handle_single_stream(
         .map_err(|_| anyhow::anyhow!("First byte read timed out"))?
         .map_err(|e| anyhow::anyhow!("First byte read failed: {}", e))?;
 
-    let message = if first_byte[0] == common::STORE_V2_MAGIC {
-        // V2 binary framing: [0x02][4-byte LE header_len][JSON header][raw blob bytes]
+    // V2 binary store path: parse header, reject relay-only, read data, handle, return.
+    if first_byte[0] == common::STORE_V2_MAGIC {
         let mut header_len_bytes = [0u8; 4];
         tokio::time::timeout(header_timeout, recv.read_exact(&mut header_len_bytes))
             .await
@@ -290,73 +294,64 @@ async fn handle_single_stream(
             .map_err(|e| anyhow::anyhow!("StoreV2 header read failed: {}", e))?;
         let header: common::MinerControlMessage = serde_json::from_slice(&header_bytes)?;
 
-        match header {
-            common::MinerControlMessage::StoreV2 { hash, data_len } => {
-                if data_len > MAX_V2_DATA_SIZE {
-                    anyhow::bail!(
-                        "StoreV2 data too large: {} bytes (max {})",
-                        data_len,
-                        MAX_V2_DATA_SIZE
-                    );
-                }
-                let data_len = data_len as usize;
-                let mut data = vec![0u8; data_len];
-                tokio::time::timeout(data_timeout, recv.read_exact(&mut data))
-                    .await
-                    .map_err(|_| anyhow::anyhow!("StoreV2 data read timed out after 55s"))?
-                    .map_err(|e| anyhow::anyhow!("StoreV2 data read failed: {}", e))?;
-                // Convert to Store variant for unified handling
-                common::MinerControlMessage::Store {
-                    hash,
-                    data: Some(data),
-                    source_miner: None,
-                }
-            }
+        let (hash, data_len, validator_signature) = match header {
+            common::MinerControlMessage::StoreV2 { hash, data_len, validator_signature } => (hash, data_len, validator_signature),
             other => {
-                // V2 framing only valid for StoreV2; other variants would leave raw data
-                // unconsumed on the stream, causing protocol corruption.
                 anyhow::bail!(
                     "V2 framing used with non-StoreV2 header: {:?}",
                     std::mem::discriminant(&other)
                 );
             }
+        };
+
+        if data_len > MAX_V2_DATA_SIZE {
+            anyhow::bail!(
+                "StoreV2 data too large: {} bytes (max {})",
+                data_len,
+                MAX_V2_DATA_SIZE
+            );
         }
-    } else {
-        // V1: prepend the first byte back and parse as JSON.
-        // from_slice enables SIMD parsing (faster than byte-at-a-time from_reader).
-        let remaining = tokio::time::timeout(data_timeout, recv.read_to_end(MAX_MESSAGE_SIZE - 1))
+
+        // Reject relay-only connections before reading blob data to save bandwidth
+        if !has_direct_ip_path(connection) {
+            warn!(
+                remote = %remote_node_id,
+                hash = %truncate_for_log(&hash, 16),
+                "Store rejected: relay-only connection"
+            );
+            return send_response(&mut send, b"ERROR: RELAY_ONLY").await;
+        }
+
+        let data_len = data_len as usize;
+        let mut data = vec![0u8; data_len];
+        tokio::time::timeout(data_timeout, recv.read_exact(&mut data))
             .await
-            .map_err(|_| anyhow::anyhow!("V1 message read timed out after 55s"))?
-            .map_err(|e| anyhow::anyhow!("V1 message read failed: {}", e))?;
-        let mut full = Vec::with_capacity(1 + remaining.len());
-        full.push(first_byte[0]);
-        full.extend_from_slice(&remaining);
-        serde_json::from_slice(&full)?
-    };
+            .map_err(|_| anyhow::anyhow!("StoreV2 data read timed out after 55s"))?
+            .map_err(|e| anyhow::anyhow!("StoreV2 data read failed: {}", e))?;
+
+        return handle_store(remote_node_id, handler, &mut send, hash, data, validator_signature).await;
+    }
+
+    // JSON control path: prepend the first byte back and parse.
+    // from_slice enables SIMD parsing (faster than byte-at-a-time from_reader).
+    let remaining = tokio::time::timeout(data_timeout, recv.read_to_end(MAX_MESSAGE_SIZE - 1))
+        .await
+        .map_err(|_| anyhow::anyhow!("JSON message read timed out after 55s"))?
+        .map_err(|e| anyhow::anyhow!("JSON message read failed: {}", e))?;
+    let mut full = Vec::with_capacity(1 + remaining.len());
+    full.push(first_byte[0]);
+    full.extend_from_slice(&remaining);
+    let message: common::MinerControlMessage = serde_json::from_slice(&full)?;
 
     match message {
-        common::MinerControlMessage::Store {
-            hash,
-            data,
-            source_miner,
-        } => {
-            if !has_direct_ip_path(connection) {
-                warn!(
-                    remote = %remote_node_id,
-                    hash = %truncate_for_log(&hash, 16),
-                    "Store rejected: relay-only connection"
-                );
-                return send_response(&mut send, b"ERROR: RELAY_ONLY").await;
-            }
-            handle_store(remote_node_id, handler, &mut send, hash, data, source_miner).await?;
-        }
-        common::MinerControlMessage::Delete { hash } => {
+        common::MinerControlMessage::Delete { hash, validator_signature } => {
             handle_delete(
                 remote_node_id,
                 handler.validator_node_id.as_ref(),
                 &mut send,
                 &handler.store,
                 hash,
+                validator_signature,
             )
             .await?;
         }
@@ -402,11 +397,6 @@ async fn handle_single_stream(
             };
             handle_pull_from_peer(remote_node_id, handler, &mut send, hash, peer_addr).await?;
         }
-        common::MinerControlMessage::QueryPgFiles { .. }
-        | common::MinerControlMessage::PgFilesResponse { .. } => {
-            warn!("Received validator-only message, ignoring");
-            send_response(&mut send, b"ERROR: Not supported").await?;
-        }
         common::MinerControlMessage::PosChallenge {
             shard_hash,
             chunk_indices,
@@ -445,9 +435,9 @@ async fn handle_single_stream(
             handle_check_blob(&mut send, &handler.store, hash).await?;
         }
         common::MinerControlMessage::StoreV2 { .. } => {
-            // V1 JSON path: a raw JSON StoreV2 message (without V2 binary framing) is invalid.
-            // V2 framing always converts StoreV2 → Store above, so this is only reachable
-            // if someone sends {"StoreV2":...} as plain JSON — reject it.
+            // StoreV2 requires binary framing (0x02 magic byte). The binary path
+            // short-circuits above, so reaching here means someone sent {"StoreV2":...}
+            // as plain JSON — reject it.
             warn!("Received raw JSON StoreV2 message (not V2-framed), rejecting");
             send_response(&mut send, b"ERROR: StoreV2 requires binary framing").await?;
         }
@@ -461,131 +451,84 @@ async fn handle_store(
     handler: &MinerControlHandler,
     send: &mut iroh::endpoint::SendStream,
     hash: String,
-    data: Option<Vec<u8>>,
-    source_miner: Option<String>,
+    data: Vec<u8>,
+    validator_signature: Vec<u8>,
 ) -> Result<()> {
-    // Only validator should be allowed to issue Store commands
-    if !is_authorized(remote_node_id, handler.validator_node_id.as_ref()) {
-        error!(remote = %remote_node_id, "Store rejected: non-validator controller");
+    // Authenticate Gateway P2P StoreV2: Verify the Ed25519 signature from the validator
+    let is_authorized = if let Some(val_node_id) = handler.validator_node_id.as_ref() {
+        let message_to_sign = format!("UPLOAD:{}", hash);
+        let sig_array = <[u8; 64]>::try_from(validator_signature.as_slice()).unwrap_or([0; 64]);
+        val_node_id.verify(message_to_sign.as_bytes(), &iroh::Signature::from_bytes(&sig_array)).is_ok()
+    } else {
+        false // If no validator configured, nothing is authorized
+    };
+
+    if !is_authorized {
+        error!(remote = %remote_node_id, "Store rejected: invalid validator signature");
         return send_response(send, b"ERROR: UNAUTHORIZED").await;
     }
 
     trace!(hash = %hash, "Received Store command");
 
-    match (data, source_miner) {
-        // CASE 1: Push from validator (initial upload)
-        (Some(blob_data), None) => {
-            // Backpressure: bound concurrent Store ops
-            let _permit = match acquire_permit_with_timeout(handler.store_sem.clone(), 30).await {
-                PermitResult::Acquired(p) => p,
-                PermitResult::Closed => {
-                    error!("Store semaphore closed unexpectedly");
-                    return send_response(send, b"ERROR: Internal error").await;
-                }
-                PermitResult::Timeout => {
-                    debug!(hash = %hash, "Store command timed out waiting for permit");
-                    return send_response(send, b"RATE_LIMITED").await;
-                }
-            };
-
-            trace!(hash = %hash, size = blob_data.len(), "Receiving blob from validator");
-
-            // Verify requested hash parses and matches what we actually store
-            let requested = match iroh_blobs::Hash::from_str(&hash) {
-                Ok(h) => h,
-                Err(e) => {
-                    error!(hash = %hash, error = %e, "Store: Invalid hash");
-                    return send_response(send, b"ERROR: Invalid hash").await;
-                }
-            };
-
-            // Store blob (persistent with FsStore)
-            let outcome = match handler.store.add_bytes(blob_data).await {
-                Ok(o) => o,
-                Err(e) => {
-                    error!(hash = %hash, error = %e, "Failed to store blob");
-                    return send_response(send, b"ERROR: Storage failed").await;
-                }
-            };
-
-            // Invalidate blob cache entry to ensure fresh data on next read
-            get_blob_cache().remove(&requested);
-
-            // Track tag for O(1) delete lookup
-            crate::state::tag_map_insert(outcome.hash, outcome.name);
-
-            // Invalidate PoS commitment cache (shard data changed)
-            crate::state::get_pos_commitment_cache().remove(&requested);
-
-            if outcome.hash != requested {
-                error!(requested = %requested, stored = %outcome.hash, "Store hash mismatch");
-                return send_response(send, b"ERROR: Hash mismatch").await;
+    // Backpressure: bound concurrent Store ops
+    let _permit =
+        match acquire_permit_with_timeout(handler.store_sem.clone(), STORE_PERMIT_TIMEOUT_SECS)
+            .await
+        {
+            PermitResult::Acquired(p) => p,
+            PermitResult::Closed => {
+                error!("Store semaphore closed unexpectedly");
+                return send_response(send, b"ERROR: Internal error").await;
             }
+            PermitResult::Timeout => {
+                debug!(hash = %hash, "Store command timed out waiting for permit");
+                return send_response(send, b"RATE_LIMITED").await;
+            }
+        };
 
-            trace!(hash = %outcome.hash, "Stored blob");
+    trace!(hash = %hash, size = data.len(), "Receiving blob from validator");
 
-            // Send ACK and wait for remote to receive it
-            send_response(send, b"OK").await?;
+    // Verify requested hash parses and matches what we actually store
+    let requested = match iroh_blobs::Hash::from_str(&hash) {
+        Ok(h) => h,
+        Err(e) => {
+            error!(hash = %hash, error = %e, "Store: Invalid hash");
+            return send_response(send, b"ERROR: Invalid hash").await;
         }
+    };
 
-        // CASE 2: Pull from another miner (rebalancing)
-        (None, Some(miner_id)) => {
-            // Backpressure: bound concurrent peer pulls
-            let permit = match acquire_permit_with_timeout(handler.pull_sem.clone(), 30).await {
-                PermitResult::Acquired(p) => p,
-                PermitResult::Closed => {
-                    error!("Pull semaphore closed unexpectedly");
-                    return send_response(send, b"ERROR: Internal error").await;
-                }
-                PermitResult::Timeout => {
-                    debug!(hash = %hash, miner_id = %miner_id, "Pull command timed out waiting for permit");
-                    return send_response(send, b"RATE_LIMITED").await;
-                }
-            };
-
-            trace!(hash = %hash, miner_id = %miner_id, "Downloading blob from miner");
-
-            // Await download completion BEFORE sending ACK
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                download_from_peer_miner(
-                    &miner_id,
-                    &hash,
-                    handler.store.clone(),
-                    handler.endpoint.clone(),
-                ),
-            )
-            .await;
-
-            // Release permit after download completes
-            drop(permit);
-
-            // Send ACK based on actual result
-            let response: &[u8] = match &result {
-                Ok(Ok(())) => {
-                    trace!(hash = %hash, "Downloaded blob from peer miner");
-                    b"OK"
-                }
-                Ok(Err(e)) => {
-                    error!(hash = %hash, error = %e, "Failed to download blob from peer");
-                    b"ERROR: Peer download failed"
-                }
-                Err(_) => {
-                    error!(hash = %hash, miner_id = %miner_id, "Timeout downloading blob from peer");
-                    b"TIMEOUT"
-                }
-            };
-            send_response(send, response).await?;
+    // Store blob (persistent with FsStore)
+    let outcome = match handler.store.add_bytes(data).await {
+        Ok(o) => o,
+        Err(e) => {
+            error!(hash = %hash, error = %e, "Failed to store blob");
+            return send_response(send, b"ERROR: Storage failed").await;
         }
+    };
 
-        // CASE 3: Invalid (both or neither specified)
-        _ => {
-            error!("Invalid Store command: must have either data OR source_miner (not both)");
-            send_response(send, b"ERROR: Invalid parameters").await?;
-        }
+    // Verify hash before updating caches — on mismatch, delete the
+    // tag created by add_bytes so the mismatched blob becomes GC-eligible.
+    // Uses outcome.name directly (the tag from this add_bytes call) since
+    // tag_map_insert hasn't been called yet.
+    if outcome.hash != requested {
+        error!(requested = %requested, stored = %outcome.hash, "Store hash mismatch");
+        let _ = handler.store.tags().delete(&outcome.name).await;
+        return send_response(send, b"ERROR: Hash mismatch").await;
     }
 
-    Ok(())
+    // Invalidate blob cache entry to ensure fresh data on next read
+    get_blob_cache().remove(&requested);
+
+    // Track tag for O(1) delete lookup
+    crate::state::tag_map_insert(outcome.hash, outcome.name);
+
+    // Invalidate PoS commitment cache (shard data changed)
+    crate::state::get_pos_commitment_cache().remove(&requested);
+
+    trace!(hash = %outcome.hash, "Stored blob");
+
+    // Send ACK and wait for remote to receive it
+    send_response(send, b"OK").await
 }
 
 async fn handle_delete(
@@ -594,10 +537,19 @@ async fn handle_delete(
     send: &mut iroh::endpoint::SendStream,
     store: &FsStore,
     hash: String,
+    validator_signature: Vec<u8>,
 ) -> Result<()> {
-    // Only validator should be allowed to issue Delete commands
-    if !is_authorized(remote_node_id, validator_node_id) {
-        error!(remote = %remote_node_id, "Delete rejected: non-validator controller");
+    // Authenticate Gateway P2P Delete: Verify the Ed25519 signature from the validator
+    let is_authorized = if let Some(val_node_id) = validator_node_id {
+        let message_to_sign = format!("DELETE:{}", hash);
+        let sig_array = <[u8; 64]>::try_from(validator_signature.as_slice()).unwrap_or([0; 64]);
+        val_node_id.verify(message_to_sign.as_bytes(), &iroh::Signature::from_bytes(&sig_array)).is_ok()
+    } else {
+        false // If no validator configured, nothing is authorized
+    };
+
+    if !is_authorized {
+        error!(remote = %remote_node_id, "Delete rejected: invalid validator signature");
         return send_response(send, b"ERROR: UNAUTHORIZED").await;
     }
 
@@ -917,8 +869,10 @@ async fn handle_cluster_map_update(
     }
 
     let discovery = get_static_discovery();
+    let mut peers_cached = 0u32;
+    let mut peers_parse_failed = 0u32;
 
-    for (node_id, addr_json) in peers {
+    for (node_id, addr_json) in &peers {
         // Enforce cache size limit
         if peer_cache.len() >= MAX_PEER_CACHE_ENTRIES {
             warn!(
@@ -928,7 +882,7 @@ async fn handle_cluster_map_update(
             break;
         }
 
-        if let Ok(addr) = serde_json::from_str::<iroh::EndpointAddr>(&addr_json) {
+        if let Ok(addr) = serde_json::from_str::<iroh::EndpointAddr>(addr_json) {
             // Seed iroh's discovery with peer direct addresses so
             // PullFromPeer/FetchBlob connect directly without relay.
             if let Some(disc) = discovery
@@ -936,10 +890,18 @@ async fn handle_cluster_map_update(
             {
                 disc.add_endpoint_info(addr.clone());
             }
-            peer_cache.insert(node_id, addr);
+            peer_cache.insert(node_id.clone(), addr);
+            peers_cached += 1;
         } else {
-            debug!(node_id = %node_id, "Failed to parse peer endpoint address");
+            peers_parse_failed += 1;
         }
+    }
+
+    if peers_parse_failed > 0 {
+        debug!(
+            peers_cached,
+            peers_parse_failed, "Peer cache update had parse failures"
+        );
     }
 
     // Store the cluster map for CRUSH calculations
@@ -1006,7 +968,12 @@ async fn handle_pull_from_peer(
     trace!(hash = %truncate_for_log(&hash, 32), "Received PullFromPeer command");
 
     // Backpressure: bound concurrent peer pulls
-    let permit = match acquire_permit_with_timeout(handler.pull_sem.clone(), 30).await {
+    let permit = match acquire_permit_with_timeout(
+        handler.pull_sem.clone(),
+        PULL_PERMIT_TIMEOUT_SECS,
+    )
+    .await
+    {
         PermitResult::Acquired(p) => p,
         PermitResult::Closed => {
             error!("Pull semaphore closed unexpectedly");
@@ -1020,7 +987,7 @@ async fn handle_pull_from_peer(
 
     // Await download completion BEFORE sending ACK
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(PEER_BLOB_DOWNLOAD_TIMEOUT_SECS),
         pull_blob_from_peer(
             handler.store.clone(),
             handler.endpoint.clone(),
@@ -1061,16 +1028,18 @@ pub async fn pull_blob_from_peer(
     trace!(hash = %truncate_for_log(&hash, 16), "Pulling blob from peer");
 
     // Use connection pool to avoid QUIC handshake on repeated pulls to the same peer
-    let conn = crate::state::get_pooled_connection(&endpoint, &peer_addr, b"hippius/miner-control")
-        .await?;
+    let conn =
+        crate::state::get_pooled_connection(&endpoint, &peer_addr, common::MINER_CONTROL_ALPN)
+            .await?;
 
     // Wait briefly for direct path — after the initial relay
     // connect, hole-punching typically resolves in 30-100ms.
-    if !wait_for_direct_peer_path(&conn, 500).await {
+    if !wait_for_direct_peer_path(&conn, PULL_DIRECT_PATH_WAIT_MS).await {
         warn!(
             peer = %peer_addr.id,
             hash = %truncate_for_log(&hash, 16),
-            "PullFromPeer aborted: no direct path to peer after 500ms"
+            wait_ms = PULL_DIRECT_PATH_WAIT_MS,
+            "PullFromPeer aborted: no direct path to peer"
         );
         return Err(anyhow::anyhow!(
             "No direct path to peer {}, refusing data transfer",
@@ -1088,7 +1057,7 @@ pub async fn pull_blob_from_peer(
 
     // Read response with timeout
     let response = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(PEER_DATA_RECEPTION_TIMEOUT_SECS),
         recv.read_to_end(MAX_FETCH_RESPONSE_SIZE),
     )
     .await
@@ -1104,7 +1073,7 @@ pub async fn pull_blob_from_peer(
         let peer_msg = std::str::from_utf8(&response)
             .unwrap_or("<non-utf8>")
             .chars()
-            .take(120)
+            .take(LOG_STRING_TRUNCATE_LEN)
             .collect::<String>();
         return Err(anyhow::anyhow!(
             "Peer did not return DATA for {} (response: {})",
@@ -1139,30 +1108,6 @@ pub async fn pull_blob_from_peer(
 
     trace!(hash = %truncate_for_log(&hash, 16), "Pulled and stored blob from peer");
     Ok(())
-}
-
-/// Download blob from peer miner using node ID (looks up EndpointAddr from cache)
-pub async fn download_from_peer_miner(
-    miner_id: &str,
-    hash: &str,
-    store: FsStore,
-    endpoint: Endpoint,
-) -> Result<()> {
-    trace!(
-        hash = %truncate_for_log(hash, 16),
-        miner_id = %truncate_for_log(miner_id, 16),
-        "Downloading blob from peer miner"
-    );
-
-    // Look up peer address from cache
-    let peer_cache = get_peer_cache();
-    let peer_addr = peer_cache
-        .get(miner_id)
-        .map(|r| r.value().clone())
-        .ok_or_else(|| anyhow::anyhow!("Peer {} not in cache", truncate_for_log(miner_id, 16)))?;
-
-    // Delegate to pull_blob_from_peer which does the actual work
-    pull_blob_from_peer(store, endpoint, peer_addr, hash.to_string()).await
 }
 
 /// Handle a proof-of-storage challenge from a Warden.

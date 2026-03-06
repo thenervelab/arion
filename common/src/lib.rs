@@ -10,10 +10,12 @@
 //!
 //! # Placement Algorithm Overview
 //!
-//! Arion supports two placement versions (controlled by `FileManifest.placement_version`):
+//! Arion supports three placement versions (controlled by `FileManifest.placement_version`):
 //!
 //! - **Version 1 (legacy)**: Per-stripe CRUSH with seed = `hash(file_hash + stripe_index)`
 //! - **Version 2 (PG-based)**: File → PG mapping, then CRUSH on PG ID with stripe rotation
+//! - **Version 3 (PG+straw2)**: Same as v2 but uses Ceph-style straw2 selection for
+//!   minimal data movement on topology changes
 //!
 //! Both versions use CRUSH (Controlled Replication Under Scalable Hashing) for:
 //! - Deterministic placement (no coordination needed between nodes)
@@ -30,7 +32,10 @@
 pub mod attestation_bundle;
 pub mod merkle;
 pub mod middleware;
+#[cfg(feature = "redb")]
+pub mod redb_utils;
 pub mod stun;
+pub mod telemetry;
 pub mod tls;
 
 // Re-export attestation bundle types at crate root for convenience
@@ -116,6 +121,12 @@ pub struct MinerNode {
     /// Software version reported by the miner (e.g., "0.1.1")
     #[serde(default)]
     pub version: String,
+
+    /// Pre-reputation base weight computed by `adjust_miner_weight()`.
+    /// Stored to avoid reverse-computing from the reputation-penalized weight.
+    /// Zero means not yet computed (backward compat with old serialized maps).
+    #[serde(default)]
+    pub base_weight: u32,
 }
 
 /// Result of auditing a single shard's availability and integrity.
@@ -224,26 +235,56 @@ impl ClusterMap {
     ///
     /// Default values: epoch=0, pg_count=16384, ec_k=10, ec_m=20
     pub fn new() -> Self {
-        let backup_data_path = PathBuf::from("data/validator/cluster_map_backup.json");
+        let empty = Self {
+            epoch: 0,
+            miners: Vec::new(),
+            pg_count: default_pg_count(),
+            ec_k: default_ec_k(),
+            ec_m: default_ec_m(),
+        };
 
+        let backup_data_path = PathBuf::from("data/validator/cluster_map_backup.json");
         if !backup_data_path.exists() {
-            return Self {
-                epoch: 0,
-                miners: Vec::new(),
-                pg_count: default_pg_count(),
-                ec_k: default_ec_k(),
-                ec_m: default_ec_m(),
-            };
+            return empty;
         }
 
-        serde_json::from_str(&std::fs::read_to_string(backup_data_path).unwrap()).unwrap()
+        match std::fs::read_to_string(&backup_data_path) {
+            Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    path = %backup_data_path.display(),
+                    "Corrupt cluster_map backup, using empty default"
+                );
+                empty
+            }),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %backup_data_path.display(),
+                    "Failed to read cluster_map backup, using empty default"
+                );
+                empty
+            }
+        }
     }
 
-    /// Ensure critical placement parameters are never zero.
+    /// Ensure critical placement parameters are valid.
     /// Call after deserialization from untrusted sources.
+    ///
+    /// - Replaces zero values with defaults
+    /// - Rounds pg_count up to the next power of 2 (CRUSH distribution
+    ///   uniformity requires power-of-2 PG counts)
     pub fn ensure_defaults(&mut self) {
         if self.pg_count == 0 {
             self.pg_count = default_pg_count();
+        } else if !self.pg_count.is_power_of_two() {
+            let rounded = self.pg_count.next_power_of_two();
+            tracing::warn!(
+                original = self.pg_count,
+                rounded,
+                "pg_count must be a power of 2, rounding up"
+            );
+            self.pg_count = rounded;
         }
         if self.ec_k == 0 {
             self.ec_k = default_ec_k();
@@ -274,7 +315,7 @@ impl ClusterMap {
 /// The miner location is calculated via CRUSH at read time, not stored.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ShardInfo {
-    /// Shard index within the stripe (0 to k+m-1)
+    /// Global shard index across the file (stripe_idx * (k+m) + shard_idx_within_stripe)
     pub index: usize,
     /// BLAKE3 hash of the shard data (used for content addressing and verification)
     pub blob_hash: String,
@@ -298,6 +339,16 @@ pub struct ShardInfo {
 ///  stripe_1_shard_0, stripe_1_shard_1, ..., stripe_1_shard_{k+m-1},
 ///  ...]
 /// ```
+/// Warden PoS Commitment (shard_hash, poseidon_tree_root, miner_uid, size, address)
+pub type ShardCommitment = (String, [u32; 8], u32, u32, iroh::EndpointAddr);
+
+/// Payload sent from the Gateway to the Validator upon successful upload distribution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadFinalizeRequest {
+    pub manifest: FileManifest,
+    pub warden_commitments: Vec<ShardCommitment>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FileManifest {
     /// BLAKE3 hash of the original file (64 hex characters)
@@ -305,6 +356,7 @@ pub struct FileManifest {
     /// Placement algorithm version for shard location calculation:
     /// - 1: legacy per-stripe CRUSH (seed = hash(file_hash + stripe_index))
     /// - 2: PG-based placement (file → PG → CRUSH with stripe rotation)
+    /// - 3: PG-based placement with straw2 selection (minimal data movement)
     #[serde(default = "default_manifest_placement_version")]
     pub placement_version: u8,
     /// Cluster map epoch when file was originally distributed.
@@ -353,14 +405,18 @@ impl FileManifest {
 ///
 /// # Default Configuration
 ///
-/// - `size`: 2 MiB per stripe
+/// - `size`: 8 MiB per stripe
 /// - `k`: 10 data shards
 /// - `m`: 20 parity shards
 ///
 /// This provides 66% fault tolerance (can lose 20 of 30 shards and still reconstruct).
+///
+/// StripeConfig is intentionally hardcoded (k=10, m=20, stripe_size=8MiB).
+/// The manifest records the actual config used at upload time, enabling
+/// future changes without breaking existing files.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct StripeConfig {
-    /// Stripe size in bytes (default: 2 MiB)
+    /// Stripe size in bytes (default: 8 MiB)
     pub size: u64,
     /// Number of data shards (minimum shards needed for reconstruction)
     pub k: usize,
@@ -371,7 +427,7 @@ pub struct StripeConfig {
 impl Default for StripeConfig {
     fn default() -> Self {
         Self {
-            size: 2 * 1024 * 1024,
+            size: 8 * 1024 * 1024,
             k: 10,
             m: 20,
         }
@@ -414,24 +470,15 @@ impl StripeConfig {
 /// Messages sent via the `hippius/miner-control` P2P protocol.
 ///
 /// Used for Validator → Miner and Gateway → Miner communication.
-/// Sent over Iroh QUIC connections with bincode serialization.
+/// Sent over Iroh QUIC connections with JSON serialization (serde_json).
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum MinerControlMessage {
-    /// Store a shard (push from validator or pull from peer)
-    Store {
-        /// BLAKE3 hash of the shard data
-        hash: String,
-        /// For push (validator → miner): Some(blob_data)
-        /// For pull (miner → miner): None
-        data: Option<Vec<u8>>,
-        /// For pull: Some(source_miner_id)
-        /// For push: None
-        source_miner: Option<String>,
-    },
     /// Delete a shard by hash
     Delete {
         /// BLAKE3 hash of the shard to delete
         hash: String,
+        /// Ed25519 signature from the Validator (or authorized Gateway) over `"DELETE:{hash}"`
+        validator_signature: Vec<u8>,
     },
     /// Fetch a blob by hash (Gateway → Miner)
     FetchBlob {
@@ -449,18 +496,6 @@ pub enum MinerControlMessage {
         /// Authorized warden node IDs for PoS challenge authorization (auto-distributed by validator)
         #[serde(default)]
         warden_node_ids: Option<Vec<String>>,
-    },
-    /// Query files in a Placement Group (Miner → Validator)
-    QueryPgFiles {
-        /// Placement Group ID to query
-        pg_id: u32,
-    },
-    /// Response containing files in a Placement Group
-    PgFilesResponse {
-        /// Placement Group ID this response is for
-        pg_id: u32,
-        /// List of file hashes belonging to this PG
-        files: Vec<String>,
     },
     /// Instruct miner to pull a blob from a peer via Iroh P2P
     PullFromPeer {
@@ -491,6 +526,8 @@ pub enum MinerControlMessage {
         /// Length of raw blob data that follows this header on the stream.
         /// Uses u64 for platform-independent wire format.
         data_len: u64,
+        /// Ed25519 signature from the Validator (or authorized Gateway) over `"UPLOAD:{hash}"`
+        validator_signature: Vec<u8>,
     },
     /// Lightweight metadata-only existence check for a shard.
     /// Returns `HAS:true` or `HAS:false` without reading blob data.
@@ -762,6 +799,9 @@ pub fn calculate_placement_for_stripe(
         let base_per_family = count / num_families;
         let remainder = count % num_families;
 
+        // Track how many miners were taken from each family
+        let mut taken_per_family = vec![0usize; num_families];
+
         for (idx, family_id) in selected_families.iter().enumerate() {
             let miners_in_family = &families[family_id];
 
@@ -777,10 +817,41 @@ pub fn calculate_placement_for_stripe(
             let miners_from_family =
                 select_weighted_miners_from_family(miners_in_family, to_take, family_input, map)?;
 
+            taken_per_family[idx] = miners_from_family.len();
             selected_miners.extend(miners_from_family);
+        }
 
-            if selected_miners.len() >= count {
-                break;
+        // Second pass: redistribute unfilled slots to families
+        // with remaining capacity.
+        if selected_miners.len() < count {
+            let mut shortfall = count - selected_miners.len();
+            let pass_seed = input.wrapping_add(num_families as u64);
+
+            for (idx, family_id) in selected_families.iter().enumerate() {
+                if shortfall == 0 {
+                    break;
+                }
+                let miners_in_family = &families[family_id];
+                let remaining = miners_in_family.len() - taken_per_family[idx];
+                if remaining == 0 {
+                    continue;
+                }
+                let extra = remaining.min(shortfall);
+
+                let taken_uids: std::collections::HashSet<u32> =
+                    selected_miners.iter().map(|m| m.uid).collect();
+                let available: Vec<(usize, &MinerNode)> = miners_in_family
+                    .iter()
+                    .filter(|(i, _)| !taken_uids.contains(&map.miners[*i].uid))
+                    .copied()
+                    .collect();
+
+                let family_input = pass_seed.wrapping_add(idx as u64);
+                let extra_miners =
+                    select_weighted_miners_from_family(&available, extra, family_input, map)?;
+                taken_per_family[idx] += extra_miners.len();
+                shortfall -= extra_miners.len();
+                selected_miners.extend(extra_miners);
             }
         }
 
@@ -921,6 +992,429 @@ fn select_weighted_miners_from_family(
     }
 
     Ok(selected)
+}
+
+// ============================================================================
+// Straw2 Selection (placement_version=3)
+// ============================================================================
+//
+// Ceph-style straw2 selection for minimal data movement on topology changes.
+// Each candidate computes an independent "draw" value; the max draw wins.
+// Adding or removing a candidate only affects selections where that
+// candidate would have won — all other placements remain stable.
+
+/// Compute a straw2 draw for a single candidate.
+///
+/// Uses the Ceph straw2 formula: `ln(hash / 65536) / weight`.
+/// Higher weight → less negative draw → more likely to win.
+/// Zero-weight candidates get `-INFINITY` (never selected).
+fn straw2_draw(seed: u64, id: u32, weight: u64) -> f64 {
+    if weight == 0 {
+        return f64::NEG_INFINITY;
+    }
+    let mut hasher = xxh3::Xxh3::new();
+    hasher.write_u64(seed);
+    hasher.write_u32(id);
+    let hash = hasher.finish();
+    // Map to (0, 1) range — +1 avoids ln(0), +1 in denominator keeps range < 1
+    let u = ((hash & 0xFFFF) as f64 + 1.0) / 65537.0;
+    // Use libm::log for cross-platform determinism (f64::ln() is
+    // platform-dependent and may produce different results on different
+    // CPU architectures).
+    libm::log(u) / (weight as f64)
+}
+
+/// Select one item from candidates using straw2 (max-draw-wins).
+///
+/// Returns the index into `candidates` of the winner.
+/// Each candidate's draw is independent of all other candidates.
+fn straw2_select_one(candidates: &[(u32, u64)], seed: u64) -> Result<usize, String> {
+    if candidates.is_empty() {
+        return Err("straw2: empty candidate list".to_string());
+    }
+    if candidates.iter().all(|(_, w)| *w == 0) {
+        return Err("straw2: all candidates have zero weight".to_string());
+    }
+
+    let mut best_idx = 0;
+    let mut best_draw = f64::NEG_INFINITY;
+    for (idx, (id, weight)) in candidates.iter().enumerate() {
+        let draw = straw2_draw(seed, *id, *weight);
+        if draw > best_draw {
+            best_draw = draw;
+            best_idx = idx;
+        }
+    }
+    Ok(best_idx)
+}
+
+/// Selects families using straw2 for minimal data movement.
+///
+/// Each family's "id" for straw2 is a hash of its family_id string,
+/// ensuring deterministic draws regardless of HashMap iteration order.
+fn select_straw2_families<'a>(
+    families: &'a HashMap<&'a str, Vec<(usize, &MinerNode)>>,
+    count: usize,
+    seed: u64,
+) -> Result<Vec<&'a str>, String> {
+    // Build sorted candidate list: (family_hash_id, family_id_str, weight)
+    let mut candidates: Vec<(u32, &str, u64)> = families
+        .iter()
+        .map(|(fid, miners)| {
+            let total_weight: u64 = miners.iter().map(|(_, m)| m.weight as u64).sum();
+            // Hash family_id to a stable u32 for straw2_draw
+            let mut h = xxh3::Xxh3::new();
+            h.write(fid.as_bytes());
+            let fid_hash = h.finish() as u32;
+            (fid_hash, *fid, total_weight)
+        })
+        .collect();
+
+    // Sort by family_id for determinism
+    candidates.sort_by(|a, b| a.1.cmp(b.1));
+
+    let mut selected = Vec::with_capacity(count);
+    let iterations = count.min(candidates.len());
+
+    for round in 0..iterations {
+        if candidates.iter().all(|(_, _, w)| *w == 0) {
+            break;
+        }
+
+        // Each round uses a different seed
+        let round_seed = seed.wrapping_add(round as u64);
+        let draw_candidates: Vec<(u32, u64)> =
+            candidates.iter().map(|(id, _, w)| (*id, *w)).collect();
+
+        let winner = straw2_select_one(&draw_candidates, round_seed)?;
+
+        let (_, family_id, _) = candidates.remove(winner);
+        selected.push(family_id);
+    }
+
+    Ok(selected)
+}
+
+/// Selects miners from a single family using straw2.
+fn select_straw2_miners_from_family(
+    miners_in_family: &[(usize, &MinerNode)],
+    count: usize,
+    seed: u64,
+    map: &ClusterMap,
+) -> Result<Vec<MinerNode>, String> {
+    let mut available: Vec<(usize, u32, u64)> = miners_in_family
+        .iter()
+        .map(|(idx, m)| (*idx, m.uid, m.weight as u64))
+        .collect();
+
+    if available.iter().any(|(idx, _, _)| *idx >= map.miners.len()) {
+        return Err("Invalid miner index in family".to_string());
+    }
+
+    // Sort by UID for determinism
+    available.sort_by_key(|(_, uid, _)| *uid);
+
+    let mut selected = Vec::new();
+
+    for round in 0..count.min(available.len()) {
+        if available.iter().all(|(_, _, w)| *w == 0) {
+            break;
+        }
+
+        let round_seed = seed.wrapping_add(round as u64);
+        let draw_candidates: Vec<(u32, u64)> =
+            available.iter().map(|(_, uid, w)| (*uid, *w)).collect();
+
+        let winner = straw2_select_one(&draw_candidates, round_seed)?;
+
+        let (miner_idx, _, _) = available.remove(winner);
+        selected.push(map.miners[miner_idx].clone());
+    }
+
+    Ok(selected)
+}
+
+/// UID-only straw2 miner selection (no MinerNode cloning).
+fn select_straw2_miner_uids(
+    miners_in_family: &[(usize, &MinerNode)],
+    count: usize,
+    seed: u64,
+    map: &ClusterMap,
+) -> Result<Vec<u32>, String> {
+    let mut available: Vec<(usize, u32, u64)> = miners_in_family
+        .iter()
+        .map(|(idx, m)| (*idx, m.uid, m.weight as u64))
+        .collect();
+
+    if available.iter().any(|(idx, _, _)| *idx >= map.miners.len()) {
+        return Err("Invalid miner index in family".to_string());
+    }
+
+    available.sort_by_key(|(_, uid, _)| *uid);
+
+    let mut selected = Vec::with_capacity(count);
+
+    for round in 0..count.min(available.len()) {
+        if available.iter().all(|(_, _, w)| *w == 0) {
+            break;
+        }
+
+        let round_seed = seed.wrapping_add(round as u64);
+        let draw_candidates: Vec<(u32, u64)> =
+            available.iter().map(|(_, uid, w)| (*uid, *w)).collect();
+
+        let winner = straw2_select_one(&draw_candidates, round_seed)?;
+
+        let (miner_idx, _, _) = available.remove(winner);
+        selected.push(map.miners[miner_idx].uid);
+    }
+
+    Ok(selected)
+}
+
+/// CRUSH placement with straw2 selection (placement_version=3).
+///
+/// Same family-diversity logic as v1/v2, but uses straw2 max-draw selection
+/// instead of cumulative-weight selection. This minimizes data movement
+/// when miners join or leave the cluster.
+pub fn calculate_placement_for_stripe_straw2(
+    file_hash: &str,
+    stripe_index: u64,
+    count: usize,
+    map: &ClusterMap,
+) -> Result<Vec<MinerNode>, String> {
+    if map.miners.len() < count {
+        return Err(format!(
+            "Insufficient cluster capacity: need {} miners with space, have {}",
+            count,
+            map.miners.len()
+        ));
+    }
+
+    let mut hasher = xxh3::Xxh3::new();
+    hasher.write(file_hash.as_bytes());
+    hasher.write_u64(stripe_index);
+    let input = hasher.finish();
+
+    let mut families: HashMap<&str, Vec<(usize, &MinerNode)>> = HashMap::new();
+    for (idx, miner) in map.miners.iter().enumerate() {
+        families
+            .entry(miner.family_id.as_str())
+            .or_default()
+            .push((idx, miner));
+    }
+    for miners in families.values_mut() {
+        miners.sort_by_key(|(_, m)| m.uid);
+    }
+
+    let num_families = families.len();
+
+    if num_families >= count {
+        let selected_families = select_straw2_families(&families, count, input)?;
+        let mut selected_miners = Vec::new();
+
+        for (idx, family_id) in selected_families.iter().enumerate() {
+            let miners_in_family = &families[family_id];
+            let family_input = input.wrapping_add(idx as u64);
+            let miners = select_straw2_miners_from_family(miners_in_family, 1, family_input, map)?;
+            selected_miners.extend(miners);
+        }
+
+        if selected_miners.len() != count {
+            return Err(format!(
+                "Placement failed: needed {} miners but selected {} (zero-weight families?)",
+                count,
+                selected_miners.len()
+            ));
+        }
+        Ok(selected_miners)
+    } else {
+        let selected_families = select_straw2_families(&families, num_families, input)?;
+        let mut selected_miners = Vec::new();
+        let base_per_family = count / num_families;
+        let remainder = count % num_families;
+
+        let mut taken_per_family = vec![0usize; num_families];
+
+        for (idx, family_id) in selected_families.iter().enumerate() {
+            let miners_in_family = &families[family_id];
+            let to_take = if idx < remainder {
+                base_per_family + 1
+            } else {
+                base_per_family
+            }
+            .min(miners_in_family.len());
+
+            let family_input = input.wrapping_add(idx as u64);
+            let miners =
+                select_straw2_miners_from_family(miners_in_family, to_take, family_input, map)?;
+            taken_per_family[idx] = miners.len();
+            selected_miners.extend(miners);
+        }
+
+        // Second pass: redistribute unfilled slots to families
+        // with remaining capacity.
+        if selected_miners.len() < count {
+            let mut shortfall = count - selected_miners.len();
+            let pass_seed = input.wrapping_add(num_families as u64);
+
+            for (idx, family_id) in selected_families.iter().enumerate() {
+                if shortfall == 0 {
+                    break;
+                }
+                let miners_in_family = &families[family_id];
+                let remaining = miners_in_family.len() - taken_per_family[idx];
+                if remaining == 0 {
+                    continue;
+                }
+                let extra = remaining.min(shortfall);
+
+                let taken_uids: std::collections::HashSet<u32> =
+                    selected_miners.iter().map(|m| m.uid).collect();
+                let available: Vec<(usize, &MinerNode)> = miners_in_family
+                    .iter()
+                    .filter(|(i, _)| !taken_uids.contains(&map.miners[*i].uid))
+                    .copied()
+                    .collect();
+
+                let family_input = pass_seed.wrapping_add(idx as u64);
+                let extra_miners =
+                    select_straw2_miners_from_family(&available, extra, family_input, map)?;
+                taken_per_family[idx] += extra_miners.len();
+                shortfall -= extra_miners.len();
+                selected_miners.extend(extra_miners);
+            }
+        }
+
+        selected_miners.truncate(count);
+
+        if selected_miners.len() < count {
+            return Err(format!(
+                "Placement failed: needed {} miners but only selected {}",
+                count,
+                selected_miners.len()
+            ));
+        }
+        Ok(selected_miners)
+    }
+}
+
+/// UID-only straw2 placement (no MinerNode cloning).
+fn placement_uids_for_stripe_straw2(
+    file_hash: &str,
+    stripe_index: u64,
+    count: usize,
+    map: &ClusterMap,
+) -> Result<Vec<u32>, String> {
+    if map.miners.len() < count {
+        return Err(format!(
+            "Insufficient cluster capacity: need {} miners, have {}",
+            count,
+            map.miners.len()
+        ));
+    }
+
+    let mut hasher = xxh3::Xxh3::new();
+    hasher.write(file_hash.as_bytes());
+    hasher.write_u64(stripe_index);
+    let input = hasher.finish();
+
+    let mut families: HashMap<&str, Vec<(usize, &MinerNode)>> = HashMap::new();
+    for (idx, miner) in map.miners.iter().enumerate() {
+        families
+            .entry(miner.family_id.as_str())
+            .or_default()
+            .push((idx, miner));
+    }
+    for miners in families.values_mut() {
+        miners.sort_by_key(|(_, m)| m.uid);
+    }
+
+    let num_families = families.len();
+
+    if num_families >= count {
+        let selected_families = select_straw2_families(&families, count, input)?;
+        let mut uids = Vec::with_capacity(count);
+        for (idx, family_id) in selected_families.iter().enumerate() {
+            let miners_in_family = &families[family_id];
+            let family_input = input.wrapping_add(idx as u64);
+            let miner_uids = select_straw2_miner_uids(miners_in_family, 1, family_input, map)?;
+            uids.extend(miner_uids);
+        }
+        if uids.len() != count {
+            return Err(format!(
+                "Placement failed: needed {} miners but selected {}",
+                count,
+                uids.len()
+            ));
+        }
+        Ok(uids)
+    } else {
+        let selected_families = select_straw2_families(&families, num_families, input)?;
+        let mut uids = Vec::with_capacity(count);
+        let base_per_family = count / num_families;
+        let remainder = count % num_families;
+
+        let mut taken_per_family = vec![0usize; num_families];
+
+        for (idx, family_id) in selected_families.iter().enumerate() {
+            let miners_in_family = &families[family_id];
+            let to_take = if idx < remainder {
+                base_per_family + 1
+            } else {
+                base_per_family
+            }
+            .min(miners_in_family.len());
+
+            let family_input = input.wrapping_add(idx as u64);
+            let miner_uids =
+                select_straw2_miner_uids(miners_in_family, to_take, family_input, map)?;
+            taken_per_family[idx] = miner_uids.len();
+            uids.extend(miner_uids);
+        }
+
+        // Second pass: redistribute unfilled slots to families
+        // with remaining capacity.
+        if uids.len() < count {
+            let mut shortfall = count - uids.len();
+            let pass_seed = input.wrapping_add(num_families as u64);
+
+            for (idx, family_id) in selected_families.iter().enumerate() {
+                if shortfall == 0 {
+                    break;
+                }
+                let miners_in_family = &families[family_id];
+                let remaining = miners_in_family.len() - taken_per_family[idx];
+                if remaining == 0 {
+                    continue;
+                }
+                let extra = remaining.min(shortfall);
+
+                let taken_uids: std::collections::HashSet<u32> = uids.iter().copied().collect();
+                let available: Vec<(usize, &MinerNode)> = miners_in_family
+                    .iter()
+                    .filter(|(i, _)| !taken_uids.contains(&map.miners[*i].uid))
+                    .copied()
+                    .collect();
+
+                let family_input = pass_seed.wrapping_add(idx as u64);
+                let extra_uids = select_straw2_miner_uids(&available, extra, family_input, map)?;
+                taken_per_family[idx] += extra_uids.len();
+                shortfall -= extra_uids.len();
+                uids.extend(extra_uids);
+            }
+        }
+
+        uids.truncate(count);
+        if uids.len() < count {
+            return Err(format!(
+                "Placement failed: needed {} miners but only selected {}",
+                count,
+                uids.len()
+            ));
+        }
+        Ok(uids)
+    }
 }
 
 // ============================================================================
@@ -1241,6 +1735,25 @@ pub struct WardenShardCommitment {
 // P2P Protocol Constants (Hybrid Migration)
 // ============================================================================
 
+/// ALPN protocol identifier for Validator/Gateway/Warden → Miner P2P communication.
+///
+/// Used for:
+/// - Shard storage (StoreV2), deletion, and existence checks
+/// - Blob fetching (FetchBlob) by gateways and peer miners
+/// - Peer-to-peer shard migration (PullFromPeer)
+/// - Cluster map broadcasts
+/// - Proof-of-storage challenges from wardens
+pub const MINER_CONTROL_ALPN: &[u8] = b"hippius/miner-control";
+
+/// ALPN protocol identifier for Miner → Validator P2P communication.
+///
+/// Used for:
+/// - Miner registration and heartbeats
+/// - Placement group file queries
+/// - Manifest retrieval
+/// - Ping/health checks
+pub const VALIDATOR_CONTROL_ALPN: &[u8] = b"hippius/validator-control";
+
 /// ALPN protocol identifier for Gateway ↔ Validator P2P communication.
 ///
 /// Used for internal cluster communication including:
@@ -1274,7 +1787,7 @@ pub const SUBMITTER_CONTROL_ALPN: &[u8] = b"hippius/submitter-control";
 /// - GET /map → `GetClusterMap` / `GetClusterMapEpoch`
 /// - GET /manifest/{hash} → `GetManifest`
 /// - POST /upload → `UploadFile`
-/// - DELETE /blobs/{hash} → `DeleteFile`
+/// - DELETE /blobs/{hash} → `DeleteFile` (passing validator signature)
 /// - POST /stats/bandwidth → `ReportBandwidth`
 /// - POST /stats/failures → `ReportFailures`
 /// - POST /repair_hint → `RepairHint`
@@ -1322,6 +1835,8 @@ pub enum GatewayControlMessage {
     DeleteFile {
         /// BLAKE3 hash of the file to delete
         file_hash: String,
+        /// Ed25519 signature from the Validator (or authorized Gateway) over `"DELETE:{hash}"`
+        validator_signature: Vec<u8>,
     },
 
     /// Report bandwidth statistics from gateway
@@ -1503,6 +2018,11 @@ pub enum SubmitterControlMessage {
         miner_stats: HashMap<String, [u64; 2]>,
         /// Per-miner bandwidth stats: miner_uid -> bytes_served
         bandwidth_stats: HashMap<String, u64>,
+        /// Whether the stats cache has been populated at least once.
+        /// `false` when the validator is still warming up and the
+        /// response contains default zeros rather than real data.
+        #[serde(default)]
+        is_ready: bool,
     },
 
     // ========================================
@@ -1562,6 +2082,13 @@ pub enum SubmitterControlMessage {
 /// Uses `DefaultHasher` with the `Hash` trait, matching the UID
 /// computation in deployed miners. Truncated to 31 bits to fit
 /// in i32 range.
+///
+/// STABILITY: `DefaultHasher` is `SipHash-1-3` with keys `(0,0)`,
+/// stable since Rust 1.36 (2019). UIDs are persisted in redb,
+/// on-chain, attestation signatures, and warden state. DO NOT
+/// change this hash function without a coordinated cluster-wide
+/// migration. All nodes must use the same Rust toolchain to
+/// guarantee identical UIDs.
 pub fn compute_miner_uid(public_key: &str) -> u32 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1585,16 +2112,16 @@ pub fn compute_miner_uid(public_key: &str) -> u32 {
 /// * `pg_count` - Total number of placement groups (default: 16384)
 ///
 /// # Returns
-/// PG ID in range [0, pg_count). Returns 0 if pg_count is 0.
-pub fn calculate_pg(file_hash: &str, pg_count: u32) -> u32 {
-    // Guard against division by zero
+/// - `Ok(pg_id)` — PG ID in range [0, pg_count)
+/// - `Err` if pg_count is 0
+pub fn calculate_pg(file_hash: &str, pg_count: u32) -> Result<u32, String> {
     if pg_count == 0 {
-        return 0;
+        return Err("calculate_pg: pg_count must be > 0".to_string());
     }
     let mut hasher = xxh3::Xxh3::new();
     hasher.write(file_hash.as_bytes());
     // Perform modulo before truncation to preserve full 64-bit entropy
-    (hasher.finish() % (pg_count as u64)) as u32
+    Ok((hasher.finish() % (pg_count as u64)) as u32)
 }
 
 /// Calculate which miners are responsible for a Placement Group.
@@ -1647,7 +2174,7 @@ pub fn calculate_pg_placement_for_stripe(
     shards_per_stripe: usize,
     map: &ClusterMap,
 ) -> Result<Vec<MinerNode>, String> {
-    let pg_id = calculate_pg(file_hash, map.pg_count);
+    let pg_id = calculate_pg(file_hash, map.pg_count)?;
     let mut miners = calculate_pg_placement(pg_id, shards_per_stripe, map)?;
 
     if miners.is_empty() {
@@ -1655,6 +2182,38 @@ pub fn calculate_pg_placement_for_stripe(
     }
 
     // Rotate miner list by stripe_index for per-stripe spreading
+    let len = miners.len();
+    miners.rotate_left((stripe_index as usize) % len);
+    Ok(miners)
+}
+
+/// PG placement using straw2 selection (placement_version=3).
+pub fn calculate_pg_placement_straw2(
+    pg_id: u32,
+    shards_per_file: usize,
+    map: &ClusterMap,
+) -> Result<Vec<MinerNode>, String> {
+    let pg_seed = format!("pg:{}", pg_id);
+    calculate_placement_for_stripe_straw2(&pg_seed, 0, shards_per_file, map)
+}
+
+/// PG-based stripe placement with straw2 selection (placement_version=3).
+///
+/// Same PG mapping and stripe rotation as v2, but uses straw2 selection
+/// for minimal data movement on topology changes.
+pub fn calculate_pg_placement_for_stripe_straw2(
+    file_hash: &str,
+    stripe_index: u64,
+    shards_per_stripe: usize,
+    map: &ClusterMap,
+) -> Result<Vec<MinerNode>, String> {
+    let pg_id = calculate_pg(file_hash, map.pg_count)?;
+    let mut miners = calculate_pg_placement_straw2(pg_id, shards_per_stripe, map)?;
+
+    if miners.is_empty() {
+        return Err("No miners available for stripe placement".to_string());
+    }
+
     let len = miners.len();
     miners.rotate_left((stripe_index as usize) % len);
     Ok(miners)
@@ -1670,7 +2229,7 @@ pub fn calculate_pg_placement_for_stripe(
 /// * `stripe_index` - Zero-based stripe index
 /// * `shards_per_stripe` - Number of shards per stripe (k + m)
 /// * `map` - Current cluster map
-/// * `placement_version` - Algorithm version (1=legacy, 2=PG-based)
+/// * `placement_version` - Algorithm version (1=legacy, 2=PG-based, 3=PG+straw2)
 ///
 /// # Returns
 /// - `Ok(Vec<MinerNode>)` with miners for this stripe
@@ -1683,6 +2242,12 @@ pub fn calculate_stripe_placement(
     placement_version: u8,
 ) -> Result<Vec<MinerNode>, String> {
     match placement_version {
+        3 => calculate_pg_placement_for_stripe_straw2(
+            file_hash,
+            stripe_index,
+            shards_per_stripe,
+            map,
+        ),
         2 => calculate_pg_placement_for_stripe(file_hash, stripe_index, shards_per_stripe, map),
         _ => calculate_placement_for_stripe(file_hash, stripe_index, shards_per_stripe, map),
     }
@@ -1752,6 +2317,9 @@ fn placement_uids_for_stripe(
         let base_per_family = count / num_families;
         let remainder = count % num_families;
 
+        // Track how many miners were taken from each family
+        let mut taken_per_family = vec![0usize; num_families];
+
         for (idx, family_id) in selected_families.iter().enumerate() {
             let miners_in_family = &families[family_id];
             let to_take = if idx < remainder {
@@ -1764,11 +2332,45 @@ fn placement_uids_for_stripe(
             let family_input = input.wrapping_add(idx as u64);
             let miner_uids =
                 select_weighted_miner_uids(miners_in_family, to_take, family_input, map)?;
+            taken_per_family[idx] = miner_uids.len();
             uids.extend(miner_uids);
-            if uids.len() >= count {
-                break;
+        }
+
+        // Second pass: redistribute unfilled slots to families
+        // with remaining capacity.
+        if uids.len() < count {
+            let mut shortfall = count - uids.len();
+            // Use a different seed offset to avoid repeating
+            // the same selection pattern.
+            let pass_seed = input.wrapping_add(num_families as u64);
+
+            for (idx, family_id) in selected_families.iter().enumerate() {
+                if shortfall == 0 {
+                    break;
+                }
+                let miners_in_family = &families[family_id];
+                let remaining = miners_in_family.len() - taken_per_family[idx];
+                if remaining == 0 {
+                    continue;
+                }
+                let extra = remaining.min(shortfall);
+
+                // Build available list excluding already-taken miners
+                let taken_uids: std::collections::HashSet<u32> = uids.iter().copied().collect();
+                let available: Vec<(usize, &MinerNode)> = miners_in_family
+                    .iter()
+                    .filter(|(i, _)| !taken_uids.contains(&map.miners[*i].uid))
+                    .copied()
+                    .collect();
+
+                let family_input = pass_seed.wrapping_add(idx as u64);
+                let extra_uids = select_weighted_miner_uids(&available, extra, family_input, map)?;
+                taken_per_family[idx] += extra_uids.len();
+                shortfall -= extra_uids.len();
+                uids.extend(extra_uids);
             }
         }
+
         uids.truncate(count);
         if uids.len() < count {
             return Err(format!(
@@ -1833,6 +2435,16 @@ pub fn calculate_pg_placement_uids(
     placement_uids_for_stripe(&pg_seed, 0, shards_per_file, map)
 }
 
+/// PG-based UID-only placement using straw2 selection (placement_version=3).
+pub fn calculate_pg_placement_uids_straw2(
+    pg_id: u32,
+    shards_per_file: usize,
+    map: &ClusterMap,
+) -> Result<Vec<u32>, String> {
+    let pg_seed = format!("pg:{}", pg_id);
+    placement_uids_for_stripe_straw2(&pg_seed, 0, shards_per_file, map)
+}
+
 /// Calculate which Placement Groups a miner is responsible for.
 ///
 /// Used by miners during self-rebalancing to discover their workload.
@@ -1856,9 +2468,13 @@ pub fn calculate_my_pgs(miner_uid: u32, map: &ClusterMap) -> Vec<u32> {
 
     (0..map.pg_count)
         .filter(|&pg_id| {
-            calculate_pg_placement(pg_id, shards_per_file, map)
+            let v2_match = calculate_pg_placement(pg_id, shards_per_file, map)
                 .map(|miners| miners.iter().any(|m| m.uid == miner_uid))
-                .unwrap_or(false)
+                .unwrap_or(false);
+            let v3_match = calculate_pg_placement_straw2(pg_id, shards_per_file, map)
+                .map(|miners| miners.iter().any(|m| m.uid == miner_uid))
+                .unwrap_or(false);
+            v2_match || v3_match
         })
         .collect()
 }
@@ -2120,9 +2736,9 @@ pub fn calculate_uptime_score(
 pub const DEFAULT_AUDIT_EPOCH_SECS: u64 = 3600;
 
 /// Default number of shards to sample per miner per epoch.
-/// With 50 shards per miner and max_shards=50,000, supports up to 1000 miners.
-/// Lower shard count per miner = more miners supported on the network.
-pub const DEFAULT_SHARDS_PER_MINER_PER_EPOCH: usize = 50;
+/// With 100 shards per miner and max_shards=1,000,000, a 100-miner cluster
+/// gets ~1% audit coverage per hour. Higher value = better per-miner coverage.
+pub const DEFAULT_SHARDS_PER_MINER_PER_EPOCH: usize = 100;
 
 /// Calculate the current epoch number from a timestamp.
 ///
@@ -2242,6 +2858,63 @@ pub fn sample_indices(seed: &[u8; 32], total: usize, sample_size: usize) -> Vec<
 }
 
 // ============================================================================
+// PoS Commitment Selection
+// ============================================================================
+
+/// Minimum number of shards to generate PoS commitments for per file.
+pub const MIN_COMMITMENTS_PER_FILE: usize = 3;
+
+/// Target number of commitments for a 1 GB file (3840 shards at 8 MiB stripes).
+pub const COMMITMENT_TARGET_PER_GB_SHARDS: usize = 100;
+
+/// Number of shards in a 1 GB file (128 stripes * 30 shards/stripe).
+pub const SHARDS_PER_GB: usize = 3840;
+
+/// Calculate how many shards should have PoS commitments generated for a file.
+///
+/// Uses a linear scaling formula: `min(total_shards, max(3, ceil(total * 100 / 3840)))`.
+/// This gives ~3 for tiny files, ~100 for 1 GB, and scales proportionally beyond.
+pub fn calculate_commitment_count(total_shards: usize) -> usize {
+    if total_shards == 0 {
+        return 0;
+    }
+    let scaled = total_shards
+        .saturating_mul(COMMITMENT_TARGET_PER_GB_SHARDS)
+        .div_ceil(SHARDS_PER_GB);
+    total_shards.min(scaled.max(MIN_COMMITMENTS_PER_FILE))
+}
+
+/// Produce a deterministic 32-byte seed for commitment shard selection.
+///
+/// Uses BLAKE3 with a distinct domain separator so the same file always
+/// selects the same shards, independent of epoch or validator identity.
+pub fn commitment_selection_seed(file_hash: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ARION_COMMITMENT_SELECTION_V1");
+    hasher.update(file_hash.as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// Select which shard indices should have PoS commitments generated.
+///
+/// Returns a `HashSet` for O(1) lookup in the hot path. The selection is
+/// deterministic: the same file hash and total shard count always produce
+/// the same set of indices.
+pub fn select_commitment_indices(
+    file_hash: &str,
+    total_shards: usize,
+) -> std::collections::HashSet<usize> {
+    let count = calculate_commitment_count(total_shards);
+    if count == 0 {
+        return std::collections::HashSet::new();
+    }
+    let seed = commitment_selection_seed(file_hash);
+    sample_indices(&seed, total_shards, count)
+        .into_iter()
+        .collect()
+}
+
+// ============================================================================
 // P2P Message Size Constants
 // ============================================================================
 
@@ -2261,7 +2934,7 @@ pub const P2P_MAX_UPLOAD_SIZE: usize = 100 * 1024 * 1024;
 pub const P2P_DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Default connection TTL for P2P connection pooling in seconds.
-pub const P2P_CONNECTION_TTL_SECS: u64 = 60;
+pub const P2P_CONNECTION_TTL_SECS: u64 = 120;
 
 /// Timeout for the write+flush phase of `p2p_send_response` in seconds.
 /// 30s matches the QUIC idle timeout default and is generous enough for large
@@ -2529,6 +3202,12 @@ impl P2pConnectionManager {
             known_addrs: vec![],
             relay_url: None,
         }
+    }
+
+    /// Override the connection TTL (default: `P2P_CONNECTION_TTL_SECS`).
+    pub fn with_connection_ttl(mut self, secs: u64) -> Self {
+        self.connection_ttl_secs = secs;
+        self
     }
 
     /// Seed known direct socket addresses for the target node.
@@ -3025,6 +3704,7 @@ mod tests {
             total_files: 100,
             miner_stats,
             bandwidth_stats,
+            is_ready: true,
         };
         let bytes = serde_json::to_vec(&response).unwrap();
         let decoded: SubmitterControlMessage = serde_json::from_slice(&bytes).unwrap();
@@ -3033,10 +3713,12 @@ mod tests {
                 total_files,
                 miner_stats,
                 bandwidth_stats,
+                is_ready,
             } => {
                 assert_eq!(total_files, 100);
                 assert_eq!(miner_stats.get("42"), Some(&[1024u64, 10u64]));
                 assert_eq!(bandwidth_stats.get("42"), Some(&2048u64));
+                assert!(is_ready);
             }
             _ => panic!("Wrong variant"),
         }
@@ -3139,6 +3821,32 @@ mod tests {
     }
 
     #[test]
+    fn test_ensure_defaults_rounds_pg_count_to_power_of_two() {
+        let mut map = ClusterMap {
+            epoch: 1,
+            miners: vec![],
+            pg_count: 15000,
+            ec_k: 10,
+            ec_m: 20,
+        };
+        map.ensure_defaults();
+        assert_eq!(map.pg_count, 16384); // next power of 2 above 15000
+    }
+
+    #[test]
+    fn test_ensure_defaults_preserves_power_of_two_pg_count() {
+        let mut map = ClusterMap {
+            epoch: 1,
+            miners: vec![],
+            pg_count: 4096,
+            ec_k: 10,
+            ec_m: 20,
+        };
+        map.ensure_defaults();
+        assert_eq!(map.pg_count, 4096);
+    }
+
+    #[test]
     fn test_calculate_uptime_score() {
         // New miner (< 60s elapsed) gets perfect score
         assert_eq!(calculate_uptime_score(0, 1000, 1050), 1.0);
@@ -3162,11 +3870,15 @@ mod tests {
     #[test]
     fn test_alpn_constants() {
         // Verify ALPN constants are valid byte strings
+        assert_eq!(VALIDATOR_CONTROL_ALPN, b"hippius/validator-control");
         assert_eq!(GATEWAY_CONTROL_ALPN, b"hippius/gateway-control");
         assert_eq!(WARDEN_CONTROL_ALPN, b"hippius/warden-control");
         assert_eq!(SUBMITTER_CONTROL_ALPN, b"hippius/submitter-control");
 
         // Verify they are distinct
+        assert_ne!(VALIDATOR_CONTROL_ALPN, GATEWAY_CONTROL_ALPN);
+        assert_ne!(VALIDATOR_CONTROL_ALPN, WARDEN_CONTROL_ALPN);
+        assert_ne!(VALIDATOR_CONTROL_ALPN, SUBMITTER_CONTROL_ALPN);
         assert_ne!(GATEWAY_CONTROL_ALPN, WARDEN_CONTROL_ALPN);
         assert_ne!(GATEWAY_CONTROL_ALPN, SUBMITTER_CONTROL_ALPN);
         assert_ne!(WARDEN_CONTROL_ALPN, SUBMITTER_CONTROL_ALPN);
@@ -3267,6 +3979,7 @@ mod tests {
                     consecutive_audit_passes: 0,
                     integrity_fails: 0,
                     version: String::new(),
+                    base_weight: 0,
                 }
             })
             .collect();
@@ -3355,5 +4068,400 @@ mod tests {
         // No direct addrs at all
         let addr = iroh::EndpointAddr::from(public);
         assert!(!has_direct_addr(&addr));
+    }
+
+    // ====================================================================
+    // Straw2 tests
+    // ====================================================================
+
+    fn make_straw2_test_map(num_miners: u32, families: u32) -> ClusterMap {
+        let miners: Vec<MinerNode> = (0..num_miners)
+            .map(|i| {
+                let sk = iroh::SecretKey::from_bytes(&[i as u8 + 1; 32]);
+                MinerNode {
+                    uid: i,
+                    weight: 100,
+                    family_id: format!("family-{}", i % families),
+                    endpoint: iroh::EndpointAddr::from(sk.public()),
+                    ip_subnet: String::new(),
+                    ip_address: None,
+                    http_addr: format!("http://10.0.0.{}:3001", i),
+                    public_key: format!("{:064x}", i),
+                    total_storage: 1_000_000,
+                    available_storage: 500_000,
+                    strikes: 0,
+                    last_seen: 0,
+                    heartbeat_count: 0,
+                    registration_time: 0,
+                    bandwidth_total: 0,
+                    bandwidth_window_start: 0,
+                    weight_manual_override: false,
+                    reputation: 0.0,
+                    consecutive_audit_passes: 0,
+                    integrity_fails: 0,
+                    version: String::new(),
+                    base_weight: 0,
+                }
+            })
+            .collect();
+
+        ClusterMap {
+            epoch: 1,
+            miners,
+            pg_count: 64,
+            ec_k: 10,
+            ec_m: 20,
+        }
+    }
+
+    #[test]
+    fn test_straw2_placement_deterministic() {
+        let map = make_straw2_test_map(30, 10);
+        let result1 =
+            calculate_placement_for_stripe_straw2("abc123", 0, 30, &map).expect("placement");
+        let result2 =
+            calculate_placement_for_stripe_straw2("abc123", 0, 30, &map).expect("placement");
+
+        let uids1: Vec<u32> = result1.iter().map(|m| m.uid).collect();
+        let uids2: Vec<u32> = result2.iter().map(|m| m.uid).collect();
+        assert_eq!(uids1, uids2, "straw2 must be deterministic");
+    }
+
+    #[test]
+    fn test_straw2_selects_correct_count() {
+        let map = make_straw2_test_map(50, 15);
+        let result =
+            calculate_placement_for_stripe_straw2("file_hash", 0, 30, &map).expect("placement");
+        assert_eq!(result.len(), 30);
+    }
+
+    #[test]
+    fn test_straw2_family_diversity() {
+        // 30 miners across 30 unique families → each shard should be in a different family
+        let map = make_straw2_test_map(30, 30);
+        let result =
+            calculate_placement_for_stripe_straw2("file_hash", 0, 30, &map).expect("placement");
+
+        let mut families: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for miner in &result {
+            families.insert(&miner.family_id);
+        }
+        assert_eq!(
+            families.len(),
+            30,
+            "each shard should be in a unique family"
+        );
+    }
+
+    #[test]
+    fn test_straw2_no_duplicate_miners() {
+        let map = make_straw2_test_map(50, 15);
+        let result =
+            calculate_placement_for_stripe_straw2("file_hash", 0, 30, &map).expect("placement");
+
+        let mut seen = std::collections::HashSet::new();
+        for miner in &result {
+            assert!(
+                seen.insert(miner.uid),
+                "duplicate miner UID {} in placement",
+                miner.uid
+            );
+        }
+    }
+
+    #[test]
+    fn test_straw2_uid_only_matches_full() {
+        let map = make_straw2_test_map(30, 10);
+
+        for pg_id in 0..64 {
+            let full = calculate_pg_placement_straw2(pg_id, 30, &map).expect("full");
+            let uids = calculate_pg_placement_uids_straw2(pg_id, 30, &map).expect("uids");
+
+            let full_uids: Vec<u32> = full.iter().map(|m| m.uid).collect();
+            assert_eq!(full_uids, uids, "PG {} straw2 uid mismatch", pg_id);
+        }
+    }
+
+    #[test]
+    fn test_straw2_pg_stripe_rotation() {
+        let map = make_straw2_test_map(30, 10);
+        let stripe0 =
+            calculate_pg_placement_for_stripe_straw2("hash", 0, 30, &map).expect("stripe 0");
+        let stripe1 =
+            calculate_pg_placement_for_stripe_straw2("hash", 1, 30, &map).expect("stripe 1");
+
+        // Same miners, different rotation
+        let uids0: std::collections::HashSet<u32> = stripe0.iter().map(|m| m.uid).collect();
+        let uids1: std::collections::HashSet<u32> = stripe1.iter().map(|m| m.uid).collect();
+        assert_eq!(uids0, uids1, "same PG should have same miner set");
+
+        // But order should differ (rotation)
+        let ordered0: Vec<u32> = stripe0.iter().map(|m| m.uid).collect();
+        let ordered1: Vec<u32> = stripe1.iter().map(|m| m.uid).collect();
+        assert_ne!(ordered0, ordered1, "stripe rotation should change order");
+    }
+
+    #[test]
+    fn test_straw2_minimal_data_movement() {
+        // Core straw2 property: removing one miner should only affect
+        // placements where that miner was selected.
+        let map_full = make_straw2_test_map(40, 15);
+        let removed_uid = 5;
+
+        let mut map_minus_one = map_full.clone();
+        map_minus_one.miners.retain(|m| m.uid != removed_uid);
+
+        let mut unchanged = 0;
+        let mut changed = 0;
+
+        for pg_id in 0..64 {
+            let full = calculate_pg_placement_straw2(pg_id, 30, &map_full).expect("full");
+            let minus = calculate_pg_placement_straw2(pg_id, 30, &map_minus_one).expect("minus");
+
+            let full_uids: Vec<u32> = full.iter().map(|m| m.uid).collect();
+            let minus_uids: Vec<u32> = minus.iter().map(|m| m.uid).collect();
+
+            if full_uids.contains(&removed_uid) {
+                changed += 1;
+            } else if full_uids == minus_uids {
+                unchanged += 1;
+            }
+        }
+
+        // PGs that didn't include the removed miner should be completely unchanged
+        assert!(
+            unchanged > 0,
+            "some PGs should be unaffected by removing one miner"
+        );
+        assert!(
+            changed > 0,
+            "some PGs should be affected (the removed miner was placed there)"
+        );
+    }
+
+    #[test]
+    fn test_straw2_dispatch_via_version_3() {
+        let map = make_straw2_test_map(30, 10);
+        let direct = calculate_pg_placement_for_stripe_straw2("hash", 0, 30, &map).expect("direct");
+        let dispatched = calculate_stripe_placement("hash", 0, 30, &map, 3).expect("dispatched");
+
+        let uids_direct: Vec<u32> = direct.iter().map(|m| m.uid).collect();
+        let uids_dispatched: Vec<u32> = dispatched.iter().map(|m| m.uid).collect();
+        assert_eq!(uids_direct, uids_dispatched, "v3 dispatch must match");
+    }
+
+    #[test]
+    fn test_straw2_weight_influence() {
+        // Heavily-weighted miner should appear more often across many PGs
+        let mut map = make_straw2_test_map(35, 35);
+        let heavy_uid = 0;
+        map.miners[0].weight = 1000; // 10x other miners
+
+        let mut appearances = 0;
+        for pg_id in 0..64 {
+            let result = calculate_pg_placement_straw2(pg_id, 30, &map).expect("placement");
+            if result.iter().any(|m| m.uid == heavy_uid) {
+                appearances += 1;
+            }
+        }
+
+        // With 30/35 slots and 10x weight, heavy miner should appear very often
+        assert!(
+            appearances > 50,
+            "heavy miner appeared in {}/64 PGs, expected > 50",
+            appearances
+        );
+    }
+
+    /// Regression test for C1: shortfall redistribution.
+    /// Cluster with families [1, 1, 3] miners, request 5.
+    /// The two single-miner families can only contribute 1 each,
+    /// so the 3-miner family must absorb the shortfall.
+    /// `calculate_placement_for_stripe` and `placement_uids_for_stripe`
+    /// must produce identical UID sets.
+    #[test]
+    fn test_shortfall_redistribution_matches() {
+        // 5 miners across 3 families: A(1), B(1), C(3)
+        let family_sizes = [("fam-a", 1), ("fam-b", 1), ("fam-c", 3)];
+        let mut uid_counter = 0u32;
+        let mut miners = Vec::new();
+        for (fam, count) in &family_sizes {
+            for _ in 0..*count {
+                let sk = iroh::SecretKey::from_bytes(&[uid_counter as u8 + 1; 32]);
+                miners.push(MinerNode {
+                    uid: uid_counter,
+                    weight: 100,
+                    family_id: fam.to_string(),
+                    endpoint: iroh::EndpointAddr::from(sk.public()),
+                    ip_subnet: String::new(),
+                    ip_address: None,
+                    http_addr: format!("http://10.0.0.{}:3001", uid_counter),
+                    public_key: format!("{:064x}", uid_counter),
+                    total_storage: 1_000_000,
+                    available_storage: 500_000,
+                    strikes: 0,
+                    last_seen: 0,
+                    heartbeat_count: 0,
+                    registration_time: 0,
+                    bandwidth_total: 0,
+                    bandwidth_window_start: 0,
+                    weight_manual_override: false,
+                    reputation: 0.0,
+                    consecutive_audit_passes: 0,
+                    integrity_fails: 0,
+                    version: String::new(),
+                    base_weight: 0,
+                });
+                uid_counter += 1;
+            }
+        }
+
+        let map = ClusterMap {
+            miners,
+            pg_count: 64,
+            ec_k: 10,
+            ec_m: 20,
+            ..ClusterMap::default()
+        };
+
+        let file_hash = "shortfall_test_hash";
+        let count = 5;
+
+        // V2 weighted: MinerNode vs UID-only must agree
+        let full =
+            calculate_placement_for_stripe(file_hash, 0, count, &map).expect("full placement");
+        let uids = placement_uids_for_stripe(file_hash, 0, count, &map).expect("uid placement");
+
+        assert_eq!(full.len(), count, "full placement returned wrong count");
+        assert_eq!(uids.len(), count, "uid placement returned wrong count");
+
+        let full_uids: Vec<u32> = full.iter().map(|m| m.uid).collect();
+        assert_eq!(
+            full_uids
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<u32>>(),
+            uids.iter()
+                .copied()
+                .collect::<std::collections::HashSet<u32>>(),
+            "V2 weighted: MinerNode and UID placements diverge on shortfall"
+        );
+
+        // Straw2: MinerNode vs UID-only must agree
+        let full_s2 = calculate_placement_for_stripe_straw2(file_hash, 0, count, &map)
+            .expect("straw2 full placement");
+        let uids_s2 = placement_uids_for_stripe_straw2(file_hash, 0, count, &map)
+            .expect("straw2 uid placement");
+
+        assert_eq!(full_s2.len(), count, "straw2 full returned wrong count");
+        assert_eq!(uids_s2.len(), count, "straw2 uid returned wrong count");
+
+        let full_s2_uids: Vec<u32> = full_s2.iter().map(|m| m.uid).collect();
+        assert_eq!(
+            full_s2_uids
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<u32>>(),
+            uids_s2
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<u32>>(),
+            "Straw2: MinerNode and UID placements diverge on shortfall"
+        );
+    }
+
+    // ====================================================================
+    // Commitment selection tests
+    // ====================================================================
+
+    #[test]
+    fn test_commitment_count_zero_shards() {
+        assert_eq!(calculate_commitment_count(0), 0);
+    }
+
+    #[test]
+    fn test_commitment_count_single_shard() {
+        assert_eq!(calculate_commitment_count(1), 1);
+    }
+
+    #[test]
+    fn test_commitment_count_small_file_30_shards() {
+        // 30 * 100 / 3840 = 0.78 -> ceil = 1, max(3,1) = 3, min(30,3) = 3
+        assert_eq!(calculate_commitment_count(30), 3);
+    }
+
+    #[test]
+    fn test_commitment_count_32mb_file_120_shards() {
+        // 120 * 100 / 3840 = 3.125 -> ceil = 4, max(3,4) = 4, min(120,4) = 4
+        assert_eq!(calculate_commitment_count(120), 4);
+    }
+
+    #[test]
+    fn test_commitment_count_1gb_file_3840_shards() {
+        // 3840 * 100 / 3840 = 100, max(3,100) = 100, min(3840,100) = 100
+        assert_eq!(calculate_commitment_count(3840), 100);
+    }
+
+    #[test]
+    fn test_commitment_count_2gb_file_7680_shards() {
+        // 7680 * 100 / 3840 = 200, max(3,200) = 200, min(7680,200) = 200
+        assert_eq!(calculate_commitment_count(7680), 200);
+    }
+
+    #[test]
+    fn test_commitment_count_tiny_file_2_shards() {
+        // 2 * 100 / 3840 = 0.05 -> ceil = 1, max(3,1) = 3, min(2,3) = 2
+        assert_eq!(calculate_commitment_count(2), 2);
+    }
+
+    #[test]
+    fn test_commitment_selection_seed_deterministic() {
+        let s1 = commitment_selection_seed("abc123");
+        let s2 = commitment_selection_seed("abc123");
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn test_commitment_selection_seed_different_files() {
+        let s1 = commitment_selection_seed("file_a");
+        let s2 = commitment_selection_seed("file_b");
+        assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn test_select_commitment_indices_deterministic() {
+        let i1 = select_commitment_indices("hash123", 3840);
+        let i2 = select_commitment_indices("hash123", 3840);
+        assert_eq!(i1, i2);
+    }
+
+    #[test]
+    fn test_select_commitment_indices_correct_count() {
+        let indices = select_commitment_indices("hash123", 3840);
+        assert_eq!(indices.len(), 100);
+    }
+
+    #[test]
+    fn test_select_commitment_indices_in_range() {
+        let total = 3840;
+        let indices = select_commitment_indices("hash_abc", total);
+        for &idx in &indices {
+            assert!(idx < total, "index {idx} out of range [0, {total})");
+        }
+    }
+
+    #[test]
+    fn test_select_commitment_indices_empty_for_zero() {
+        let indices = select_commitment_indices("hash", 0);
+        assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn test_select_commitment_indices_small_file() {
+        let indices = select_commitment_indices("small", 30);
+        assert_eq!(indices.len(), 3);
+        for &idx in &indices {
+            assert!(idx < 30);
+        }
     }
 }

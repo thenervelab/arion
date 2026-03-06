@@ -14,6 +14,7 @@
 //! - On subsequent runs, the existing keypair is loaded
 //! - Corrupted or invalid keypairs cause a startup error (delete to regenerate)
 
+use crate::constants::KEYPAIR_FILE_PERMISSIONS;
 use anyhow::Result;
 use iroh::SecretKey;
 use tracing::{debug, warn};
@@ -61,7 +62,7 @@ pub async fn load_keypair(data_dir: &std::path::Path) -> Result<SecretKey> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
+        let perms = std::fs::Permissions::from_mode(KEYPAIR_FILE_PERMISSIONS);
         if let Err(e) = std::fs::set_permissions(&keypair_path, perms) {
             warn!(path = %keypair_path.display(), error = %e, "Failed to set keypair file permissions");
         }

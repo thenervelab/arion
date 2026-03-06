@@ -1,12 +1,14 @@
 [package]
 name = "common"
-version = "0.1.2"
+version = "0.1.8"
 edition = "2024"
 
 [features]
 default = []
 # Enable Ed25519 signature verification for attestations
 verify = ["ed25519-dalek"]
+# Enable redb database helpers (open_database with repair logging)
+redb = ["dep:redb"]
 
 [dependencies]
 anyhow = "1.0"
@@ -33,7 +35,14 @@ scale-info = { version = "2.11", features = ["derive"] }
 blake3 = "1.5"
 # Optional: Ed25519 signature verification (enabled with "verify" feature)
 ed25519-dalek = { version = "2.1", optional = true }
+# Optional: redb database helpers (enabled with "redb" feature)
+redb = { version = "3", optional = true }
 # For serde support of large arrays (e.g., [u8; 64] for signatures)
 serde-big-array = "0.5"
 bytes = "1"
 rand = { workspace = true }
+# Portable math functions for cross-platform determinism (straw2 placement)
+libm = "0.2"
+sentry = "0.46.2"
+sentry-tracing = "0.46.2"
+tracing-subscriber.workspace = true

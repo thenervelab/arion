@@ -5,6 +5,7 @@
 //! warning if a newer version is available. Non-blocking — failures
 //! are silently swallowed so they never affect miner operation.
 
+use crate::constants::VERSION_CHECK_TIMEOUT_SECS;
 use semver::Version;
 use tracing::{debug, info, warn};
 
@@ -21,7 +22,7 @@ async fn check_for_updates_inner() -> Result<(), Box<dyn std::error::Error + Sen
     let current = Version::parse(CURRENT_VERSION)?;
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(VERSION_CHECK_TIMEOUT_SECS))
         .build()?;
 
     let resp = client

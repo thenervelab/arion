@@ -319,7 +319,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
     // STUN-based public IP auto-detection (runs before hostname/bind resolution)
     let stun_ipv4 = if config.network.auto_detect_ip {
         info!("Running STUN public IP detection...");
-        let stun_timeout = std::time::Duration::from_secs(3);
+        let stun_timeout = std::time::Duration::from_secs(constants::STUN_TIMEOUT_SECS);
         let result = common::stun::detect_public_ipv4(stun_timeout).await;
         if let Some(ref r) = result {
             info!(ip = %r.ip, "STUN detected public IPv4");
@@ -440,7 +440,12 @@ async fn run_miner(cli: Cli) -> Result<()> {
             panic!("P2P_BIND_IPV6 '{ipv6_str}' is not a valid IPv6 address: {e}");
         });
         endpoint_builder = endpoint_builder
-            .bind_addr(std::net::SocketAddrV6::new(bind_ipv6, 11231, 0, 0))
+            .bind_addr(std::net::SocketAddrV6::new(
+                bind_ipv6,
+                constants::IPV6_P2P_PORT,
+                0,
+                0,
+            ))
             .expect("valid bind addr");
     }
 
@@ -458,23 +463,27 @@ async fn run_miner(cli: Cli) -> Result<()> {
     // Configure transport with keep-alive to maintain relay connections.
     // QuicTransportConfig uses a builder pattern (immutable after build).
     let transport_config = iroh::endpoint::QuicTransportConfig::builder()
-        .keep_alive_interval(std::time::Duration::from_secs(15))
-        .default_path_keep_alive_interval(std::time::Duration::from_secs(5))
+        .keep_alive_interval(std::time::Duration::from_secs(
+            constants::KEEP_ALIVE_INTERVAL_SECS,
+        ))
+        .default_path_keep_alive_interval(std::time::Duration::from_secs(
+            constants::DEFAULT_PATH_KEEP_ALIVE_SECS,
+        ))
         .max_idle_timeout(Some(
-            std::time::Duration::from_secs(120)
+            std::time::Duration::from_secs(constants::MAX_IDLE_TIMEOUT_SECS)
                 .try_into()
                 .expect("valid idle timeout"),
         ))
         // Match validator's stream capacity for shard distribution.
         // Large uploads open ~256 streams/miner (524MB file); 16384 supports multi-GB files.
-        .max_concurrent_bidi_streams(16384u32.into())
-        .max_concurrent_uni_streams(1024u32.into())
+        .max_concurrent_bidi_streams(constants::MAX_CONCURRENT_BIDI_STREAMS.into())
+        .max_concurrent_uni_streams(constants::MAX_CONCURRENT_UNI_STREAMS.into())
         // Flow control for receiving shard data at scale.
         // 16MB send_window reduces per-connection memory and UDP buffer pressure.
-        .send_window(16 * 1024 * 1024)
-        .stream_receive_window((2u32 * 1024 * 1024).into())
-        // 64MB receive_window bounds aggregate receive capacity per connection.
-        .receive_window((64u32 * 1024 * 1024).into())
+        .send_window(constants::SEND_WINDOW_BYTES)
+        .stream_receive_window(constants::STREAM_RECEIVE_WINDOW_BYTES.into())
+        // 64 MiB receive_window bounds aggregate receive capacity per connection.
+        .receive_window(constants::RECEIVE_WINDOW_BYTES.into())
         // Use iroh defaults for multipath (13 paths) and NAT traversal (12 addresses).
         // Higher values exhaust the CID budget (CidQueue::LEN=5 in iroh-quinn-proto)
         // causing "remoted CIDs exhausted" errors during hole punching.
@@ -524,19 +533,22 @@ async fn run_miner(cli: Cli) -> Result<()> {
             info!("Waiting for direct address discovery (IPv4)...");
         }
         let mut watcher = endpoint.watch_addr();
-        match tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let addr = watcher.get();
-                let has_v4 = addr.ip_addrs().any(|a| a.is_ipv4());
-                let has_v6 = addr.ip_addrs().any(|a| a.is_ipv6());
-                if has_v4 && (!ipv6_enabled || has_v6) {
-                    return addr;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(constants::DIRECT_ADDR_DISCOVERY_TIMEOUT_SECS),
+            async {
+                loop {
+                    let addr = watcher.get();
+                    let has_v4 = addr.ip_addrs().any(|a| a.is_ipv4());
+                    let has_v6 = addr.ip_addrs().any(|a| a.is_ipv6());
+                    if has_v4 && (!ipv6_enabled || has_v6) {
+                        return addr;
+                    }
+                    if watcher.updated().await.is_err() {
+                        return watcher.get();
+                    }
                 }
-                if watcher.updated().await.is_err() {
-                    return watcher.get();
-                }
-            }
-        })
+            },
+        )
         .await
         {
             Ok(addr) => {
@@ -572,7 +584,8 @@ async fn run_miner(cli: Cli) -> Result<()> {
                     ipv4 = ?v4,
                     ipv6 = ?v6,
                     ipv6_enabled,
-                    "Direct address discovery timed out after 15s \
+                    timeout_secs = constants::DIRECT_ADDR_DISCOVERY_TIMEOUT_SECS,
+                    "Direct address discovery timed out \
                      — proceeding with partial addresses"
                 );
             }
@@ -643,7 +656,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
     };
     let router = Router::builder(endpoint.clone())
         .accept(iroh_blobs::ALPN, blobs.clone())
-        .accept(b"hippius/miner-control", miner_control_handler)
+        .accept(common::MINER_CONTROL_ALPN, miner_control_handler)
         .spawn();
 
     let ctx = MinerContext {
@@ -689,9 +702,9 @@ async fn run_miner(cli: Cli) -> Result<()> {
             let jitter_secs = {
                 use rand::Rng;
                 let mut rng = rand::rng();
-                // Wait anywhere from 10 seconds to the full tick length (usually 300s)
-                let max_jitter = std::cmp::max(11, tick_secs);
-                rng.random_range(10..max_jitter)
+                // Wait anywhere from MIN_REBALANCE_JITTER_SECS to the full tick length
+                let max_jitter = std::cmp::max(constants::MIN_REBALANCE_JITTER_SECS + 1, tick_secs);
+                rng.random_range(constants::MIN_REBALANCE_JITTER_SECS..max_jitter)
             };
 
             info!(
@@ -728,7 +741,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
                 let loop_jitter_secs = {
                     use rand::Rng;
                     let mut rng = rand::rng();
-                    rng.random_range(0..30)
+                    rng.random_range(0..constants::MAX_REBALANCE_INITIAL_JITTER_SECS)
                 };
                 tokio::select! {
                     () = tokio::time::sleep(std::time::Duration::from_secs(loop_jitter_secs)) => {}
@@ -771,7 +784,10 @@ async fn run_miner(cli: Cli) -> Result<()> {
     shutdown_token.cancel();
 
     // 2. Grace period for in-flight operations
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(
+        constants::SHUTDOWN_GRACE_PERIOD_MS,
+    ))
+    .await;
 
     // 3. Stop Router accept loop (drains in-flight handler tasks)
     if let Err(e) = router.shutdown().await {
@@ -903,10 +919,14 @@ async fn register_with_validator(ctx: &MinerContext) -> Result<()> {
                 let is_warming_up = e.to_string().contains("warming up");
                 if is_warming_up {
                     // Validator reachable but not ready -- short fixed retry, no backoff
-                    info!("Validator is warming up, retrying in 5s");
-                    let jitter_ms = rand::rng().random_range(0..2000u64);
+                    info!(
+                        "Validator is warming up, retrying in {}s",
+                        constants::REGISTRATION_RETRY_SLEEP_SECS
+                    );
+                    let jitter_ms =
+                        rand::rng().random_range(0..constants::MAX_REGISTRATION_RETRY_JITTER_MS);
                     tokio::time::sleep(
-                        tokio::time::Duration::from_secs(5)
+                        tokio::time::Duration::from_secs(constants::REGISTRATION_RETRY_SLEEP_SECS)
                             + tokio::time::Duration::from_millis(jitter_ms),
                     )
                     .await;
@@ -1020,7 +1040,7 @@ fn spawn_relay_health_monitor(
                     }
                     Err(_) => {
                         let downtime = lost_at.elapsed().as_secs();
-                        info!(
+                        debug!(
                             downtime_secs = downtime,
                             "Relay still disconnected, waiting for recovery"
                         );
@@ -1042,14 +1062,6 @@ fn spawn_relay_health_monitor(
         }
     });
 }
-
-/// Interval (in heartbeat cycles) at which to refresh validator address from environment
-const VALIDATOR_ADDR_REFRESH_INTERVAL: u32 = 10;
-
-/// After this many consecutive relay-only heartbeat failures, trigger
-/// re-registration so the miner re-resolves its hostname and sends fresh
-/// direct-address hints to the validator.
-const REREGISTER_AFTER_RELAY_FAILURES: u32 = 3;
 
 fn spawn_heartbeat_loop(
     ctx: MinerContext,
@@ -1103,7 +1115,8 @@ fn spawn_heartbeat_loop(
                         // Jitter before the next heartbeat to prevent thundering
                         // herd when many miners re-register simultaneously
                         // (e.g. after a validator restart).
-                        let jitter_ms = rand::rng().random_range(0..5000u64);
+                        let jitter_ms =
+                            rand::rng().random_range(0..constants::MAX_HEARTBEAT_RETRY_JITTER_MS);
                         tokio::time::sleep(tokio::time::Duration::from_millis(jitter_ms)).await;
                     }
                     Err(e) => {
@@ -1111,10 +1124,12 @@ fn spawn_heartbeat_loop(
                         // Set flag again to retry
                         get_needs_reregistration().store(true, std::sync::atomic::Ordering::SeqCst);
                         // Jitter avoids all miners retrying registration simultaneously
-                        let retry_jitter_ms = rand::rng().random_range(0..10_000u64);
+                        let retry_jitter_ms =
+                            rand::rng().random_range(0..constants::MAX_SOCKET_REFRESH_JITTER_MS);
                         tokio::time::sleep(
-                            tokio::time::Duration::from_secs(5)
-                                + tokio::time::Duration::from_millis(retry_jitter_ms),
+                            tokio::time::Duration::from_secs(
+                                constants::RELAY_LOSS_RECOVERY_DELAY_SECS,
+                            ) + tokio::time::Duration::from_millis(retry_jitter_ms),
                         )
                         .await;
                         continue;
@@ -1124,7 +1139,7 @@ fn spawn_heartbeat_loop(
 
             // Periodically refresh validator address from environment
             heartbeat_count = heartbeat_count.wrapping_add(1);
-            if heartbeat_count.is_multiple_of(VALIDATOR_ADDR_REFRESH_INTERVAL)
+            if heartbeat_count.is_multiple_of(constants::VALIDATOR_ADDR_REFRESH_INTERVAL_CYCLES)
                 && let Ok(new_validator_id) = std::env::var("VALIDATOR_NODE_ID")
                 && let Ok(new_pubkey) = iroh::PublicKey::from_str(&new_validator_id)
                 && new_pubkey != current_validator_pubkey
@@ -1161,7 +1176,7 @@ fn spawn_heartbeat_loop(
                 get_validator_reachable().store(false, std::sync::atomic::Ordering::Relaxed);
                 tokio::select! {
                     () = tokio::time::sleep(
-                        tokio::time::Duration::from_secs(30)
+                        tokio::time::Duration::from_secs(constants::FAILURE_BACKOFF_BASE_SECS)
                     ) => {}
                     () = cancel_token.cancelled() => {
                         info!("Heartbeat loop received shutdown signal");
@@ -1217,9 +1232,9 @@ fn spawn_heartbeat_loop(
                     match common::connect_with_direct_path(
                         &ctx.endpoint,
                         heartbeat_validator_addr.clone(),
-                        b"hippius/validator-control",
-                        std::time::Duration::from_secs(10),
-                        std::time::Duration::from_secs(10),
+                        common::VALIDATOR_CONTROL_ALPN,
+                        std::time::Duration::from_secs(constants::REBALANCE_DIRECT_PATH_WAIT_SECS),
+                        std::time::Duration::from_secs(constants::REBALANCE_DIRECT_PATH_WAIT_SECS),
                     )
                     .await
                     {
@@ -1255,7 +1270,12 @@ fn spawn_heartbeat_loop(
                     } else if !has_direct_ip_path(&conn) {
                         // Cached connection lost its direct path — give
                         // Iroh time to re-traverse NAT before giving up.
-                        wait_for_direct_path(&conn, &ctx.endpoint, 10).await
+                        wait_for_direct_path(
+                            &conn,
+                            &ctx.endpoint,
+                            constants::REBALANCE_DIRECT_PATH_WAIT_SECS,
+                        )
+                        .await
                     } else {
                         true
                     };
@@ -1286,7 +1306,7 @@ fn spawn_heartbeat_loop(
                         // After several consecutive relay-only failures,
                         // trigger re-registration to re-resolve hostname
                         // and send fresh direct-address hints.
-                        if consecutive_failures >= REREGISTER_AFTER_RELAY_FAILURES
+                        if consecutive_failures >= constants::RELAY_FAILURES_REREGISTER_THRESHOLD
                             && !get_needs_reregistration().load(std::sync::atomic::Ordering::SeqCst)
                         {
                             warn!(
@@ -1297,8 +1317,12 @@ fn spawn_heartbeat_loop(
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
                         }
 
-                        let backoff_secs = std::cmp::min(120, 30u64 << consecutive_failures.min(2));
-                        let jitter_ms = rand::rng().random_range(0..5000u64);
+                        let backoff_secs = std::cmp::min(
+                            constants::FAILURE_BACKOFF_MAX_SECS,
+                            constants::FAILURE_BACKOFF_BASE_SECS << consecutive_failures.min(2),
+                        );
+                        let jitter_ms =
+                            rand::rng().random_range(0..constants::FAILURE_BACKOFF_JITTER_MS);
                         tokio::time::sleep(
                             tokio::time::Duration::from_secs(backoff_secs)
                                 + tokio::time::Duration::from_millis(jitter_ms),
@@ -1309,7 +1333,7 @@ fn spawn_heartbeat_loop(
 
                     // Wrap entire heartbeat exchange in a single timeout to prevent
                     // stalling on write_all/stopped if the validator's receive buffer is full.
-                    let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                    let result = tokio::time::timeout(std::time::Duration::from_secs(constants::HEARTBEAT_EXCHANGE_TIMEOUT_SECS), async {
                         let (mut send, mut recv) = conn.open_bi().await?;
 
                         let msg_bytes = serde_json::to_vec(&heartbeat_msg)?;
@@ -1317,7 +1341,7 @@ fn spawn_heartbeat_loop(
                         send.finish()?;
 
                         // Read ACK
-                        let ack_bytes = recv.read_to_end(1024).await?;
+                        let ack_bytes = recv.read_to_end(constants::HEARTBEAT_ACK_BUFFER_SIZE).await?;
 
                         let ack_str = String::from_utf8_lossy(&ack_bytes);
                         if ack_str.starts_with("FAMILY_REJECTED:") {
@@ -1371,16 +1395,23 @@ fn spawn_heartbeat_loop(
                             consecutive_failures = 0;
                             get_validator_reachable()
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
+                            info!(
+                                heartbeat = heartbeat_count,
+                                cached = !is_fresh_conn,
+                                "Heartbeat OK"
+                            );
                         }
                         Ok(Ok(false)) => {
                             // Validator is warming up -- reachable but not ready.
-                            // Don't increment failures; use short retry (5s).
+                            // Don't increment failures; use short retry.
                             get_validator_reachable()
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
-                            let jitter_ms = rand::rng().random_range(0..2000u64);
+                            let jitter_ms =
+                                rand::rng().random_range(0..constants::ERROR_RETRY_JITTER_MS);
                             tokio::time::sleep(
-                                tokio::time::Duration::from_secs(5)
-                                    + tokio::time::Duration::from_millis(jitter_ms),
+                                tokio::time::Duration::from_secs(
+                                    constants::RETRY_BACKOFF_BASE_SECS,
+                                ) + tokio::time::Duration::from_millis(jitter_ms),
                             )
                             .await;
                             continue;
@@ -1402,7 +1433,10 @@ fn spawn_heartbeat_loop(
                                 .store(false, std::sync::atomic::Ordering::Relaxed);
                         }
                         Err(_) => {
-                            warn!("Heartbeat exchange timed out (15s)");
+                            warn!(
+                                timeout_secs = constants::HEARTBEAT_EXCHANGE_TIMEOUT_SECS,
+                                "Heartbeat exchange timed out"
+                            );
                             if let Some(old) = cached_conn.take() {
                                 old.close(0u32.into(), b"stale");
                             }
@@ -1421,11 +1455,14 @@ fn spawn_heartbeat_loop(
 
             // Exponential backoff: 30s, 60s, 120s (capped) on consecutive failures
             let backoff_secs = if consecutive_failures == 0 {
-                30
+                constants::FAILURE_BACKOFF_BASE_SECS
             } else {
-                std::cmp::min(120, 30u64 << consecutive_failures.min(2))
+                std::cmp::min(
+                    constants::FAILURE_BACKOFF_MAX_SECS,
+                    constants::FAILURE_BACKOFF_BASE_SECS << consecutive_failures.min(2),
+                )
             };
-            let jitter_ms = rand::rng().random_range(0..5000u64);
+            let jitter_ms = rand::rng().random_range(0..constants::FAILURE_BACKOFF_JITTER_MS);
             tokio::select! {
                 () = tokio::time::sleep(
                     tokio::time::Duration::from_secs(backoff_secs)
@@ -1526,8 +1563,8 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<()> {
     let conn = common::connect_with_direct_path(
         &ctx.endpoint,
         validator_addr,
-        b"hippius/validator-control",
-        std::time::Duration::from_secs(10),
+        common::VALIDATOR_CONTROL_ALPN,
+        std::time::Duration::from_secs(constants::REGISTER_COMPLETION_TIMEOUT_SECS),
         direct_wait,
     )
     .await?;
@@ -1556,9 +1593,12 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<()> {
         send.finish()?;
 
         // Wait for ACK
-        let ack = tokio::time::timeout(std::time::Duration::from_secs(10), recv.read_to_end(4096))
-            .await
-            .map_err(|_| anyhow::anyhow!("ACK timeout"))??;
+        let ack = tokio::time::timeout(
+            std::time::Duration::from_secs(constants::REGISTER_COMPLETION_TIMEOUT_SECS),
+            recv.read_to_end(constants::REGISTER_ACK_BUFFER_SIZE),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("ACK timeout"))??;
 
         let ack_str = String::from_utf8_lossy(&ack);
         match ack_str.as_ref() {

@@ -2,15 +2,7 @@
 members = [
     "common",
     "miner",
-    "gateway",
-    "validator",
-    "listener",
-    "chain-submitter",
     "miner-cli",
-    "tools",
-    "warden",
-    "pos-circuits",
-    "proptests",
 ]
 resolver = "2"
 
@@ -21,7 +13,11 @@ resolver = "2"
 axum = { version = "0.8.8", features = ["multipart", "macros"] }
 axum-server = { version = "0.8.0", features = ["tls-openssl"] }
 tower = "0.5"
-tower-http = { version = "0.6.8", features = ["cors", "limit"] }
+tower-http = { version = "0.6.8", features = ["cors", "limit", "timeout"] }
+
+
+sled = "0.34"
+
 
 # ============================================
 # Async Runtime & Utilities
@@ -86,8 +82,7 @@ iroh-docs = "0.96.0"
 # ============================================
 # Database
 # ============================================
-sled = "0.34"
-
+redb = "3"
 
 # ============================================
 # System
@@ -157,12 +152,6 @@ crc32fast = "1.5.0"
 prometheus-client = "0.22"
 sysinfo = "0.30"
 
-# ============================================
-# S3 Storage
-# ============================================
-rust-s3 = { version = "0.35", default-features = false, features = [
-    "use-tokio-native-tls",
-] }
 
 # ============================================
 # Substrate/Blockchain

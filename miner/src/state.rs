@@ -20,7 +20,8 @@
 #![allow(clippy::type_complexity)]
 
 use crate::constants::{
-    BLOB_CACHE_SIZE, CONNECTION_TTL_SECS, MAX_CONNECTION_POOL_SIZE, MAX_TAG_MAP_ENTRIES,
+    BLOB_CACHE_SIZE, CONNECTION_POOL_EVICTION_FRACTION, CONNECTION_TTL_SECS,
+    MAX_CONNECTION_POOL_SIZE, MAX_TAG_MAP_ENTRIES, POOLED_CONN_DEFAULT_TIMEOUT_SECS,
 };
 use anyhow::Result;
 use common::now_secs;
@@ -208,7 +209,7 @@ pub async fn get_pooled_connection(
             peer_addr.clone(),
             alpn,
             std::time::Duration::from_secs(crate::constants::DEFAULT_CONNECT_TIMEOUT_SECS),
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(POOLED_CONN_DEFAULT_TIMEOUT_SECS),
         )
         .await;
     }
@@ -233,7 +234,7 @@ pub async fn get_pooled_connection(
         peer_addr.clone(),
         alpn,
         std::time::Duration::from_secs(crate::constants::DEFAULT_CONNECT_TIMEOUT_SECS),
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(POOLED_CONN_DEFAULT_TIMEOUT_SECS),
     )
     .await?;
 
@@ -264,7 +265,7 @@ pub async fn get_pooled_connection(
             });
             // If still over capacity after TTL cleanup, fall back to sort-based eviction
             if pool.len() >= MAX_CONNECTION_POOL_SIZE {
-                let entries_to_remove = pool.len() / 10 + 1;
+                let entries_to_remove = pool.len() / CONNECTION_POOL_EVICTION_FRACTION + 1;
                 let mut oldest: Vec<_> = pool.iter().map(|(k, (_, ts))| (*k, *ts)).collect();
                 oldest.sort_by_key(|(_, ts)| *ts);
                 // Don't call conn.close() — see retain comment above.

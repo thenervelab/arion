@@ -31,7 +31,6 @@ bytes = { workspace = true }
 mycrush = { workspace = true }
 reed-solomon-erasure = { workspace = true }
 toml = { workspace = true }
-rust-s3 = { workspace = true }
 chrono = { workspace = true }
 prometheus-client = { workspace = true }
 sysinfo = { workspace = true }

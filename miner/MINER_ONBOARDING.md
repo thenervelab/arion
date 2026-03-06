@@ -82,7 +82,7 @@ You'll need these details from the network operator:
 
 - **VALIDATOR_NODE_ID**: `185651f2fb19c919d40c3c58660cf463ebe7ded1c1a326eef4dad28292171cdb`
 - **CHAIN_WS_URL**: `wss://rpc.hippius.network`
-- **IROH_RELAY_URL**: `https://relay.hippius.com`
+- **Relay servers**: `relay.hippius.com` + `relay2.hippius.com` (used by default, no config needed)
 
 ### Accounts
 
@@ -230,9 +230,9 @@ Set the required environment variables:
 
 ```bash
 export VALIDATOR_NODE_ID="185651f2fb19c919d40c3c58660cf463ebe7ded1c1a326eef4dad28292171cdb"
-export IROH_RELAY_URL="https://relay.hippius.com"
 export HOSTNAME="<your-public-ipv4>"  # MUST be your public IP, e.g. 203.0.113.10
 export RUST_LOG="info"
+# Relay servers (relay.hippius.com + relay2.hippius.com) are used by default — no config needed
 ```
 
 ### Step 5.2: Start the Miner
@@ -248,7 +248,7 @@ cargo run --release --bin miner -- \
 ```text
 INFO miner: Starting Hippius Miner
 INFO miner: Node ID: a1b2c3d4e5f6789012345678901234567890123456789012345678901234abcd
-INFO miner: Connected to relay: https://relay.hippius.com
+INFO miner: Connected to relays: ["https://relay.hippius.com", "https://relay2.hippius.com"]
 INFO miner: Registered with validator via P2P
 ```
 
@@ -268,7 +268,6 @@ Type=simple
 User=youruser
 WorkingDirectory=/home/youruser/hippius-arion/miner
 Environment="VALIDATOR_NODE_ID=185651f2fb19c919d40c3c58660cf463ebe7ded1c1a326eef4dad28292171cdb"
-Environment="IROH_RELAY_URL=https://relay.hippius.com"
 Environment="HOSTNAME=<your-public-ipv4>"
 Environment="RUST_LOG=info"
 ExecStart=/home/youruser/hippius-arion/target/release/miner \
@@ -324,8 +323,8 @@ WARN: Cannot reach relay server
 
 **Solution:**
 - Check internet connectivity
-- Verify `IROH_RELAY_URL` is accessible: `curl https://relay.hippius.com`
-- Try alternative relay servers
+- Verify relay servers are accessible: `curl https://relay.hippius.com && curl https://relay2.hippius.com`
+- Both default relays must be reachable for optimal connectivity
 
 ### Issue: Miner registered but not receiving shards
 

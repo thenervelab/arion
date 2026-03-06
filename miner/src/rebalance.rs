@@ -18,10 +18,11 @@
 //! `PullFromPeer` commands. The miner does not self-heal.
 
 use crate::constants::{
-    MAX_BATCH_PG_RESPONSE_SIZE, MAX_ORPHAN_ENTRIES, ORPHAN_GRACE_PERIOD_SECS,
-    REBALANCE_MAX_FILES_PER_CYCLE,
+    BATCH_RESPONSE_TIMEOUT_SECS, CONCURRENT_MANIFEST_FETCH_STREAMS, MANIFEST_READ_TIMEOUT_SECS,
+    MANIFEST_RESPONSE_MAX_SIZE, MANIFEST_STREAM_OPEN_TIMEOUT_SECS, MAX_BATCH_PG_RESPONSE_SIZE,
+    MAX_CONSECUTIVE_MANIFEST_FAILURES, MAX_ORPHAN_ENTRIES, MAX_PG_BATCH_FILE_ENTRIES,
+    ORPHAN_GRACE_PERIOD_SECS, PG_BATCH_CHUNK_SIZE, REBALANCE_MAX_FILES_PER_CYCLE,
 };
-use crate::helpers::truncate_for_log;
 use crate::state::{
     get_blobs_dir, get_cluster_map, get_orphan_shards, get_validator_endpoint,
     get_validator_reachable,
@@ -32,6 +33,7 @@ use iroh::endpoint::Endpoint;
 use iroh_blobs::store::fs::FsStore;
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, trace, warn};
 
 /// PG-based self-rebalancing: Calculate which PGs this miner is responsible for,
@@ -73,7 +75,9 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
         }
     };
 
-    // Calculate which PGs we are responsible for (cached by epoch)
+    // Calculate which PGs we are responsible for (cached by epoch).
+    // calculate_my_pgs is CPU-bound (CRUSH over 16,384 PGs) so it
+    // runs on spawn_blocking to avoid starving the async runtime.
     let current_epoch = cluster_map.epoch;
     let my_pgs = {
         let cache = crate::state::get_my_pgs_cache();
@@ -83,7 +87,14 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
             cached.1.clone()
         } else {
             drop(cached);
-            let pgs = common::calculate_my_pgs(my_uid, &cluster_map);
+            let map_for_pgs = cluster_map.clone();
+            let pgs =
+                tokio::task::spawn_blocking(move || common::calculate_my_pgs(my_uid, &map_for_pgs))
+                    .await
+                    .unwrap_or_else(|e| {
+                        error!(error = %e, "PG calculation panicked");
+                        Vec::new()
+                    });
             let mut cached = cache.write().await;
             *cached = (current_epoch, pgs.clone());
             pgs
@@ -114,12 +125,12 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
     // Single P2P connection for both PG queries and manifest fetches.
     // QUIC natively multiplexes streams on one connection.
     // Reuses the pooled validator connection to avoid extra QUIC handshakes.
-    let read_timeout = std::time::Duration::from_secs(60); // Longer timeout for batch response
+    let read_timeout = std::time::Duration::from_secs(BATCH_RESPONSE_TIMEOUT_SECS);
 
     let validator_conn = match crate::state::get_pooled_connection(
         &endpoint,
         &validator_addr,
-        b"hippius/validator-control",
+        common::VALIDATOR_CONTROL_ALPN,
     )
     .await
     {
@@ -137,7 +148,7 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
 
     // Process PGs in chunks to prevent validator OOM
     // 500 PGs * ~17 files/PG * 64 bytes/hash ≈ 544 KB per chunk (very safe)
-    for chunk in my_pgs.chunks(500) {
+    for chunk in my_pgs.chunks(PG_BATCH_CHUNK_SIZE) {
         let query_msg = common::ValidatorControlMessage::QueryPgFilesBatch {
             pg_ids: chunk.to_vec(),
         };
@@ -146,6 +157,7 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
             let (mut send, mut recv) = validator_conn.open_bi().await?;
             let msg_bytes = serde_json::to_vec(&query_msg)?;
             send.write_all(&msg_bytes).await?;
+            send.flush().await?;
             send.finish()?;
 
             // Buffer for batch response
@@ -159,10 +171,11 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
 
             // Validate deserialized size to prevent memory exhaustion
             let total_entries: usize = files.values().map(|v| v.len()).sum();
-            if total_entries > 100_000 {
+            if total_entries > MAX_PG_BATCH_FILE_ENTRIES {
                 anyhow::bail!(
-                    "PG batch response too large: {} file entries (max 100000)",
-                    total_entries
+                    "PG batch response too large: {} file entries (max {})",
+                    total_entries,
+                    MAX_PG_BATCH_FILE_ENTRIES,
                 );
             }
 
@@ -220,6 +233,8 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
         .take(REBALANCE_MAX_FILES_PER_CYCLE)
         .collect();
     let files_processed = file_entries.len();
+    let mut total_manifest_failures: u32 = 0;
+    let mut aborted = false;
     {
         // Fetch manifests concurrently (16 parallel QUIC streams on one connection)
         use futures::stream::StreamExt;
@@ -231,36 +246,31 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
                     (file_hash, result)
                 }
             })
-            .buffer_unordered(16);
+            .buffer_unordered(CONCURRENT_MANIFEST_FETCH_STREAMS);
 
         let mut consecutive_failures: u32 = 0;
-        const MAX_CONSECUTIVE_FAILURES: u32 = 10;
 
         while let Some((file_hash, result)) = manifest_stream.next().await {
             match result {
-                Ok(manifest) => {
+                Ok(Some(manifest)) => {
                     consecutive_failures = 0;
 
                     let shards_per_stripe = manifest.stripe_config.k + manifest.stripe_config.m;
                     let num_stripes = manifest.shards.len().div_ceil(shards_per_stripe);
 
-                    // Compute PG and base CRUSH placement once per file
-                    let pg_id = common::calculate_pg(&file_hash, cluster_map.pg_count);
-                    let base_miners = match common::calculate_pg_placement(
-                        pg_id,
-                        shards_per_stripe,
-                        &cluster_map,
-                    ) {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
-                    let base_len = base_miners.len();
-
                     for stripe_idx in 0..num_stripes {
-                        let mut stripe_miners = base_miners.clone();
-                        if base_len > 0 {
-                            stripe_miners.rotate_left(stripe_idx % base_len);
-                        }
+                        // Use version-aware dispatcher so v1, v2,
+                        // and v3 files all get correct placement.
+                        let stripe_miners = match common::calculate_stripe_placement(
+                            &file_hash,
+                            stripe_idx as u64,
+                            shards_per_stripe,
+                            &cluster_map,
+                            manifest.placement_version,
+                        ) {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        };
 
                         for local_idx in 0..shards_per_stripe {
                             let global_idx = stripe_idx * shards_per_stripe + local_idx;
@@ -286,29 +296,21 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
 
                                 if !local_hashes.contains(&shard_hash) {
                                     missing_shards += 1;
-                                    trace!(
-                                        shard_idx = local_idx,
-                                        blob_hash = %truncate_for_log(&shard.blob_hash, 16),
-                                        file_hash = %truncate_for_log(&file_hash, 16),
-                                        "Missing shard (validator handles migration via PullFromPeer)"
-                                    );
                                 }
                             }
                         }
                     }
                 }
-                Err(e) => {
-                    error!(
-                        file_hash = %truncate_for_log(&file_hash, 16),
-                        error = %e,
-                        "Failed to fetch manifest"
-                    );
+                Ok(None) => {
+                    // Manifest not found - likely a race condition where the file was deleted
+                    // or isn't fully indexed yet. Reset consecutive but don't count as expected.
+                    consecutive_failures = 0;
+                }
+                Err(_) => {
+                    total_manifest_failures += 1;
                     consecutive_failures += 1;
-                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                        error!(
-                            failures = consecutive_failures,
-                            "Too many consecutive manifest failures, aborting rebalance"
-                        );
+                    if consecutive_failures >= MAX_CONSECUTIVE_MANIFEST_FAILURES {
+                        aborted = true;
                         break;
                     }
                 }
@@ -316,11 +318,20 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
         }
     }
 
+    if total_manifest_failures > 0 {
+        warn!(
+            manifest_failures = total_manifest_failures,
+            aborted = aborted,
+            "Manifest fetch failures during rebalance"
+        );
+    }
+
     debug!(
         files_total = total_files,
         files_processed = files_processed,
         expected_shards = expected_shards.len(),
         missing_shards = missing_shards,
+        manifest_failures = total_manifest_failures,
         "Self-rebalance summary"
     );
 
@@ -364,6 +375,8 @@ async fn gc_orphan_shards(
     let mut deleted_count = 0;
     let mut kept_count = 0;
     let mut skipped_at_capacity = 0u64;
+    let mut tag_delete_failures = 0u32;
+    let mut file_delete_failures = 0u32;
 
     // Use DashMap for lock-free orphan tracking
     let orphan_map = get_orphan_shards();
@@ -385,22 +398,12 @@ async fn gc_orphan_shards(
 
                 // Guard: if now < first_seen, entry is corrupted
                 if now < first_seen {
-                    warn!(
-                        hash = %truncate_for_log(&hash_str, 16),
-                        "Clock skew detected: removing corrupted orphan entry"
-                    );
                     orphan_map.remove(blob_hash);
                     continue;
                 }
 
                 // Check if grace period expired
                 if now - first_seen > ORPHAN_GRACE_PERIOD_SECS {
-                    trace!(
-                        hash = %truncate_for_log(&hash_str, 16),
-                        age_secs = now - first_seen,
-                        "GC: Deleting orphan"
-                    );
-
                     let mut removed = false;
 
                     // Delete the tag first so the blob becomes eligible for store-level GC
@@ -410,12 +413,8 @@ async fn gc_orphan_shards(
                             // Also remove from TAG_MAP cache
                             crate::state::get_tag_map().remove(blob_hash);
                         }
-                        Err(e) => {
-                            warn!(
-                                hash = %truncate_for_log(&hash_str, 16),
-                                error = %e,
-                                "Failed to delete tag for orphan"
-                            );
+                        Err(_) => {
+                            tag_delete_failures += 1;
                         }
                     }
 
@@ -429,12 +428,8 @@ async fn gc_orphan_shards(
                                 break;
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(e) => {
-                                error!(
-                                    hash = %truncate_for_log(&hash_str, 16),
-                                    error = %e,
-                                    "Failed to delete orphan file"
-                                );
+                            Err(_) => {
+                                file_delete_failures += 1;
                             }
                         }
                     }
@@ -465,6 +460,13 @@ async fn gc_orphan_shards(
         );
     }
 
+    if tag_delete_failures > 0 || file_delete_failures > 0 {
+        warn!(
+            tag_delete_failures,
+            file_delete_failures, "Orphan GC encountered delete errors"
+        );
+    }
+
     if orphan_count > 0 || deleted_count > 0 {
         debug!(
             expected = kept_count,
@@ -483,34 +485,36 @@ async fn gc_orphan_shards(
 async fn fetch_manifest_on_conn(
     conn: &iroh::endpoint::Connection,
     file_hash: &str,
-) -> Result<common::FileManifest> {
+) -> Result<Option<common::FileManifest>> {
     let query_msg = common::ValidatorControlMessage::QueryManifest {
         file_hash: file_hash.to_string(),
     };
 
-    let (mut send, mut recv) =
-        tokio::time::timeout(std::time::Duration::from_secs(10), conn.open_bi())
-            .await
-            .map_err(|_| anyhow::anyhow!("Stream open timeout"))??;
+    let (mut send, mut recv) = tokio::time::timeout(
+        std::time::Duration::from_secs(MANIFEST_STREAM_OPEN_TIMEOUT_SECS),
+        conn.open_bi(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Stream open timeout"))??;
 
     let msg_bytes = serde_json::to_vec(&query_msg)?;
     send.write_all(&msg_bytes).await?;
     send.finish()?;
 
     let response_bytes = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        recv.read_to_end(1024 * 1024),
+        std::time::Duration::from_secs(MANIFEST_READ_TIMEOUT_SECS),
+        recv.read_to_end(MANIFEST_RESPONSE_MAX_SIZE),
     )
     .await
     .map_err(|_| anyhow::anyhow!("Read timeout fetching manifest"))??;
 
     if response_bytes == b"NOT_FOUND" {
-        return Err(anyhow::anyhow!("Manifest not found"));
+        return Ok(None);
     }
     if response_bytes == b"WARMING_UP" {
         return Err(anyhow::anyhow!("Validator still warming up"));
     }
 
     let manifest: common::FileManifest = serde_json::from_slice(&response_bytes)?;
-    Ok(manifest)
+    Ok(Some(manifest))
 }

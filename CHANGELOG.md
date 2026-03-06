@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.9] - 2026-03-06
+
+### Miner
+
+#### Reliability
+
+- Extracted hardcoded timeouts and magic numbers into `constants.rs` (`VERSION_CHECK_TIMEOUT_SECS`, `CONNECTION_POOL_EVICTION_FRACTION`, `MANIFEST_RESPONSE_MAX_SIZE`, `POOLED_CONN_DEFAULT_TIMEOUT_SECS`, etc.)
+- Improved handling of manifest stream timeouts and limits (`MANIFEST_STREAM_OPEN_TIMEOUT_SECS`, `MANIFEST_READ_TIMEOUT_SECS`, `MANIFEST_RESPONSE_MAX_SIZE`)
+- Manifest fetching gracefully handles `NOT_FOUND` instead of throwing an error
+- Rebalance task aborts if consecutive manifest failures exceed `MAX_CONSECUTIVE_MANIFEST_FAILURES`
+- Improved robustness in orphan garbage collection (accumulates and logs `tag_delete_failures` and `file_delete_failures`)
+
 ## [0.1.3] - 2026-02-20
 
 ### Miner
