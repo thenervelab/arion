@@ -1,4 +1,5 @@
 //! Miner entry point for the Hippius Arion storage subnet.
+#![allow(warnings)]
 //!
 //! The miner receives shards from validators via P2P, stores them in Iroh's
 //! FsStore, and serves them back to gateways and other miners on request.
@@ -251,7 +252,18 @@ impl MinerContext {
     }
 
     fn validator_addr(&self) -> iroh::EndpointAddr {
-        build_validator_addr(&self.validator_pubkey, &self.relay_url)
+        let mut addr = build_validator_addr(&self.validator_pubkey, &self.relay_url);
+        if let Some(ref direct_str) = self.config.validator.direct_addrs {
+            let direct_addrs = config::parse_direct_addrs(&Some(direct_str.clone()));
+            if !direct_addrs.is_empty() {
+                let addrs: Vec<_> = direct_addrs
+                    .into_iter()
+                    .map(iroh::TransportAddr::Ip)
+                    .collect();
+                addr = addr.with_addrs(addrs);
+            }
+        }
+        addr
     }
 
     /// Resolve the configured hostname to an IP address.
@@ -1229,106 +1241,46 @@ fn spawn_heartbeat_loop(
                         old.close(0u32.into(), b"stale");
                     }
                     is_fresh_conn = true;
-                    match common::connect_with_direct_path(
-                        &ctx.endpoint,
-                        heartbeat_validator_addr.clone(),
-                        common::VALIDATOR_CONTROL_ALPN,
-                        std::time::Duration::from_secs(constants::REBALANCE_DIRECT_PATH_WAIT_SECS),
-                        std::time::Duration::from_secs(constants::REBALANCE_DIRECT_PATH_WAIT_SECS),
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(constants::DEFAULT_CONNECT_TIMEOUT_SECS),
+                        ctx.endpoint.connect(
+                            heartbeat_validator_addr.clone(),
+                            common::VALIDATOR_CONTROL_ALPN,
+                        ),
                     )
                     .await
                     {
-                        Ok(new_conn) => {
+                        Ok(Ok(new_conn)) => {
                             cached_conn = Some(new_conn.clone());
                             Ok(new_conn)
                         }
-                        Err(e) => Err(format!("{e}")),
+                        Ok(Err(e)) => Err(format!("{e}")),
+                        Err(_) => Err("connect timeout".to_string()),
                     }
                 }
             };
 
             match conn {
                 Ok(conn) => {
-                    // For fresh connections, connect_with_direct_path already
-                    // ensured a direct path. For cached connections, verify
-                    // the path is still live.
-                    let direct = if is_fresh_conn {
-                        use iroh::Watcher as _;
-                        let paths = conn.paths().get();
-                        let path_details: Vec<String> = paths
-                            .iter()
-                            .map(|p| {
-                                format!("{:?} (rtt={}ms)", p.remote_addr(), p.rtt().as_millis())
-                            })
-                            .collect();
-                        info!(
-                            path_count = paths.len(),
-                            paths = ?path_details,
-                            "Heartbeat: fresh direct P2P connection to validator established"
-                        );
-                        true
-                    } else if !has_direct_ip_path(&conn) {
-                        // Cached connection lost its direct path — give
-                        // Iroh time to re-traverse NAT before giving up.
-                        wait_for_direct_path(
-                            &conn,
-                            &ctx.endpoint,
-                            constants::REBALANCE_DIRECT_PATH_WAIT_SECS,
-                        )
-                        .await
-                    } else {
-                        true
-                    };
-
                     // Seed the validator's direct addresses into static
                     // discovery so future connect() calls try direct first.
-                    if direct {
+                    // This creates a direct path over time if holepunching succeeds.
+                    if has_direct_ip_path(&conn) {
                         seed_validator_discovery(&conn, &current_validator_pubkey, &ctx.relay_url);
                     }
-
-                    if !direct {
+                    // If the connection is relay-only, we still send the heartbeat,
+                    // but we log a warning and increment consecutive failures.
+                    // The validator will still receive the heartbeat and update
+                    // the miner's status, but it won't assign shards if it can't
+                    // establish a direct connection.
+                    if !has_direct_ip_path(&conn) {
                         use iroh::Watcher as _;
                         let paths = conn.paths().get();
-                        warn!(
+                        debug!(
                             path_count = paths.len(),
                             ip_paths = paths.iter().filter(|p| p.is_ip()).count(),
-                            "Skipping heartbeat: no direct IP path to validator \
-                             (relay-only). Miner will not receive shards until \
-                             direct connectivity is established."
+                            "Heartbeat sent over relay-only connection"
                         );
-                        get_validator_reachable()
-                            .store(false, std::sync::atomic::Ordering::Relaxed);
-                        if let Some(old) = cached_conn.take() {
-                            old.close(0u32.into(), b"stale");
-                        }
-                        consecutive_failures = consecutive_failures.saturating_add(1);
-
-                        // After several consecutive relay-only failures,
-                        // trigger re-registration to re-resolve hostname
-                        // and send fresh direct-address hints.
-                        if consecutive_failures >= constants::RELAY_FAILURES_REREGISTER_THRESHOLD
-                            && !get_needs_reregistration().load(std::sync::atomic::Ordering::SeqCst)
-                        {
-                            warn!(
-                                consecutive_failures,
-                                "Persistent relay-only connectivity — triggering re-registration"
-                            );
-                            get_needs_reregistration()
-                                .store(true, std::sync::atomic::Ordering::SeqCst);
-                        }
-
-                        let backoff_secs = std::cmp::min(
-                            constants::FAILURE_BACKOFF_MAX_SECS,
-                            constants::FAILURE_BACKOFF_BASE_SECS << consecutive_failures.min(2),
-                        );
-                        let jitter_ms =
-                            rand::rng().random_range(0..constants::FAILURE_BACKOFF_JITTER_MS);
-                        tokio::time::sleep(
-                            tokio::time::Duration::from_secs(backoff_secs)
-                                + tokio::time::Duration::from_millis(jitter_ms),
-                        )
-                        .await;
-                        continue;
                     }
 
                     // Wrap entire heartbeat exchange in a single timeout to prevent
@@ -1554,20 +1506,16 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<()> {
         }
     };
 
-    // Connect to validator via P2P with direct path guarantee.
-    // Uses connect_with_direct_path which ensures a direct IP path
-    // before use — closes the connection if relay-only after timeout.
+    // Connect to validator via P2P (relay or direct)
     let validator_addr = ctx.validator_addr();
-    let direct_wait = std::time::Duration::from_secs(ctx.config.tuning.p2p_direct_wait_secs);
 
-    let conn = common::connect_with_direct_path(
-        &ctx.endpoint,
-        validator_addr,
-        common::VALIDATOR_CONTROL_ALPN,
-        std::time::Duration::from_secs(constants::REGISTER_COMPLETION_TIMEOUT_SECS),
-        direct_wait,
+    let conn = tokio::time::timeout(
+        std::time::Duration::from_secs(constants::DEFAULT_CONNECT_TIMEOUT_SECS),
+        ctx.endpoint
+            .connect(validator_addr, common::VALIDATOR_CONTROL_ALPN),
     )
-    .await?;
+    .await?
+    .map_err(|e| anyhow::anyhow!("connect error: {}", e))?;
 
     {
         use iroh::Watcher as _;
@@ -1579,7 +1527,7 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<()> {
         info!(
             path_count = paths.len(),
             paths = ?path_details,
-            "Registration: direct P2P connection to validator established"
+            "Registration: P2P connection to validator established"
         );
     }
 

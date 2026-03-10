@@ -280,7 +280,7 @@ pub const PEER_DATA_RECEPTION_TIMEOUT_SECS: u64 = 30;
 pub const BATCH_RESPONSE_TIMEOUT_SECS: u64 = 60;
 
 /// Number of PGs to query per batch chunk
-pub const PG_BATCH_CHUNK_SIZE: usize = 500;
+pub const PG_BATCH_CHUNK_SIZE: usize = 50;
 
 /// Maximum total file entries accepted from a batch PG response
 pub const MAX_PG_BATCH_FILE_ENTRIES: usize = 100_000;

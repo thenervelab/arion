@@ -295,7 +295,11 @@ async fn handle_single_stream(
         let header: common::MinerControlMessage = serde_json::from_slice(&header_bytes)?;
 
         let (hash, data_len, validator_signature) = match header {
-            common::MinerControlMessage::StoreV2 { hash, data_len, validator_signature } => (hash, data_len, validator_signature),
+            common::MinerControlMessage::StoreV2 {
+                hash,
+                data_len,
+                validator_signature,
+            } => (hash, data_len, validator_signature),
             other => {
                 anyhow::bail!(
                     "V2 framing used with non-StoreV2 header: {:?}",
@@ -322,14 +326,16 @@ async fn handle_single_stream(
             return send_response(&mut send, b"ERROR: RELAY_ONLY").await;
         }
 
-        let data_len = data_len as usize;
-        let mut data = vec![0u8; data_len];
-        tokio::time::timeout(data_timeout, recv.read_exact(&mut data))
-            .await
-            .map_err(|_| anyhow::anyhow!("StoreV2 data read timed out after 55s"))?
-            .map_err(|e| anyhow::anyhow!("StoreV2 data read failed: {}", e))?;
-
-        return handle_store(remote_node_id, handler, &mut send, hash, data, validator_signature).await;
+        return handle_store(
+            remote_node_id,
+            handler,
+            &mut send,
+            &mut recv,
+            hash,
+            data_len as usize,
+            validator_signature,
+        )
+        .await;
     }
 
     // JSON control path: prepend the first byte back and parse.
@@ -344,7 +350,10 @@ async fn handle_single_stream(
     let message: common::MinerControlMessage = serde_json::from_slice(&full)?;
 
     match message {
-        common::MinerControlMessage::Delete { hash, validator_signature } => {
+        common::MinerControlMessage::Delete {
+            hash,
+            validator_signature,
+        } => {
             handle_delete(
                 remote_node_id,
                 handler.validator_node_id.as_ref(),
@@ -450,15 +459,21 @@ async fn handle_store(
     remote_node_id: &iroh::PublicKey,
     handler: &MinerControlHandler,
     send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream,
     hash: String,
-    data: Vec<u8>,
+    data_len: usize,
     validator_signature: Vec<u8>,
 ) -> Result<()> {
     // Authenticate Gateway P2P StoreV2: Verify the Ed25519 signature from the validator
     let is_authorized = if let Some(val_node_id) = handler.validator_node_id.as_ref() {
         let message_to_sign = format!("UPLOAD:{}", hash);
         let sig_array = <[u8; 64]>::try_from(validator_signature.as_slice()).unwrap_or([0; 64]);
-        val_node_id.verify(message_to_sign.as_bytes(), &iroh::Signature::from_bytes(&sig_array)).is_ok()
+        val_node_id
+            .verify(
+                message_to_sign.as_bytes(),
+                &iroh::Signature::from_bytes(&sig_array),
+            )
+            .is_ok()
     } else {
         false // If no validator configured, nothing is authorized
     };
@@ -469,6 +484,15 @@ async fn handle_store(
     }
 
     trace!(hash = %hash, "Received Store command");
+
+    // Verify requested hash parses and matches what we actually store early
+    let requested = match iroh_blobs::Hash::from_str(&hash) {
+        Ok(h) => h,
+        Err(e) => {
+            error!(hash = %hash, error = %e, "Store: Invalid hash");
+            return send_response(send, b"ERROR: Invalid hash").await;
+        }
+    };
 
     // Backpressure: bound concurrent Store ops
     let _permit =
@@ -486,16 +510,14 @@ async fn handle_store(
             }
         };
 
-    trace!(hash = %hash, size = data.len(), "Receiving blob from validator");
+    trace!(hash = %hash, size = data_len, "Receiving blob from validator/gateway");
 
-    // Verify requested hash parses and matches what we actually store
-    let requested = match iroh_blobs::Hash::from_str(&hash) {
-        Ok(h) => h,
-        Err(e) => {
-            error!(hash = %hash, error = %e, "Store: Invalid hash");
-            return send_response(send, b"ERROR: Invalid hash").await;
-        }
-    };
+    let mut data = vec![0u8; data_len];
+    let data_timeout = std::time::Duration::from_secs(DATA_FRAME_READ_TIMEOUT_SECS);
+    tokio::time::timeout(data_timeout, recv.read_exact(&mut data))
+        .await
+        .map_err(|_| anyhow::anyhow!("StoreV2 data read timed out after 55s"))?
+        .map_err(|e| anyhow::anyhow!("StoreV2 data read failed: {}", e))?;
 
     // Store blob (persistent with FsStore)
     let outcome = match handler.store.add_bytes(data).await {
@@ -543,7 +565,12 @@ async fn handle_delete(
     let is_authorized = if let Some(val_node_id) = validator_node_id {
         let message_to_sign = format!("DELETE:{}", hash);
         let sig_array = <[u8; 64]>::try_from(validator_signature.as_slice()).unwrap_or([0; 64]);
-        val_node_id.verify(message_to_sign.as_bytes(), &iroh::Signature::from_bytes(&sig_array)).is_ok()
+        val_node_id
+            .verify(
+                message_to_sign.as_bytes(),
+                &iroh::Signature::from_bytes(&sig_array),
+            )
+            .is_ok()
     } else {
         false // If no validator configured, nothing is authorized
     };

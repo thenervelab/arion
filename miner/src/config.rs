@@ -191,6 +191,9 @@ pub struct ValidatorConfig {
     /// Validator Node ID (Ed25519 public key) for P2P
     pub node_id: Option<String>,
 
+    /// Validator direct addresses (comma-separated list of IP:PORT)
+    pub direct_addrs: Option<String>,
+
     /// Warden Node ID (Ed25519 public key) for PoS challenges
     pub warden_node_id: Option<String>,
 
@@ -207,6 +210,7 @@ impl Default for ValidatorConfig {
     fn default() -> Self {
         Self {
             node_id: None,
+            direct_addrs: None,
             warden_node_id: None,
             heartbeat_interval_secs: default_heartbeat_interval(),
             registration_retry_secs: default_registration_retry(),
@@ -255,6 +259,7 @@ impl MinerConfig {
 
         // Validator overrides
         env_string_opt("VALIDATOR_NODE_ID", &mut config.validator.node_id);
+        env_string_opt("VALIDATOR_DIRECT_ADDRS", &mut config.validator.direct_addrs);
         env_string_opt("WARDEN_NODE_ID", &mut config.validator.warden_node_id);
 
         // Tuning overrides
@@ -347,7 +352,7 @@ impl Default for TuningConfig {
 }
 
 fn default_store_concurrency() -> usize {
-    1024
+    16
 }
 fn default_pull_concurrency() -> usize {
     32
@@ -447,4 +452,13 @@ mod tests {
         assert_eq!(config.tuning.rebalance_tick_secs, 300);
         assert!(config.tuning.rebalance_enabled);
     }
+}
+/// Helper function to parse direct addresses
+pub fn parse_direct_addrs(addrs: &Option<String>) -> Vec<std::net::SocketAddr> {
+    addrs
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect()
 }

@@ -1,6 +1,6 @@
 [package]
 name = "miner"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 
 [dependencies]
@@ -37,3 +37,7 @@ tempfile = { workspace = true }
 [[bin]]
 name = "generate_keypair"
 path = "src/bin/generate_keypair.rs"
+
+[patch.crates-io]
+iroh-quinn = { path = "./vendor/iroh-quinn" }
+iroh-quinn-proto = { path = "./vendor/iroh-quinn-proto" }
