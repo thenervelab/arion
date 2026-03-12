@@ -18,6 +18,15 @@ tower-http = { version = "0.6.8", features = ["cors", "limit", "timeout"] }
 
 sled = "0.34"
 
+# ============================================
+# Metrics & Observability
+# ============================================
+
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "logs"] }
+opentelemetry-appender-tracing = "0.31"
+
 
 # ============================================
 # Async Runtime & Utilities
@@ -190,3 +199,8 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+
+[patch.crates-io]
+iroh-quinn = { path = "./vendor/iroh-quinn" }
+iroh-quinn-proto = { path = "./vendor/iroh-quinn-proto" }

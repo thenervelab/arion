@@ -52,7 +52,7 @@ pub const CONNECTION_TTL_SECS: u64 = 120;
 pub const MAX_CONNECTION_POOL_SIZE: usize = 500;
 
 /// Default timeout for pooled connection direct-path wait (seconds)
-pub const POOLED_CONN_DEFAULT_TIMEOUT_SECS: u64 = 5;
+pub const POOLED_CONN_DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Fraction of pool entries to evict when at capacity (1/N of pool size)
 pub const CONNECTION_POOL_EVICTION_FRACTION: usize = 10;
@@ -197,6 +197,11 @@ pub const RETRY_BACKOFF_BASE_SECS: u64 = 5;
 
 /// Base backoff for heartbeat failures (seconds)
 pub const FAILURE_BACKOFF_BASE_SECS: u64 = 30;
+
+/// Number of consecutive heartbeat failures before triggering automatic re-registration.
+/// After a validator restart, miners lose their connection. This triggers re-registration
+/// after 3 failures (~30s × 3 = ~90s) instead of waiting indefinitely.
+pub const HEARTBEAT_FAILURES_BEFORE_REREGISTRATION: u32 = 3;
 
 /// Maximum backoff cap for heartbeat failures (seconds)
 pub const FAILURE_BACKOFF_MAX_SECS: u64 = 120;

@@ -46,3 +46,8 @@ libm = "0.2"
 sentry = "0.46.2"
 sentry-tracing = "0.46.2"
 tracing-subscriber.workspace = true
+tracing-appender = "0.2.4"
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-appender-tracing = { workspace = true }

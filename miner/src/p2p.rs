@@ -395,6 +395,7 @@ async fn handle_single_stream(
         common::MinerControlMessage::PullFromPeer {
             hash,
             peer_endpoint,
+            ..
         } => {
             // Parse peer_endpoint string to EndpointAddr
             let peer_addr = match serde_json::from_str::<iroh::EndpointAddr>(&peer_endpoint) {

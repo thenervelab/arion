@@ -503,6 +503,10 @@ pub enum MinerControlMessage {
         hash: String,
         /// Peer's EndpointAddr as JSON string
         peer_endpoint: String,
+        /// Ed25519 signature over "PULL:{hash}" bytes, signed by the validator's iroh key.
+        /// Verified by the miner to authenticate the command.
+        #[serde(default)]
+        validator_signature: Vec<u8>,
     },
     /// Proof-of-storage challenge from Warden
     PosChallenge {
@@ -3115,13 +3119,21 @@ pub fn get_relay_url(config_url: Option<&str>) -> iroh_base::RelayUrl {
 /// Load all relay URLs. If a config/env override is set, returns only that
 /// URL. Otherwise returns all `DEFAULT_RELAY_URLS`.
 pub fn get_relay_urls(config_url: Option<&str>) -> Vec<iroh_base::RelayUrl> {
-    if let Some(url) = config_url.and_then(|s| s.parse().ok()) {
-        return vec![url];
+    if let Some(url_str) = config_url {
+        if url_str.eq_ignore_ascii_case("default") {
+            return vec![]; // Signal to use Iroh Default
+        }
+        if let Ok(url) = url_str.parse() {
+            return vec![url];
+        }
     }
-    if let Ok(val) = std::env::var("IROH_RELAY_URL")
-        && let Ok(url) = val.parse()
-    {
-        return vec![url];
+    if let Ok(val) = std::env::var("IROH_RELAY_URL") {
+        if val.eq_ignore_ascii_case("default") {
+            return vec![]; // Signal to use Iroh Default
+        }
+        if let Ok(url) = val.parse() {
+            return vec![url];
+        }
     }
     DEFAULT_RELAY_URLS
         .iter()
@@ -3129,8 +3141,11 @@ pub fn get_relay_urls(config_url: Option<&str>) -> Vec<iroh_base::RelayUrl> {
         .collect()
 }
 
-/// Build `RelayMode::Custom` from one or more relay URLs.
+/// Build `RelayMode::Custom` from one or more relay URLs, or `RelayMode::Default` if empty.
 pub fn build_relay_mode(urls: &[iroh_base::RelayUrl]) -> iroh::endpoint::RelayMode {
+    if urls.is_empty() {
+        return iroh::endpoint::RelayMode::Default;
+    }
     let configs: Vec<_> = urls
         .iter()
         .map(|url| iroh::RelayConfig::from(url.clone()))

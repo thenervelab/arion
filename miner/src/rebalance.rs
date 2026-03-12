@@ -106,10 +106,56 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
         "Responsible for PGs"
     );
 
-    if my_pgs.is_empty() {
-        warn!("No PGs assigned to this miner");
-        return Ok(());
-    }
+    // Retry loop: after re-registration the cluster map broadcast may not have
+    // arrived yet, so give it up to 60s before skipping this rebalance cycle.
+    let my_pgs = if !my_pgs.is_empty() {
+        my_pgs
+    } else {
+        const MAX_WAIT_SECS: u64 = 60;
+        const POLL_INTERVAL_SECS: u64 = 5;
+        const MAX_ATTEMPTS: u64 = MAX_WAIT_SECS / POLL_INTERVAL_SECS;
+        let mut found_pgs = Vec::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            warn!(
+                attempt,
+                max_attempts = MAX_ATTEMPTS,
+                "No PGs assigned yet — waiting for cluster map broadcast..."
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
+            // Re-read cluster map (may have been updated by validator broadcast)
+            let updated_map: Arc<common::ClusterMap> = {
+                let map_guard = get_cluster_map().read().await;
+                match map_guard.as_ref() {
+                    Some(map) => map.clone(),
+                    None => continue,
+                }
+            };
+            let map_for_pgs = updated_map.clone();
+            let pgs =
+                tokio::task::spawn_blocking(move || common::calculate_my_pgs(my_uid, &map_for_pgs))
+                    .await
+                    .unwrap_or_else(|e| {
+                        error!(error = %e, "PG calculation panicked during retry");
+                        Vec::new()
+                    });
+            if !pgs.is_empty() {
+                // Update cache with fresh result
+                let cache = crate::state::get_my_pgs_cache();
+                let mut cached = cache.write().await;
+                *cached = (updated_map.epoch, pgs.clone());
+                found_pgs = pgs;
+                break;
+            }
+        }
+        if found_pgs.is_empty() {
+            warn!(
+                waited_secs = MAX_WAIT_SECS,
+                "No PGs assigned after waiting, skipping this rebalance cycle"
+            );
+            return Ok(());
+        }
+        found_pgs
+    };
 
     trace!(pgs = ?my_pgs.iter().take(10).collect::<Vec<_>>(), "My PG assignments (first 10)");
 

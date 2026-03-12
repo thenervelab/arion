@@ -1405,6 +1405,18 @@ fn spawn_heartbeat_loop(
                 }
             }
 
+            // After 3 consecutive heartbeat failures, trigger re-registration.
+            // This handles the case where the validator restarted and the miner
+            // needs to re-announce itself (new node_id epoch, lost from cluster map).
+            if consecutive_failures >= constants::HEARTBEAT_FAILURES_BEFORE_REREGISTRATION {
+                warn!(
+                    consecutive_failures,
+                    "Too many consecutive heartbeat failures — triggering re-registration"
+                );
+                get_needs_reregistration().store(true, std::sync::atomic::Ordering::SeqCst);
+                consecutive_failures = 0;
+            }
+
             // Exponential backoff: 30s, 60s, 120s (capped) on consecutive failures
             let backoff_secs = if consecutive_failures == 0 {
                 constants::FAILURE_BACKOFF_BASE_SECS
@@ -1474,7 +1486,7 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<()> {
             );
         } else {
             info!(
-                ?resolved_ip,
+                direct_addrs = ?my_endpoint_addr.addrs,
                 p2p_port = ctx.config.network.p2p_port,
                 "Including direct address hint in registration"
             );

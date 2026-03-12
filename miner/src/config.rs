@@ -447,7 +447,7 @@ mod tests {
         let config = MinerConfig::default();
         assert_eq!(config.network.p2p_port, 11220);
         assert_eq!(config.network.family_id, "default");
-        assert_eq!(config.tuning.store_concurrency, 1024);
+        assert_eq!(config.tuning.store_concurrency, 16);
         assert_eq!(config.tuning.fetch_concurrency, 256);
         assert_eq!(config.tuning.rebalance_tick_secs, 300);
         assert!(config.tuning.rebalance_enabled);
