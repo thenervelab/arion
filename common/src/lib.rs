@@ -127,6 +127,29 @@ pub struct MinerNode {
     /// Zero means not yet computed (backward compat with old serialized maps).
     #[serde(default)]
     pub base_weight: u32,
+
+    // Trust score tracking for earned capacity
+    /// Total warden challenges received
+    #[serde(default)]
+    pub warden_challenges_total: u32,
+    /// Warden challenges that passed successfully
+    #[serde(default)]
+    pub warden_challenges_passed: u32,
+    /// Fetch timeout count reported by peers (rolling 24h window)
+    #[serde(default)]
+    pub fetch_timeout_count: u32,
+    /// Expected shard count based on CRUSH placement
+    #[serde(default)]
+    pub expected_shards: u32,
+    /// Actual shard count confirmed on miner
+    #[serde(default)]
+    pub actual_shards: u32,
+    /// Computed trust score in range [0.0, 1.0]
+    #[serde(default)]
+    pub trust_score: f32,
+    /// Computed earned capacity in bytes
+    #[serde(default)]
+    pub earned_capacity_bytes: u64,
 }
 
 /// Result of auditing a single shard's availability and integrity.
@@ -381,6 +404,55 @@ fn default_manifest_placement_version() -> u8 {
     1
 }
 
+/// Lightweight manifest for iroh-docs gossip distribution.
+///
+/// Contains only the fields needed for shard verification and CRUSH placement
+/// recalculation. Miner assignments are intentionally excluded — they are
+/// recalculated from CRUSH + the cluster map epoch at read time.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DocManifest {
+    /// BLAKE3 hash of the original file (64 hex characters)
+    pub file_hash: String,
+    /// Placement algorithm version (1, 2, or 3)
+    pub placement_version: u8,
+    /// Cluster map epoch when file was originally distributed
+    pub placement_epoch: u64,
+    /// Original file size in bytes
+    pub size: u64,
+    /// Erasure coding configuration (stripe size, k, m)
+    pub stripe_config: StripeConfig,
+    /// Shard hashes (index + blob_hash only, no miner info)
+    pub shards: Vec<ShardInfo>,
+}
+
+impl From<&FileManifest> for DocManifest {
+    fn from(m: &FileManifest) -> Self {
+        Self {
+            file_hash: m.file_hash.clone(),
+            placement_version: m.placement_version,
+            placement_epoch: m.placement_epoch,
+            size: m.size,
+            stripe_config: m.stripe_config.clone(),
+            shards: m.shards.clone(),
+        }
+    }
+}
+
+impl From<DocManifest> for FileManifest {
+    fn from(d: DocManifest) -> Self {
+        Self {
+            file_hash: d.file_hash,
+            placement_version: d.placement_version,
+            placement_epoch: d.placement_epoch,
+            size: d.size,
+            stripe_config: d.stripe_config,
+            shards: d.shards,
+            filename: None,
+            content_type: None,
+        }
+    }
+}
+
 impl FileManifest {
     /// Serializes the manifest to a JSON string.
     ///
@@ -396,6 +468,26 @@ impl FileManifest {
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
+}
+
+/// Serialize a [`DocManifest`] to bincode bytes for iroh-doc storage.
+pub fn doc_manifest_to_bytes(m: &DocManifest) -> anyhow::Result<Vec<u8>> {
+    bincode::serialize(m).map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Deserialize a [`DocManifest`] from bincode bytes.
+pub fn doc_manifest_from_bytes(b: &[u8]) -> anyhow::Result<DocManifest> {
+    bincode::deserialize(b).map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Serialize a [`ClusterMap`] to bincode bytes for iroh-doc storage.
+pub fn cluster_map_to_bytes(m: &ClusterMap) -> anyhow::Result<Vec<u8>> {
+    bincode::serialize(m).map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Deserialize a [`ClusterMap`] from bincode bytes.
+pub fn cluster_map_from_bytes(b: &[u8]) -> anyhow::Result<ClusterMap> {
+    bincode::deserialize(b).map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Configuration for Reed-Solomon erasure coding stripes.
@@ -3995,6 +4087,13 @@ mod tests {
                     integrity_fails: 0,
                     version: String::new(),
                     base_weight: 0,
+                    warden_challenges_total: 0,
+                    warden_challenges_passed: 0,
+                    fetch_timeout_count: 0,
+                    expected_shards: 0,
+                    actual_shards: 0,
+                    trust_score: 0.0,
+                    earned_capacity_bytes: 0,
                 }
             })
             .collect();
@@ -4116,6 +4215,13 @@ mod tests {
                     integrity_fails: 0,
                     version: String::new(),
                     base_weight: 0,
+                    warden_challenges_total: 0,
+                    warden_challenges_passed: 0,
+                    fetch_timeout_count: 0,
+                    expected_shards: 0,
+                    actual_shards: 0,
+                    trust_score: 0.0,
+                    earned_capacity_bytes: 0,
                 }
             })
             .collect();
@@ -4326,6 +4432,13 @@ mod tests {
                     integrity_fails: 0,
                     version: String::new(),
                     base_weight: 0,
+                    warden_challenges_total: 0,
+                    warden_challenges_passed: 0,
+                    fetch_timeout_count: 0,
+                    expected_shards: 0,
+                    actual_shards: 0,
+                    trust_score: 0.0,
+                    earned_capacity_bytes: 0,
                 });
                 uid_counter += 1;
             }

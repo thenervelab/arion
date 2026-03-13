@@ -95,10 +95,33 @@ static STATIC_DISCOVERY: OnceLock<iroh::address_lookup::memory::MemoryLookup> = 
 /// Cached PG assignments: (epoch, pgs) — recomputed only when epoch changes
 static MY_PGS_CACHE: OnceLock<Arc<RwLock<(u64, Vec<u32>)>>> = OnceLock::new();
 
+/// Tracks the last epoch change: (epoch, instant when it changed).
+/// Used by rebalance to defer work during topology churn.
+static LAST_EPOCH_CHANGE: OnceLock<Arc<RwLock<(u64, tokio::time::Instant)>>> = OnceLock::new();
+
+/// Data directory path for persisting cluster map cache to disk
+static DATA_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+
 /// PoS commitment cache: avoids rebuilding Poseidon2 Merkle trees on repeated challenges
 static POS_COMMITMENT_CACHE: OnceLock<
     Arc<Cache<iroh_blobs::Hash, Arc<pos_circuits::commitment::CommitmentWithTree>>>,
 > = OnceLock::new();
+
+/// Recent cluster map history for epoch lookback (newest at back).
+/// Prevents premature orphan GC during rebalancing transitions.
+static CLUSTER_MAP_HISTORY: OnceLock<
+    Arc<RwLock<std::collections::VecDeque<Arc<common::ClusterMap>>>>,
+> = OnceLock::new();
+
+/// Whether the miner has already joined the iroh-doc manifest gossip
+static DOC_JOINED: OnceLock<AtomicBool> = OnceLock::new();
+
+/// iroh-docs API handle (set once after joining the doc)
+static DOC_REPLICA: OnceLock<Arc<RwLock<Option<iroh_docs::api::Doc>>>> = OnceLock::new();
+
+/// iroh-docs blob store for reading doc entry content (set once after joining the doc)
+static DOC_REPLICA_BLOBS: OnceLock<Arc<RwLock<Option<iroh_blobs::store::fs::FsStore>>>> =
+    OnceLock::new();
 
 pub fn get_peer_cache() -> &'static DashMap<String, iroh::EndpointAddr> {
     PEER_MINER_CACHE.get_or_init(DashMap::new)
@@ -183,10 +206,43 @@ pub fn get_my_pgs_cache() -> &'static Arc<RwLock<(u64, Vec<u32>)>> {
     MY_PGS_CACHE.get_or_init(|| Arc::new(RwLock::new((0, Vec::new()))))
 }
 
+pub fn get_last_epoch_change() -> &'static Arc<RwLock<(u64, tokio::time::Instant)>> {
+    LAST_EPOCH_CHANGE.get_or_init(|| Arc::new(RwLock::new((0, tokio::time::Instant::now()))))
+}
+
+pub fn set_data_dir(path: std::path::PathBuf) {
+    let _ = DATA_DIR.set(path);
+}
+
+pub fn get_data_dir() -> Option<&'static std::path::PathBuf> {
+    DATA_DIR.get()
+}
+
 pub fn get_pos_commitment_cache()
 -> &'static Arc<Cache<iroh_blobs::Hash, Arc<pos_circuits::commitment::CommitmentWithTree>>> {
     POS_COMMITMENT_CACHE
         .get_or_init(|| Arc::new(Cache::new(crate::constants::POS_COMMITMENT_CACHE_SIZE)))
+}
+
+pub fn get_cluster_map_history()
+-> &'static Arc<RwLock<std::collections::VecDeque<Arc<common::ClusterMap>>>> {
+    CLUSTER_MAP_HISTORY.get_or_init(|| {
+        Arc::new(RwLock::new(std::collections::VecDeque::with_capacity(
+            crate::constants::MAX_CLUSTER_MAP_HISTORY,
+        )))
+    })
+}
+
+pub fn get_doc_joined() -> &'static AtomicBool {
+    DOC_JOINED.get_or_init(|| AtomicBool::new(false))
+}
+
+pub fn get_doc_replica() -> &'static Arc<RwLock<Option<iroh_docs::api::Doc>>> {
+    DOC_REPLICA.get_or_init(|| Arc::new(RwLock::new(None)))
+}
+
+pub fn get_doc_replica_blobs() -> &'static Arc<RwLock<Option<iroh_blobs::store::fs::FsStore>>> {
+    DOC_REPLICA_BLOBS.get_or_init(|| Arc::new(RwLock::new(None)))
 }
 
 /// Get a pooled connection or create a new one

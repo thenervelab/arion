@@ -1,6 +1,6 @@
 [package]
 name = "miner"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 
 [dependencies]
@@ -9,6 +9,8 @@ pos-circuits = { path = "../pos-circuits" }
 iroh = { workspace = true }
 iroh-base = { workspace = true }
 iroh-blobs = { workspace = true }
+iroh-docs = { workspace = true }
+iroh-gossip = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }

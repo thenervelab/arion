@@ -40,8 +40,8 @@ use crate::constants::{
 };
 use crate::helpers::{has_direct_ip_path, truncate_for_log};
 use crate::state::{
-    get_blob_cache, get_blobs_dir, get_cluster_map, get_current_epoch, get_peer_cache,
-    get_static_discovery, get_warden_node_ids,
+    get_blob_cache, get_blobs_dir, get_cluster_map, get_current_epoch, get_last_epoch_change,
+    get_peer_cache, get_static_discovery, get_warden_node_ids,
 };
 use anyhow::Result;
 use futures::StreamExt;
@@ -189,18 +189,21 @@ pub async fn handle_miner_control(
             .iter()
             .any(|p| matches!(p.remote_addr(), iroh::TransportAddr::Ip(_)));
         if has_direct {
+            let rtt_ms = paths
+                .iter()
+                .filter(|p| matches!(p.remote_addr(), iroh::TransportAddr::Ip(_)))
+                .map(|p| p.rtt().as_millis())
+                .next()
+                .unwrap_or(0);
             info!(
-                remote = %remote_node_id,
-                path_count = paths.len(),
-                paths = ?path_details,
-                "Inbound connection accepted with direct P2P path"
+                "[P2P] Inbound connection from {} (direct, {}ms)",
+                &remote_node_id.to_string()[..8],
+                rtt_ms
             );
         } else {
             debug!(
-                remote = %remote_node_id,
-                path_count = paths.len(),
-                paths = ?path_details,
-                "Inbound connection accepted via relay only (no direct path)"
+                "[P2P] Inbound connection from {} (relay only)",
+                &remote_node_id.to_string()[..8]
             );
         }
     }
@@ -243,7 +246,24 @@ pub async fn handle_miner_control(
             if let Err(e) =
                 handle_single_stream(send, recv, &remote_node_id, &handler, &conn_clone).await
             {
-                warn!(remote = %remote_node_id, error = %e, "Stream handler error");
+                let err_str = e.to_string();
+                // "sending stopped by peer: error 0" = clean close by remote, not an error
+                // "connection lost" / "connection closed" = expected during reconnects
+                if err_str.contains("error 0")
+                    || err_str.contains("connection lost")
+                    || err_str.contains("connection closed")
+                {
+                    trace!(
+                        remote = %&remote_node_id.to_string()[..8],
+                        "Stream closed by peer (normal)"
+                    );
+                } else {
+                    warn!(
+                        remote = %&remote_node_id.to_string()[..8],
+                        error = %e,
+                        "[P2P] Stream error"
+                    );
+                }
             }
         });
     }
@@ -549,6 +569,18 @@ async fn handle_store(
     crate::state::get_pos_commitment_cache().remove(&requested);
 
     trace!(hash = %outcome.hash, "Stored blob");
+
+    let size_human = if data_len >= 1_048_576 {
+        format!("{:.1} MiB", data_len as f64 / 1_048_576.0)
+    } else {
+        format!("{:.1} KiB", data_len as f64 / 1024.0)
+    };
+    info!(
+        "[SHARD] Stored shard {} ({}) from {}",
+        truncate_for_log(&outcome.hash.to_string(), 12),
+        size_human,
+        truncate_for_log(&remote_node_id.to_string(), 12),
+    );
 
     // Send ACK and wait for remote to receive it
     send_response(send, b"OK").await
@@ -884,6 +916,9 @@ async fn handle_cluster_map_update(
 
     if epoch_changed {
         debug!(old_epoch = old_epoch, new_epoch = epoch, "Epoch updated");
+        // Record when this epoch change happened for rebalance stability window
+        let mut last_change = get_last_epoch_change().write().await;
+        *last_change = (epoch, tokio::time::Instant::now());
     }
 
     // Update peer cache (lock-free DashMap)
@@ -944,7 +979,17 @@ async fn handle_cluster_map_update(
         } else {
             match serde_json::from_str::<common::ClusterMap>(&json) {
                 Ok(map) => {
+                    crate::rebalance::persist_cluster_map(&map).await;
                     let mut map_guard = get_cluster_map().write().await;
+                    // Save old map to history before replacing (for epoch lookback)
+                    if let Some(old_map) = map_guard.as_ref() {
+                        let history_lock = crate::state::get_cluster_map_history();
+                        let mut history = history_lock.write().await;
+                        if history.len() >= crate::constants::MAX_CLUSTER_MAP_HISTORY {
+                            history.pop_front();
+                        }
+                        history.push_back(Arc::clone(old_map));
+                    }
                     *map_guard = Some(Arc::new(map));
                 }
                 Err(e) => {
@@ -1055,10 +1100,36 @@ pub async fn pull_blob_from_peer(
 ) -> Result<()> {
     trace!(hash = %truncate_for_log(&hash, 16), "Pulling blob from peer");
 
-    // Use connection pool to avoid QUIC handshake on repeated pulls to the same peer
-    let conn =
-        crate::state::get_pooled_connection(&endpoint, &peer_addr, common::MINER_CONTROL_ALPN)
-            .await?;
+    let id_prefix = &peer_addr.id.to_string()[..8];
+
+    // Quick connectivity check: fail fast if peer is unreachable (3s timeout)
+    // rather than waiting for the full connect timeout (20s).
+    let conn = match tokio::time::timeout(
+        std::time::Duration::from_secs(crate::constants::REBALANCE_PEER_CONNECT_TIMEOUT_SECS),
+        crate::state::get_pooled_connection(&endpoint, &peer_addr, common::MINER_CONTROL_ALPN),
+    )
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            warn!(
+                "[REBALANCE] Peer {} unreachable, skipping (connect error: {})",
+                id_prefix, e
+            );
+            return Err(anyhow::anyhow!("Peer {} unreachable: {}", id_prefix, e));
+        }
+        Err(_) => {
+            warn!(
+                "[REBALANCE] Peer {} unreachable, skipping (connect timeout {}s)",
+                id_prefix,
+                crate::constants::REBALANCE_PEER_CONNECT_TIMEOUT_SECS,
+            );
+            return Err(anyhow::anyhow!(
+                "Peer {} unreachable: connect timeout",
+                id_prefix
+            ));
+        }
+    };
 
     // Wait briefly for direct path — after the initial relay
     // connect, hole-punching typically resolves in 30-100ms.
@@ -1116,6 +1187,8 @@ pub async fn pull_blob_from_peer(
         return Err(anyhow::anyhow!("Empty DATA payload from peer"));
     }
 
+    let pull_size = data.len();
+
     // Store blob and verify hash matches (add_bytes accepts impl Into<Bytes>)
     let outcome = store
         .add_bytes(data)
@@ -1133,8 +1206,17 @@ pub async fn pull_blob_from_peer(
             truncate_for_log(&stored_hash, 16)
         ));
     }
-
-    trace!(hash = %truncate_for_log(&hash, 16), "Pulled and stored blob from peer");
+    let pull_size_human = if pull_size >= 1_048_576 {
+        format!("{:.1} MiB", pull_size as f64 / 1_048_576.0)
+    } else {
+        format!("{:.1} KiB", pull_size as f64 / 1024.0)
+    };
+    info!(
+        "[SHARD] Stored shard {} ({}) from peer {}",
+        truncate_for_log(&hash, 12),
+        pull_size_human,
+        truncate_for_log(&peer_addr.id.to_string(), 12),
+    );
     Ok(())
 }
 

@@ -6,6 +6,7 @@
 
 mod config;
 mod constants;
+mod doc_replica;
 mod helpers;
 mod p2p;
 mod rebalance;
@@ -84,11 +85,20 @@ enum Commands {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::from_default_env().add_directive(
-                "iroh::socket::remote_map::remote_state=error"
-                    .parse()
-                    .unwrap(),
-            ),
+            EnvFilter::from_default_env()
+                .add_directive(
+                    "iroh::socket::remote_map::remote_state=off"
+                        .parse()
+                        .unwrap(),
+                )
+                .add_directive("iroh_quinn_proto=error".parse().unwrap())
+                .add_directive(
+                    "iroh::socket::transports::relay::actor=error"
+                        .parse()
+                        .unwrap(),
+                )
+                .add_directive("iroh_docs::engine::live=error".parse().unwrap())
+                .add_directive("iroh_gossip=error".parse().unwrap()),
         )
         .init();
 
@@ -517,6 +527,34 @@ async fn run_miner(cli: Cli) -> Result<()> {
     let miner_uid = common::compute_miner_uid(&node_id.to_string());
     state::set_miner_uid(miner_uid);
 
+    // Store data_dir globally for cluster map persistence
+    state::set_data_dir(data_dir.clone());
+
+    // Load cached cluster map from disk (survives restarts)
+    if let Some(map) = rebalance::load_cluster_map_cache(&data_dir).await {
+        let epoch = map.epoch;
+        let pgs = tokio::task::spawn_blocking({
+            let map_clone = map.clone();
+            move || common::calculate_my_pgs(miner_uid, &map_clone)
+        })
+        .await
+        .unwrap_or_default();
+        let pg_count = pgs.len();
+        {
+            let mut map_guard = state::get_cluster_map().write().await;
+            *map_guard = Some(std::sync::Arc::new(map));
+        }
+        {
+            let mut cached = state::get_my_pgs_cache().write().await;
+            *cached = (epoch, pgs);
+        }
+        info!(
+            epoch = epoch,
+            pgs = pg_count,
+            "[STARTUP] Loaded cached cluster map from disk"
+        );
+    }
+
     // Wait for relay connection (with timeout instead of fixed sleep)
     info!("Waiting for relay connection...");
     match tokio::time::timeout(
@@ -687,6 +725,16 @@ async fn run_miner(cli: Cli) -> Result<()> {
 
     // P2P Registration Loop with exponential backoff
     register_with_validator(&ctx).await?;
+
+    // 4b. Join iroh-doc if DOC_TICKET provided at startup
+    if let Ok(ticket) = std::env::var("DOC_TICKET") {
+        if !ticket.is_empty() {
+            info!("DOC_TICKET provided, joining iroh-doc manifest gossip");
+            if let Err(e) = doc_replica::join_doc(endpoint.clone(), &ctx.data_dir, &ticket).await {
+                warn!(error = %e, "Failed to join iroh-doc at startup, will retry via heartbeat");
+            }
+        }
+    }
 
     // 5. Start P2P Heartbeat Loop
     let shutdown_token = CancellationToken::new();
@@ -1267,6 +1315,21 @@ fn spawn_heartbeat_loop(
                     // This creates a direct path over time if holepunching succeeds.
                     if has_direct_ip_path(&conn) {
                         seed_validator_discovery(&conn, &current_validator_pubkey, &ctx.relay_url);
+                        if is_fresh_conn {
+                            use iroh::Watcher as _;
+                            let rtt_ms = conn
+                                .paths()
+                                .get()
+                                .iter()
+                                .filter(|p| p.is_ip())
+                                .map(|p| p.rtt().as_millis())
+                                .next()
+                                .unwrap_or(0);
+                            info!(
+                                "[CONNECTED] Validator reachable via direct P2P ({}ms latency)",
+                                rtt_ms
+                            );
+                        }
                     }
                     // If the connection is relay-only, we still send the heartbeat,
                     // but we log a warning and increment consecutive failures.
@@ -1311,29 +1374,52 @@ fn spawn_heartbeat_loop(
                             return Ok(false);
                         }
 
-                        // Try to parse JSON response for warden node IDs (new validator format)
+                        // Try to parse JSON response for warden node IDs and doc ticket
                         if let Ok(response) = serde_json::from_str::<serde_json::Value>(&ack_str)
-                            && let Some(ids) =
-                                response.get("warden_node_ids").and_then(|v| v.as_array())
                         {
-                            let mut new_ids = Vec::new();
-                            for id in ids {
-                                if let Some(s) = id.as_str()
-                                    && let Ok(pk) = iroh::PublicKey::from_str(s)
-                                {
-                                    new_ids.push(pk);
+                            if let Some(ids) =
+                                response.get("warden_node_ids").and_then(|v| v.as_array())
+                            {
+                                let mut new_ids = Vec::new();
+                                for id in ids {
+                                    if let Some(s) = id.as_str()
+                                        && let Ok(pk) = iroh::PublicKey::from_str(s)
+                                    {
+                                        new_ids.push(pk);
+                                    }
+                                }
+                                if !new_ids.is_empty() {
+                                    // Sort for deterministic comparison (validator sends from HashSet)
+                                    new_ids.sort();
+                                    let mut warden_ids = get_warden_node_ids().write().await;
+                                    if *warden_ids != new_ids {
+                                        debug!(
+                                            count = new_ids.len(),
+                                            "Updated warden node IDs from validator heartbeat"
+                                        );
+                                        *warden_ids = new_ids;
+                                    }
                                 }
                             }
-                            if !new_ids.is_empty() {
-                                // Sort for deterministic comparison (validator sends from HashSet)
-                                new_ids.sort();
-                                let mut warden_ids = get_warden_node_ids().write().await;
-                                if *warden_ids != new_ids {
-                                    debug!(
-                                        count = new_ids.len(),
-                                        "Updated warden node IDs from validator heartbeat"
-                                    );
-                                    *warden_ids = new_ids;
+
+                            // Join iroh-doc manifest gossip if ticket provided and not yet joined
+                            if !state::get_doc_joined().load(std::sync::atomic::Ordering::Acquire) {
+                                if let Some(ticket_str) =
+                                    response.get("doc_ticket").and_then(|v| v.as_str())
+                                {
+                                    let ep = ctx.endpoint.clone();
+                                    let dd = ctx.data_dir.clone();
+                                    let ts = ticket_str.to_string();
+                                    tokio::spawn(async move {
+                                        if let Err(e) =
+                                            doc_replica::join_doc(ep, &dd, &ts).await
+                                        {
+                                            warn!(
+                                                error = %e,
+                                                "Failed to join iroh-doc from heartbeat ticket"
+                                            );
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -1347,10 +1433,17 @@ fn spawn_heartbeat_loop(
                             consecutive_failures = 0;
                             get_validator_reachable()
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
+                            let hb_epoch = {
+                                let e = crate::state::get_current_epoch().read().await;
+                                *e
+                            };
+                            let hb_pgs = {
+                                let c = crate::state::get_my_pgs_cache().read().await;
+                                c.1.len()
+                            };
                             info!(
-                                heartbeat = heartbeat_count,
-                                cached = !is_fresh_conn,
-                                "Heartbeat OK"
+                                "[HEARTBEAT] OK — epoch={} assigned_pgs={}",
+                                hb_epoch, hb_pgs
                             );
                         }
                         Ok(Ok(false)) => {
@@ -1369,6 +1462,10 @@ fn spawn_heartbeat_loop(
                             continue;
                         }
                         Ok(Err(e)) if e.to_string() == "FAMILY_REJECTED" => {
+                            info!(
+                                "[DISCONNECTED] Validator rejected this miner's family, shutting down"
+                            );
+
                             if let Some(conn) = cached_conn.take() {
                                 conn.close(0u32.into(), b"shutdown");
                             }
@@ -1376,7 +1473,7 @@ fn spawn_heartbeat_loop(
                             return;
                         }
                         Ok(Err(e)) => {
-                            warn!(error = %e, "Heartbeat error");
+                            warn!(error = %e, "[DISCONNECTED] Lost connection to validator, will retry...");
                             if let Some(old) = cached_conn.take() {
                                 old.close(0u32.into(), b"stale");
                             }
@@ -1387,7 +1484,7 @@ fn spawn_heartbeat_loop(
                         Err(_) => {
                             warn!(
                                 timeout_secs = constants::HEARTBEAT_EXCHANGE_TIMEOUT_SECS,
-                                "Heartbeat exchange timed out"
+                                "[DISCONNECTED] Lost connection to validator, will retry..."
                             );
                             if let Some(old) = cached_conn.take() {
                                 old.close(0u32.into(), b"stale");
@@ -1399,7 +1496,7 @@ fn spawn_heartbeat_loop(
                     }
                 }
                 Err(e) => {
-                    warn!(error = %e, "Heartbeat connection unavailable");
+                    warn!(error = %e, "[DISCONNECTED] Lost connection to validator, will retry...");
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     get_validator_reachable().store(false, std::sync::atomic::Ordering::Relaxed);
                 }

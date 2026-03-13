@@ -171,7 +171,8 @@ pub const DIRECT_ADDR_DISCOVERY_TIMEOUT_SECS: u64 = 15;
 pub const HEARTBEAT_EXCHANGE_TIMEOUT_SECS: u64 = 30;
 
 /// Maximum buffer size for heartbeat ACK response (bytes)
-pub const HEARTBEAT_ACK_BUFFER_SIZE: usize = 1024;
+/// Increased to accommodate doc_ticket field in heartbeat response.
+pub const HEARTBEAT_ACK_BUFFER_SIZE: usize = 4096;
 
 /// Timeout for registration ACK from validator (seconds)
 pub const REGISTER_COMPLETION_TIMEOUT_SECS: u64 = 10;
@@ -253,6 +254,33 @@ pub const MAX_REBALANCE_INITIAL_JITTER_SECS: u64 = 30;
 /// Direct path wait timeout during heartbeat probe (seconds)
 pub const REBALANCE_DIRECT_PATH_WAIT_SECS: u64 = 10;
 
+/// Minimum time since last epoch change before rebalance runs (seconds).
+/// Prevents rebalance from acting on a stale or rapidly-changing topology.
+pub const REBALANCE_STABLE_WINDOW_SECS: u64 = 300;
+
+/// Timeout for quick connectivity check to a peer before fetching shards (seconds)
+pub const REBALANCE_PEER_CONNECT_TIMEOUT_SECS: u64 = 3;
+
+/// Number of concurrent shard fetches during rebalance (adaptive, starts here)
+pub const REBALANCE_FETCH_CONCURRENCY: usize = 4;
+
+/// Max concurrent shard fetches (adaptive ceiling)
+pub const REBALANCE_FETCH_MAX_CONCURRENCY: usize = 16;
+
+/// Min concurrent shard fetches (adaptive floor)
+pub const REBALANCE_FETCH_MIN_CONCURRENCY: usize = 1;
+
+/// Number of consecutive successes before increasing rebalance fetch concurrency
+pub const REBALANCE_FETCH_SCALEUP_THRESHOLD: usize = 5;
+
+/// Epoch lookback depth for shard placement during rebalance.
+/// Shards placed on this miner under any cluster map within this window
+/// are considered expected, preventing premature orphan GC during transitions.
+pub const EPOCH_LOOKBACK: u64 = 50;
+
+/// Maximum cluster map history entries retained for epoch lookback.
+pub const MAX_CLUSTER_MAP_HISTORY: usize = 10;
+
 // ============================================================================
 // P2P Operations
 // ============================================================================
@@ -304,6 +332,21 @@ pub const MANIFEST_RESPONSE_MAX_SIZE: usize = 1024 * 1024;
 
 /// Timeout for reading a manifest response from validator (seconds)
 pub const MANIFEST_READ_TIMEOUT_SECS: u64 = 30;
+
+// ============================================================================
+// Erasure Reconstruction
+// ============================================================================
+
+/// Maximum concurrent erasure reconstruction tasks per miner.
+/// Reconstruction is CPU + network intensive (fetches k=10 shards from peers
+/// then runs RS decode), so keep this low.
+pub const MAX_CONCURRENT_RECONSTRUCTIONS: usize = 2;
+
+/// Timeout for connecting to a peer miner during shard reconstruction (seconds)
+pub const RECONSTRUCT_PEER_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Timeout for reading shard data from a peer during reconstruction (seconds)
+pub const RECONSTRUCT_PEER_READ_TIMEOUT_SECS: u64 = 30;
 
 // ============================================================================
 // Miscellaneous
