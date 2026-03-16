@@ -1,5 +1,4 @@
 //! Miner entry point for the Hippius Arion storage subnet.
-#![allow(warnings)]
 //!
 //! The miner receives shards from validators via P2P, stores them in Iroh's
 //! FsStore, and serves them back to gateways and other miners on request.
@@ -7,6 +6,7 @@
 mod config;
 mod constants;
 mod doc_replica;
+mod gateway_keepalive;
 mod helpers;
 mod p2p;
 mod rebalance;
@@ -305,11 +305,23 @@ impl MinerContext {
         if let Some(url) = &self.relay_url {
             addr = addr.with_relay_url(url.clone());
         }
-        // Resolve direct address: hostname first, STUN fallback second.
+        // Resolve direct address: hostname first, STUN fallback second,
+        // then iroh's own discovered public IP (from QUIC addr discovery).
         let resolved_ip = self
             .resolve_hostname_ip()
             .filter(|ip| common::is_advertisable_ip(*ip))
-            .or(self.stun_public_ip);
+            .or(self.stun_public_ip)
+            .or_else(|| {
+                // Fallback: use iroh's own discovered public IP.
+                // This works for bare-metal miners with a public IP that don't
+                // have a hostname configured — iroh discovers the public IP
+                // via QUIC addr discovery when the relay connection is established.
+                self.endpoint
+                    .addr()
+                    .ip_addrs()
+                    .find(|sock| common::is_advertisable_ip(sock.ip()))
+                    .map(|sock| sock.ip())
+            });
         if let Some(ip) = resolved_ip {
             let direct_addr = std::net::SocketAddr::new(ip, self.config.network.p2p_port);
             addr = addr.with_addrs(vec![iroh::TransportAddr::Ip(direct_addr)]);
@@ -317,8 +329,9 @@ impl MinerContext {
             warn!(
                 hostname = %self.hostname,
                 stun_ip = ?self.stun_public_ip,
-                "No advertisable IP for endpoint: hostname resolved to unusable address \
-                 and STUN detection unavailable. Set --hostname to your public IP."
+                "No advertisable IP for endpoint: hostname resolved to unusable address, \
+                 STUN detection unavailable, and iroh addr discovery pending. \
+                 Set --hostname to your public IP for reliable direct connections."
             );
         }
         addr
@@ -328,6 +341,9 @@ impl MinerContext {
 async fn run_miner(cli: Cli) -> Result<()> {
     info!(version = env!("CARGO_PKG_VERSION"), "Starting miner");
     tokio::spawn(version_check::check_for_updates());
+
+    // Preflight: check firewall/conntrack settings that can silently kill QUIC
+    check_network_health();
 
     // Load config from TOML file with env overrides
     let config = match config::MinerConfig::load(None) {
@@ -724,7 +740,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
     info!(validator = %truncate_for_log(&validator_node_id_str, 16), "Registering with validator via P2P");
 
     // P2P Registration Loop with exponential backoff
-    register_with_validator(&ctx).await?;
+    let reg_conn = register_with_validator(&ctx).await?;
 
     // 4b. Join iroh-doc if DOC_TICKET provided at startup
     if let Ok(ticket) = std::env::var("DOC_TICKET") {
@@ -736,10 +752,15 @@ async fn run_miner(cli: Cli) -> Result<()> {
         }
     }
 
-    // 5. Start P2P Heartbeat Loop
+    // 5. Start P2P Heartbeat Loop (reuse registration connection)
     let shutdown_token = CancellationToken::new();
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
-    spawn_heartbeat_loop(ctx.clone(), shutdown_notify.clone(), shutdown_token.clone());
+    spawn_heartbeat_loop(
+        ctx.clone(),
+        shutdown_notify.clone(),
+        shutdown_token.clone(),
+        Some(reg_conn),
+    );
 
     // 5b. Start relay health monitor
     spawn_relay_health_monitor(
@@ -747,6 +768,9 @@ async fn run_miner(cli: Cli) -> Result<()> {
         shutdown_notify.clone(),
         shutdown_token.clone(),
     );
+
+    // 5c. Start gateway keepalive loop (miner→gateway persistent connections)
+    gateway_keepalive::spawn_gateway_keepalive(endpoint.clone(), shutdown_token.clone());
 
     // 6. Start Self-Rebalance Loop (if enabled)
     if config.tuning.rebalance_enabled {
@@ -863,6 +887,47 @@ async fn run_miner(cli: Cli) -> Result<()> {
 }
 
 /// Build a validator `EndpointAddr` from public key and optional relay URL.
+/// Preflight network health checks.
+///
+/// Warns about system settings that can silently break QUIC connections:
+/// - Linux conntrack UDP timeout too low (kills outbound QUIC paths)
+/// - UFW / iptables INPUT DROP without adequate conntrack timeouts
+fn check_network_health() {
+    // Check conntrack UDP timeouts (Linux only).
+    // Both `nf_conntrack_udp_timeout` (unreplied flows) and
+    // `nf_conntrack_udp_timeout_stream` (established bidirectional flows)
+    // must be >= 120s or QUIC connections will be silently killed.
+    for (path, label) in [
+        (
+            "/proc/sys/net/netfilter/nf_conntrack_udp_timeout",
+            "nf_conntrack_udp_timeout",
+        ),
+        (
+            "/proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream",
+            "nf_conntrack_udp_timeout_stream",
+        ),
+    ] {
+        if let Ok(val) = std::fs::read_to_string(path) {
+            if let Ok(timeout) = val.trim().parse::<u64>() {
+                if timeout < 120 {
+                    warn!(
+                        param = label,
+                        current_timeout = timeout,
+                        required = 120,
+                        "⚠️  LOW CONNTRACK UDP TIMEOUT — QUIC connections may drop after {timeout}s. \
+                         Run: sudo sysctl -w {label}=120 \
+                         and persist in /etc/sysctl.conf. \
+                         See miner README for details."
+                    );
+                } else {
+                    info!(param = label, timeout, "Conntrack UDP timeout OK");
+                }
+            }
+        }
+    }
+    // No /proc/sys/net/netfilter means conntrack is not loaded — no firewall issue
+}
+
 /// Iroh discovers the validator's direct address via relay-assisted
 /// hole-punching — no hardcoded IPs needed.
 fn build_validator_addr(
@@ -923,6 +988,7 @@ fn seed_validator_discovery(
 /// Delegates core waiting to `common::wait_for_direct_ip_path` and adds
 /// miner-specific logging (troubleshooting hints on long registration
 /// waits, debug-level for heartbeat probes).
+#[allow(dead_code)]
 async fn wait_for_direct_path(
     conn: &iroh::endpoint::Connection,
     endpoint: &iroh::Endpoint,
@@ -957,7 +1023,7 @@ async fn wait_for_direct_path(
     found
 }
 
-async fn register_with_validator(ctx: &MinerContext) -> Result<()> {
+async fn register_with_validator(ctx: &MinerContext) -> Result<iroh::endpoint::Connection> {
     // NAT traversal requires an active connection — direct path waiting
     // happens inside register_with_validator_once after connect().
 
@@ -967,13 +1033,13 @@ async fn register_with_validator(ctx: &MinerContext) -> Result<()> {
 
     loop {
         match register_with_validator_once(ctx).await {
-            Ok(()) => {
+            Ok(conn) => {
                 info!("Registered with validator via P2P");
                 {
                     let mut val_ep = get_validator_endpoint().write().await;
                     *val_ep = Some(ctx.validator_addr());
                 }
-                return Ok(());
+                return Ok(conn);
             }
             Err(e) => {
                 let is_warming_up = e.to_string().contains("warming up");
@@ -1127,22 +1193,28 @@ fn spawn_heartbeat_loop(
     ctx: MinerContext,
     shutdown: Arc<tokio::sync::Notify>,
     cancel_token: CancellationToken,
+    initial_conn: Option<iroh::endpoint::Connection>,
 ) {
     let miner_uid = state::get_miner_uid();
-    let cached_endpoint_addr = ctx.build_endpoint_addr();
+    // Build initial endpoint addr — may be relay-only if iroh hasn't discovered
+    // the public IP yet. We refresh it every few heartbeats so that once iroh
+    // discovers the public IP via QUIC addr discovery, subsequent heartbeats
+    // advertise the direct address to the validator.
+    let mut cached_endpoint_addr = ctx.build_endpoint_addr();
+    let mut endpoint_addr_refresh_counter: u32 = 0;
 
     tokio::spawn(async move {
         let mut heartbeat_count: u32 = 0;
         let mut consecutive_failures: u32 = 0;
         let mut current_validator_pubkey = ctx.validator_pubkey;
 
-        let mut heartbeat_validator_addr =
-            build_validator_addr(&current_validator_pubkey, &ctx.relay_url);
+        let mut heartbeat_validator_addr = ctx.validator_addr();
 
         // Persistent connection: reuse a single QUIC connection across heartbeats
-        // instead of creating a new one every 30s. Open a fresh bidi stream per
-        // heartbeat on the existing connection; reconnect only when it drops.
-        let mut cached_conn: Option<iroh::endpoint::Connection> = None;
+        // instead of creating a new one every 30s. Seed with the registration
+        // connection so the first heartbeat doesn't need a new connect().
+        let mut cached_conn: Option<iroh::endpoint::Connection> = initial_conn;
+        let mut consecutive_rereg_failures: u32 = 0;
 
         loop {
             // Check if re-registration is needed
@@ -1158,20 +1230,25 @@ fn spawn_heartbeat_loop(
                     ..ctx.clone()
                 };
                 match register_with_validator_once(&rereg_ctx).await {
-                    Ok(()) => {
+                    Ok(new_conn) => {
+                        consecutive_rereg_failures = 0;
                         info!("Re-registration successful");
-                        // Update stored validator endpoint
-                        let new_addr =
-                            build_validator_addr(&current_validator_pubkey, &ctx.relay_url);
+                        // Update stored validator endpoint (include direct addrs from config)
+                        let new_ctx = MinerContext {
+                            validator_pubkey: current_validator_pubkey,
+                            ..ctx.clone()
+                        };
+                        let new_addr = new_ctx.validator_addr();
                         {
                             let mut val_ep = get_validator_endpoint().write().await;
                             *val_ep = Some(new_addr.clone());
                         }
                         heartbeat_validator_addr = new_addr;
-                        // Close and invalidate cached connection after re-registration
+                        // Replace cached connection with the fresh registration connection
                         if let Some(old) = cached_conn.take() {
                             old.close(0u32.into(), b"stale");
                         }
+                        cached_conn = Some(new_conn);
                         // Jitter before the next heartbeat to prevent thundering
                         // herd when many miners re-register simultaneously
                         // (e.g. after a validator restart).
@@ -1180,7 +1257,31 @@ fn spawn_heartbeat_loop(
                         tokio::time::sleep(tokio::time::Duration::from_millis(jitter_ms)).await;
                     }
                     Err(e) => {
-                        error!(error = %e, "Re-registration failed, will retry on next heartbeat");
+                        consecutive_rereg_failures = consecutive_rereg_failures.saturating_add(1);
+                        error!(
+                            error = %e,
+                            attempt = consecutive_rereg_failures,
+                            "Re-registration failed, will retry on next heartbeat"
+                        );
+
+                        // After too many consecutive failures, iroh's cached QUIC
+                        // path is likely stale and won't recover on its own.
+                        // Trigger clean exit so systemd restarts with fresh state.
+                        if consecutive_rereg_failures
+                            >= constants::MAX_REREGISTRATION_FAILURES_BEFORE_EXIT
+                        {
+                            error!(
+                                consecutive_failures = consecutive_rereg_failures,
+                                "Re-registration stuck in failure loop — triggering clean exit \
+                                 for systemd restart with fresh iroh endpoint"
+                            );
+                            if let Some(conn) = cached_conn.take() {
+                                conn.close(0u32.into(), b"stale-rereg");
+                            }
+                            shutdown.notify_one();
+                            return;
+                        }
+
                         // Set flag again to retry
                         get_needs_reregistration().store(true, std::sync::atomic::Ordering::SeqCst);
                         // Jitter avoids all miners retrying registration simultaneously
@@ -1210,8 +1311,13 @@ fn spawn_heartbeat_loop(
                     "Validator address refreshed from environment"
                 );
                 current_validator_pubkey = new_pubkey;
-                heartbeat_validator_addr =
-                    build_validator_addr(&current_validator_pubkey, &ctx.relay_url);
+                {
+                    let refresh_ctx = MinerContext {
+                        validator_pubkey: current_validator_pubkey,
+                        ..ctx.clone()
+                    };
+                    heartbeat_validator_addr = refresh_ctx.validator_addr();
+                }
 
                 // Update stored validator endpoint
                 {
@@ -1259,6 +1365,31 @@ fn spawn_heartbeat_loop(
             } else {
                 available
             };
+
+            // Refresh endpoint addr periodically so that once iroh discovers the
+            // public IP via QUIC addr discovery, subsequent heartbeats advertise
+            // the direct address (important for miners with no hostname configured).
+            endpoint_addr_refresh_counter = endpoint_addr_refresh_counter.wrapping_add(1);
+            if endpoint_addr_refresh_counter
+                .is_multiple_of(constants::ENDPOINT_ADDR_REFRESH_INTERVAL_CYCLES)
+            {
+                let refreshed = ctx.build_endpoint_addr();
+                let had_direct = cached_endpoint_addr
+                    .addrs
+                    .iter()
+                    .any(|a| matches!(a, iroh::TransportAddr::Ip(_)));
+                let now_has_direct = refreshed
+                    .addrs
+                    .iter()
+                    .any(|a| matches!(a, iroh::TransportAddr::Ip(_)));
+                if !had_direct && now_has_direct {
+                    info!(
+                        addrs = ?refreshed.addrs,
+                        "Endpoint addr upgraded: now advertising direct IP to validator"
+                    );
+                }
+                cached_endpoint_addr = refreshed;
+            }
 
             let heartbeat_msg = {
                 let public_key_str = ctx.endpoint.secret_key().public().to_string();
@@ -1542,7 +1673,7 @@ fn spawn_heartbeat_loop(
 }
 
 /// Perform a single registration attempt with the validator (for re-registration).
-async fn register_with_validator_once(ctx: &MinerContext) -> Result<()> {
+async fn register_with_validator_once(ctx: &MinerContext) -> Result<iroh::endpoint::Connection> {
     // Calculate storage stats
     let available = free_space(&ctx.data_dir).unwrap_or(0);
     let total = fs2::total_space(&ctx.data_dir).unwrap_or(0);
@@ -1668,6 +1799,9 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<()> {
     }
     .await;
 
-    conn.close(0u32.into(), b"done");
-    result
+    // Don't close the connection — return it so the heartbeat loop can reuse it.
+    // Closing forces iroh to create a new QUIC path on the next connect(), which
+    // may fail if the outbound UDP path is flaky (e.g. Contabo→OVH).
+    result?;
+    Ok(conn)
 }

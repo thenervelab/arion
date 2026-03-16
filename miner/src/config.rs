@@ -191,7 +191,8 @@ pub struct ValidatorConfig {
     /// Validator Node ID (Ed25519 public key) for P2P
     pub node_id: Option<String>,
 
-    /// Validator direct addresses (comma-separated list of IP:PORT)
+    /// Validator direct addresses (comma-separated list of IP:PORT).
+    /// Default: production validator IP. Override with VALIDATOR_DIRECT_ADDRS env var.
     pub direct_addrs: Option<String>,
 
     /// Warden Node ID (Ed25519 public key) for PoS challenges
@@ -210,7 +211,7 @@ impl Default for ValidatorConfig {
     fn default() -> Self {
         Self {
             node_id: None,
-            direct_addrs: None,
+            direct_addrs: Some("51.210.230.161:11220".to_string()),
             warden_node_id: None,
             heartbeat_interval_secs: default_heartbeat_interval(),
             registration_retry_secs: default_registration_retry(),

@@ -123,6 +123,11 @@ static DOC_REPLICA: OnceLock<Arc<RwLock<Option<iroh_docs::api::Doc>>>> = OnceLoc
 static DOC_REPLICA_BLOBS: OnceLock<Arc<RwLock<Option<iroh_blobs::store::fs::FsStore>>>> =
     OnceLock::new();
 
+/// Known gateway endpoints received from ClusterMapUpdate broadcasts.
+/// Key: node_id hex string, Value: GatewayEndpoint (node_id, public_addr, last_seen).
+/// Updated on each ClusterMapUpdate; read by the gateway keepalive background task.
+static GATEWAY_ENDPOINTS: OnceLock<DashMap<String, common::GatewayEndpoint>> = OnceLock::new();
+
 pub fn get_peer_cache() -> &'static DashMap<String, iroh::EndpointAddr> {
     PEER_MINER_CACHE.get_or_init(DashMap::new)
 }
@@ -243,6 +248,10 @@ pub fn get_doc_replica() -> &'static Arc<RwLock<Option<iroh_docs::api::Doc>>> {
 
 pub fn get_doc_replica_blobs() -> &'static Arc<RwLock<Option<iroh_blobs::store::fs::FsStore>>> {
     DOC_REPLICA_BLOBS.get_or_init(|| Arc::new(RwLock::new(None)))
+}
+
+pub fn get_gateway_endpoints() -> &'static DashMap<String, common::GatewayEndpoint> {
+    GATEWAY_ENDPOINTS.get_or_init(DashMap::new)
 }
 
 /// Get a pooled connection or create a new one

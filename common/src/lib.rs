@@ -150,6 +150,20 @@ pub struct MinerNode {
     /// Computed earned capacity in bytes
     #[serde(default)]
     pub earned_capacity_bytes: u64,
+    /// When true, miner is deregistered and draining — read-only source,
+    /// invisible as a destination for new shard placement.
+    #[serde(default)]
+    pub draining: bool,
+
+    /// P2P reliability score in range [0.0, 1.0].
+    /// Used to modulate CRUSH weight — miners with low scores get fewer shards.
+    /// Updated by the validator's P2P connectivity probe and FetchBlob outcomes.
+    #[serde(default = "default_reliability_score")]
+    pub p2p_reliability_score: f64,
+}
+
+fn default_reliability_score() -> f64 {
+    1.0
 }
 
 /// Result of auditing a single shard's availability and integrity.
@@ -214,6 +228,23 @@ pub struct SyncIndex {
 /// - Miner weights change significantly
 /// - Manual rebalancing is triggered
 ///
+/// A gateway endpoint registered with the validator for client discovery.
+/// Included in `ClusterMapUpdate` broadcasts so miners and other nodes know
+/// which gateways are available for HTTP ingress.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct GatewayEndpoint {
+    /// Unique identifier for this gateway (typically the Iroh node ID hex string)
+    pub node_id: String,
+    /// Public HTTP address (e.g. "https://gateway.example.com:3000")
+    pub public_addr: String,
+    /// Direct P2P address for iroh QUIC connections (e.g. "51.91.196.88:11205")
+    /// Miners use this to establish keepalive connections to gateways.
+    #[serde(default)]
+    pub direct_addr: Option<String>,
+    /// Unix timestamp of last heartbeat (for TTL-based cleanup)
+    pub last_seen: u64,
+}
+
 /// Files store their `placement_epoch` in the manifest to support epoch-fallback
 /// reads during cluster transitions.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -588,6 +619,9 @@ pub enum MinerControlMessage {
         /// Authorized warden node IDs for PoS challenge authorization (auto-distributed by validator)
         #[serde(default)]
         warden_node_ids: Option<Vec<String>>,
+        /// Known gateway endpoints for client discovery (optional, empty for old miners)
+        #[serde(default)]
+        gateway_endpoints: Vec<GatewayEndpoint>,
     },
     /// Instruct miner to pull a blob from a peer via Iroh P2P
     PullFromPeer {
@@ -1841,6 +1875,13 @@ pub struct WardenShardCommitment {
 /// - Proof-of-storage challenges from wardens
 pub const MINER_CONTROL_ALPN: &[u8] = b"hippius/miner-control";
 
+/// ALPN protocol identifier for Miner → Gateway inbound connections.
+///
+/// Used for miner-initiated connections to the gateway. The miner connects
+/// and sends its UID; the gateway adds the connection to its pool, preferring
+/// inbound connections over outbound ones.
+pub const GATEWAY_INBOUND_ALPN: &[u8] = b"hippius/gateway-inbound";
+
 /// ALPN protocol identifier for Miner → Validator P2P communication.
 ///
 /// Used for:
@@ -2347,6 +2388,58 @@ pub fn calculate_stripe_placement(
         2 => calculate_pg_placement_for_stripe(file_hash, stripe_index, shards_per_stripe, map),
         _ => calculate_placement_for_stripe(file_hash, stripe_index, shards_per_stripe, map),
     }
+}
+
+/// Reliability-aware variant of `calculate_stripe_placement`.
+///
+/// Multiplies each miner's CRUSH weight by its P2P reliability score,
+/// and skips miners whose score is below 0.2. Reliability scores are
+/// passed externally to preserve CRUSH determinism (ClusterMap is shared
+/// and snapshotted — embedding mutable scores would break consistency).
+///
+/// Gateway continues to use `calculate_stripe_placement` (no scores).
+/// Validator recovery uses this variant for smarter shard placement.
+pub fn calculate_stripe_placement_with_reliability(
+    file_hash: &str,
+    stripe_index: u64,
+    shards_per_stripe: usize,
+    map: &ClusterMap,
+    placement_version: u8,
+    reliability_scores: &std::collections::HashMap<u32, f64>,
+) -> Result<Vec<MinerNode>, String> {
+    // Build a filtered ClusterMap with adjusted weights
+    let mut adjusted_map = map.clone();
+    adjusted_map.miners.retain(|m| {
+        let score = reliability_scores.get(&m.uid).copied().unwrap_or(1.0);
+        score >= 0.2
+    });
+    for miner in &mut adjusted_map.miners {
+        let score = reliability_scores
+            .get(&miner.uid)
+            .copied()
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        miner.weight = std::cmp::max(1, (miner.weight as f64 * score) as u32);
+    }
+
+    // Fall back to original map if too few miners remain after filtering
+    if adjusted_map.miners.len() < shards_per_stripe {
+        return calculate_stripe_placement(
+            file_hash,
+            stripe_index,
+            shards_per_stripe,
+            map,
+            placement_version,
+        );
+    }
+
+    calculate_stripe_placement(
+        file_hash,
+        stripe_index,
+        shards_per_stripe,
+        &adjusted_map,
+        placement_version,
+    )
 }
 
 // ============================================================================
@@ -4094,6 +4187,8 @@ mod tests {
                     actual_shards: 0,
                     trust_score: 0.0,
                     earned_capacity_bytes: 0,
+                    draining: false,
+                    p2p_reliability_score: 1.0,
                 }
             })
             .collect();
@@ -4222,6 +4317,8 @@ mod tests {
                     actual_shards: 0,
                     trust_score: 0.0,
                     earned_capacity_bytes: 0,
+                    draining: false,
+                    p2p_reliability_score: 1.0,
                 }
             })
             .collect();
@@ -4439,6 +4536,8 @@ mod tests {
                     actual_shards: 0,
                     trust_score: 0.0,
                     earned_capacity_bytes: 0,
+                    draining: false,
+                    p2p_reliability_score: 1.0,
                 });
                 uid_counter += 1;
             }

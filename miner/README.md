@@ -37,6 +37,35 @@ echo test | nc -u -w2 <your-public-ip> 11220
 
 Docker bridge networking is **not supported**. Run the miner directly on the host. If Docker is installed but the miner runs natively, set `P2P_BIND_IPV4` to your public IP to avoid advertising the `docker0` address.
 
+### Firewall & Conntrack (UFW / iptables)
+
+If your server uses a firewall with `INPUT DROP` policy (e.g. UFW), you **must** ensure the Linux conntrack UDP timeout is high enough to keep QUIC connections alive.
+
+The miner communicates with the validator over QUIC (UDP). Linux conntrack tracks outbound UDP flows and allows return traffic. By default, the conntrack timeout for "unreplied" UDP flows is **30 seconds**, which is too short — QUIC path probing will consider the path dead and abandon the connection.
+
+**Required sysctl setting:**
+
+```bash
+# Check current values
+sysctl net.netfilter.nf_conntrack_udp_timeout
+sysctl net.netfilter.nf_conntrack_udp_timeout_stream
+
+# Set both to 120 seconds (must be >= QUIC idle timeout)
+sudo sysctl -w net.netfilter.nf_conntrack_udp_timeout=120
+sudo sysctl -w net.netfilter.nf_conntrack_udp_timeout_stream=120
+
+# Persist across reboots
+echo 'net.netfilter.nf_conntrack_udp_timeout=120' | sudo tee -a /etc/sysctl.conf
+echo 'net.netfilter.nf_conntrack_udp_timeout_stream=120' | sudo tee -a /etc/sysctl.conf
+```
+
+**Symptoms of a too-low timeout:**
+- Miner registers successfully but loses connection ~30s later
+- Logs show: `[DISCONNECTED] Lost connection to validator` or `no viable network path exists: last path abandoned by peer`
+- Re-registration attempts fail with `connect timeout` or `server refused to accept a new connection`
+
+> **Note:** This primarily affects miners on networks outside the validator's local network (e.g. different hosting providers). Miners on the same network (e.g. same vRack/VLAN) are typically unaffected.
+
 ## Configuration
 
 Copy `miner.example.toml` to `miner.toml`:

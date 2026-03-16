@@ -204,6 +204,12 @@ pub const FAILURE_BACKOFF_BASE_SECS: u64 = 30;
 /// after 3 failures (~30s × 3 = ~90s) instead of waiting indefinitely.
 pub const HEARTBEAT_FAILURES_BEFORE_REREGISTRATION: u32 = 3;
 
+/// Maximum consecutive re-registration failures before triggering a clean exit.
+/// When iroh's QUIC path to the validator goes stale, re-registration keeps
+/// timing out on the same dead path. After this many failures the miner exits
+/// cleanly so systemd restarts it with a fresh iroh endpoint.
+pub const MAX_REREGISTRATION_FAILURES_BEFORE_EXIT: u32 = 10;
+
 /// Maximum backoff cap for heartbeat failures (seconds)
 pub const FAILURE_BACKOFF_MAX_SECS: u64 = 120;
 
@@ -224,10 +230,16 @@ pub const RELAY_LOSS_RECOVERY_DELAY_SECS: u64 = 5;
 pub const SHUTDOWN_GRACE_PERIOD_MS: u64 = 500;
 
 /// Number of consecutive relay-only heartbeat failures before re-registration
+#[allow(dead_code)]
 pub const RELAY_FAILURES_REREGISTER_THRESHOLD: u32 = 3;
 
 /// Interval (in heartbeat cycles) to refresh validator address from environment
 pub const VALIDATOR_ADDR_REFRESH_INTERVAL_CYCLES: u32 = 10;
+
+/// How often to refresh the cached endpoint addr in the heartbeat loop
+/// (in heartbeat cycles, ~30s each). After iroh discovers the public IP
+/// via QUIC addr discovery, the next refresh will advertise the direct addr.
+pub const ENDPOINT_ADDR_REFRESH_INTERVAL_CYCLES: u32 = 3; // ~90s
 
 /// How often to check relay status after detecting loss (seconds).
 /// Between checks, the monitor calls endpoint.online() to nudge reconnection.
@@ -252,6 +264,7 @@ pub const MIN_REBALANCE_JITTER_SECS: u64 = 10;
 pub const MAX_REBALANCE_INITIAL_JITTER_SECS: u64 = 30;
 
 /// Direct path wait timeout during heartbeat probe (seconds)
+#[allow(dead_code)]
 pub const REBALANCE_DIRECT_PATH_WAIT_SECS: u64 = 10;
 
 /// Minimum time since last epoch change before rebalance runs (seconds).
@@ -340,12 +353,15 @@ pub const MANIFEST_READ_TIMEOUT_SECS: u64 = 30;
 /// Maximum concurrent erasure reconstruction tasks per miner.
 /// Reconstruction is CPU + network intensive (fetches k=10 shards from peers
 /// then runs RS decode), so keep this low.
+#[allow(dead_code)]
 pub const MAX_CONCURRENT_RECONSTRUCTIONS: usize = 2;
 
 /// Timeout for connecting to a peer miner during shard reconstruction (seconds)
+#[allow(dead_code)]
 pub const RECONSTRUCT_PEER_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 /// Timeout for reading shard data from a peer during reconstruction (seconds)
+#[allow(dead_code)]
 pub const RECONSTRUCT_PEER_READ_TIMEOUT_SECS: u64 = 30;
 
 // ============================================================================
@@ -360,3 +376,18 @@ pub const VERSION_CHECK_TIMEOUT_SECS: u64 = 10;
 
 /// Unix file permissions for the keypair file (owner read/write only)
 pub const KEYPAIR_FILE_PERMISSIONS: u32 = 0o600;
+
+// ============================================================================
+// Gateway Keepalive
+// ============================================================================
+
+/// Default interval between gateway keepalive connection attempts (seconds).
+/// Override via `MINER_GATEWAY_KEEPALIVE_INTERVAL_SECS`.
+pub const DEFAULT_GATEWAY_KEEPALIVE_INTERVAL_SECS: u64 = 60;
+
+/// Default timeout for connecting to a gateway endpoint (seconds).
+/// Override via `MINER_GATEWAY_CONNECT_TIMEOUT_SECS`.
+pub const DEFAULT_GATEWAY_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Maximum number of gateway endpoints to track (prevents unbounded growth)
+pub const MAX_GATEWAY_ENDPOINTS: usize = 100;

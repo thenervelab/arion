@@ -903,7 +903,7 @@ async fn fetch_file_hashes_from_doc(
         .ok_or_else(|| anyhow::anyhow!("Doc replica not available"))?;
 
     let query = iroh_docs::store::Query::single_latest_per_key();
-    let mut stream = doc.get_many(query).await?;
+    let stream = doc.get_many(query).await?;
     tokio::pin!(stream);
 
     let mut file_hashes = Vec::new();
@@ -1161,6 +1161,7 @@ pub async fn load_cluster_map_cache(data_dir: &std::path::Path) -> Option<common
 ///
 /// Returns `Ok(true)` if the shard was successfully reconstructed and stored,
 /// `Ok(false)` if not enough sibling shards were available (< k).
+#[allow(dead_code)]
 pub async fn reconstruct_shard(
     shard_hash: iroh_blobs::Hash,
     shard_index: usize,

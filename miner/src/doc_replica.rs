@@ -10,13 +10,14 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use futures::StreamExt as _;
 use iroh_docs::{
     DocTicket,
     api::DocsApi,
     engine::{DefaultAuthorStorage, Engine},
 };
 use iroh_gossip::net::Gossip;
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use crate::state;
 
@@ -71,6 +72,47 @@ pub async fn join_doc(endpoint: iroh::Endpoint, data_dir: &Path, ticket_str: &st
         .start_sync(doc.id(), ticket.nodes.clone())
         .await
         .context("Failed to start doc sync")?;
+
+    // Subscribe to doc events and log incoming manifest/cluster-map updates.
+    let mut event_sub = doc
+        .subscribe()
+        .await
+        .context("Failed to subscribe to doc events")?;
+    let doc_id_str = doc.id().to_string();
+    tokio::spawn(async move {
+        let mut manifest_count = 0u64;
+        let mut map_count = 0u64;
+        loop {
+            match event_sub.next().await {
+                Some(Ok(event)) => {
+                    use iroh_docs::engine::LiveEvent;
+                    if let LiveEvent::InsertRemote { entry, .. } = event {
+                        let key = entry.key();
+                        if key.starts_with(b"map:") {
+                            map_count += 1;
+                            let epoch_str = std::str::from_utf8(&key[4..]).unwrap_or("?");
+                            debug!(doc_id = %doc_id_str, epoch = %epoch_str, total_maps = map_count, "[DOC] Received cluster map update via gossip");
+                        } else {
+                            manifest_count += 1;
+                            let hash_str = std::str::from_utf8(key).unwrap_or("?");
+                            debug!(doc_id = %doc_id_str, file_hash = %hash_str, total_manifests = manifest_count, "[DOC] Received manifest update via gossip");
+                            // Log periodically so we don't flood but confirm sync is working
+                            if manifest_count == 1 || manifest_count % 100 == 0 {
+                                info!(doc_id = %doc_id_str, total_manifests = manifest_count, total_maps = map_count, "[DOC] Gossip sync active — manifests received");
+                            }
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    warn!(error = %e, "[DOC] Doc event stream error");
+                }
+                None => {
+                    info!("[DOC] Doc event stream closed");
+                    break;
+                }
+            }
+        }
+    });
 
     // Store in global state
     {

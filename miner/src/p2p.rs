@@ -40,8 +40,8 @@ use crate::constants::{
 };
 use crate::helpers::{has_direct_ip_path, truncate_for_log};
 use crate::state::{
-    get_blob_cache, get_blobs_dir, get_cluster_map, get_current_epoch, get_last_epoch_change,
-    get_peer_cache, get_static_discovery, get_warden_node_ids,
+    get_blob_cache, get_blobs_dir, get_cluster_map, get_current_epoch, get_gateway_endpoints,
+    get_last_epoch_change, get_peer_cache, get_static_discovery, get_warden_node_ids,
 };
 use anyhow::Result;
 use futures::StreamExt;
@@ -181,7 +181,7 @@ pub async fn handle_miner_control(
     {
         use iroh::Watcher as _;
         let paths = connection.paths().get();
-        let path_details: Vec<String> = paths
+        let _path_details: Vec<String> = paths
             .iter()
             .map(|p| format!("{:?} (rtt={}ms)", p.remote_addr(), p.rtt().as_millis()))
             .collect();
@@ -289,10 +289,24 @@ async fn handle_single_stream(
     let data_timeout = std::time::Duration::from_secs(DATA_FRAME_READ_TIMEOUT_SECS);
 
     let mut first_byte = [0u8; 1];
-    tokio::time::timeout(header_timeout, recv.read_exact(&mut first_byte))
-        .await
-        .map_err(|_| anyhow::anyhow!("First byte read timed out"))?
-        .map_err(|e| anyhow::anyhow!("First byte read failed: {}", e))?;
+    match tokio::time::timeout(header_timeout, recv.read_exact(&mut first_byte)).await {
+        Ok(Ok(())) => {} // Got a byte, continue processing
+        Ok(Err(e)) if e.to_string().contains("finished") => {
+            // Stream closed immediately with 0 bytes — this is a gateway health-check ping
+            // (open_bi + finish). Not an error, just silently return.
+            trace!(
+                remote = %connection.remote_id().fmt_short(),
+                "Health-check ping received (0-byte stream), ignoring"
+            );
+            return Ok(());
+        }
+        Ok(Err(e)) => {
+            return Err(anyhow::anyhow!("First byte read failed: {}", e));
+        }
+        Err(_) => {
+            return Err(anyhow::anyhow!("First byte read timed out"));
+        }
+    }
 
     // V2 binary store path: parse header, reject relay-only, read data, handle, return.
     if first_byte[0] == common::STORE_V2_MAGIC {
@@ -400,6 +414,7 @@ async fn handle_single_stream(
             peers,
             cluster_map_json,
             warden_node_ids,
+            gateway_endpoints,
         } => {
             handle_cluster_map_update(
                 remote_node_id,
@@ -409,6 +424,7 @@ async fn handle_single_stream(
                 peers,
                 cluster_map_json,
                 warden_node_ids,
+                gateway_endpoints,
             )
             .await?;
         }
@@ -874,6 +890,7 @@ async fn handle_cluster_map_update(
     peers: Vec<(String, String)>, // (public_key, endpoint_json)
     cluster_map_json: Option<String>,
     warden_node_ids: Option<Vec<String>>,
+    gateway_endpoints: Vec<common::GatewayEndpoint>,
 ) -> Result<()> {
     // Only validator should broadcast map updates
     if !is_authorized(remote_node_id, validator_node_id) {
@@ -997,6 +1014,25 @@ async fn handle_cluster_map_update(
                 }
             }
         }
+    }
+
+    // Update gateway endpoints for keepalive connections
+    if !gateway_endpoints.is_empty() {
+        let gw_map = get_gateway_endpoints();
+        // Replace all entries with the latest set from validator
+        gw_map.clear();
+        let mut stored = 0u32;
+        for ep in &gateway_endpoints {
+            if stored as usize >= crate::constants::MAX_GATEWAY_ENDPOINTS {
+                break;
+            }
+            gw_map.insert(ep.node_id.clone(), ep.clone());
+            stored += 1;
+        }
+        debug!(
+            count = stored,
+            "Updated gateway endpoints from ClusterMapUpdate"
+        );
     }
 
     // Update warden node IDs if provided by validator
