@@ -458,7 +458,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
     let static_discovery = iroh::address_lookup::memory::MemoryLookup::new();
     state::init_static_discovery(static_discovery.clone());
 
-    let mut endpoint_builder = iroh::Endpoint::builder()
+    let mut endpoint_builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(secret_key)
         .max_tls_tickets(0) // Disable 0-RTT: prevents NAT traversal race (Iroh #3917)
         .clear_address_lookup() // Remove N0 preset's Pkarr/DNS publishing to dns.iroh.link
@@ -1453,7 +1453,7 @@ fn spawn_heartbeat_loop(
                                 .get()
                                 .iter()
                                 .filter(|p| p.is_ip())
-                                .map(|p| p.rtt().as_millis())
+                                .map(|p| p.rtt().map(|d| d.as_millis()).unwrap_or(0))
                                 .next()
                                 .unwrap_or(0);
                             info!(
@@ -1762,7 +1762,13 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<iroh::endpoi
         let paths = conn.paths().get();
         let path_details: Vec<String> = paths
             .iter()
-            .map(|p| format!("{:?} (rtt={}ms)", p.remote_addr(), p.rtt().as_millis()))
+            .map(|p| {
+                format!(
+                    "{:?} (rtt={}ms)",
+                    p.remote_addr(),
+                    p.rtt().map(|d| d.as_millis()).unwrap_or(0)
+                )
+            })
             .collect();
         info!(
             path_count = paths.len(),

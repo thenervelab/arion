@@ -28,8 +28,9 @@
 //!
 //! Each inbound connection loops accepting bidirectional QUIC streams,
 //! spawning a task per stream for concurrent request handling. Data-plane
-//! operations (Store, FetchBlob, PullFromPeer) require a direct UDP path;
+//! operations (Store, PullFromPeer) require a direct UDP path;
 //! relay-only connections are rejected to avoid saturating relay servers.
+//! FetchBlob is allowed over relay to ensure gateways can always retrieve shards.
 
 use crate::constants::{
     DATA_FRAME_READ_TIMEOUT_SECS, DEFAULT_READ_TIMEOUT_SECS, LOG_STRING_TRUNCATE_LEN,
@@ -183,7 +184,13 @@ pub async fn handle_miner_control(
         let paths = connection.paths().get();
         let _path_details: Vec<String> = paths
             .iter()
-            .map(|p| format!("{:?} (rtt={}ms)", p.remote_addr(), p.rtt().as_millis()))
+            .map(|p| {
+                format!(
+                    "{:?} (rtt={}ms)",
+                    p.remote_addr(),
+                    p.rtt().map(|d| d.as_millis()).unwrap_or(0)
+                )
+            })
             .collect();
         let has_direct = paths
             .iter()
@@ -192,7 +199,7 @@ pub async fn handle_miner_control(
             let rtt_ms = paths
                 .iter()
                 .filter(|p| matches!(p.remote_addr(), iroh::TransportAddr::Ip(_)))
-                .map(|p| p.rtt().as_millis())
+                .map(|p| p.rtt().map(|d| d.as_millis()).unwrap_or(0))
                 .next()
                 .unwrap_or(0);
             info!(
@@ -400,12 +407,11 @@ async fn handle_single_stream(
         }
         common::MinerControlMessage::FetchBlob { hash } => {
             if !has_direct_ip_path(connection) {
-                warn!(
+                info!(
                     remote = %remote_node_id,
                     hash = %truncate_for_log(&hash, 16),
-                    "FetchBlob rejected: relay-only connection"
+                    "FetchBlob over relay connection (no direct path)"
                 );
-                return send_response(&mut send, b"ERROR: RELAY_ONLY").await;
             }
             handle_fetch_blob(&mut send, &handler.store, &handler.fetch_sem, hash).await?;
         }

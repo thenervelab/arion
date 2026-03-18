@@ -82,11 +82,11 @@ openssl = { version = "0.10", features = ["vendored"] }
 # ============================================
 # Iroh P2P
 # ============================================
-iroh = "0.96.1"
-iroh-base = { version = "0.96.1", features = ["key"] }
-iroh-blobs = { version = "0.98.0", features = ["fs-store"] }
-iroh-gossip = "0.96.0"
-iroh-docs = "0.96.0"
+iroh = "0.97.0"
+iroh-base = { version = "0.97.0", features = ["key"] }
+iroh-blobs = { version = "0.99.0", features = ["fs-store"] }
+iroh-gossip = "0.97.0"
+iroh-docs = "0.97.0"
 
 # ============================================
 # Database
@@ -201,6 +201,3 @@ codegen-units = 1
 strip = true
 
 
-[patch.crates-io]
-iroh-quinn = { path = "./vendor/iroh-quinn" }
-iroh-quinn-proto = { path = "./vendor/iroh-quinn-proto" }

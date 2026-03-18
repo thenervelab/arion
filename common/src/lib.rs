@@ -886,7 +886,7 @@ pub fn calculate_placement_for_stripe(
 
     let num_families = families.len();
 
-    if num_families >= count {
+    let mut selected_miners = if num_families >= count {
         // IDEAL CASE: Enough families to put each shard in a different family
         // Select 'count' different families, then pick one miner from each
         let selected_families = select_weighted_families(&families, count, input)?;
@@ -916,7 +916,7 @@ pub fn calculate_placement_for_stripe(
             ));
         }
 
-        Ok(selected_miners)
+        selected_miners
     } else {
         // FALLBACK: Fewer families than shards needed
         // Distribute as evenly as possible across all families
@@ -996,7 +996,75 @@ pub fn calculate_placement_for_stripe(
             ));
         }
 
-        Ok(selected_miners)
+        selected_miners
+    };
+
+    // Post-placement IP deduplication: if two selected miners share the
+    // same IP address, the second one is swapped for the best available
+    // miner on a different IP. This prevents correlated failures when a
+    // single server hosts multiple miners. The swap is deterministic (same
+    // seed) so Validator and Gateway always agree on placement.
+    deduplicate_ips(&mut selected_miners, map, input);
+
+    Ok(selected_miners)
+}
+
+/// Post-placement IP deduplication.
+///
+/// Scans `selected` for miners sharing an IP address and swaps duplicates
+/// with the highest-weight miner from the full cluster map that is (a) not
+/// already selected and (b) on a different IP. Best-effort: if no
+/// replacement exists, the original miner stays (degraded diversity is
+/// better than failing the placement).
+fn deduplicate_ips(selected: &mut Vec<MinerNode>, map: &ClusterMap, seed: u64) {
+    // Build set of IPs already used by selected miners (first occurrence wins).
+    let mut used_ips: HashMap<String, usize> = HashMap::new(); // ip -> first index
+    let mut dup_indices: Vec<usize> = Vec::new();
+
+    for (i, miner) in selected.iter().enumerate() {
+        if let Some(ref ip) = miner.ip_address {
+            if used_ips.contains_key(ip) {
+                dup_indices.push(i);
+            } else {
+                used_ips.insert(ip.clone(), i);
+            }
+        }
+    }
+
+    if dup_indices.is_empty() {
+        return;
+    }
+
+    let selected_uids: std::collections::HashSet<u32> = selected.iter().map(|m| m.uid).collect();
+
+    // Build replacement pool: all miners not already selected, sorted by
+    // (weight DESC, uid ASC) for determinism.
+    let mut replacements: Vec<&MinerNode> = map
+        .miners
+        .iter()
+        .filter(|m| !selected_uids.contains(&m.uid) && m.weight > 0)
+        .collect();
+    replacements.sort_by(|a, b| b.weight.cmp(&a.weight).then(a.uid.cmp(&b.uid)));
+
+    let mut rng_seed = seed.wrapping_add(0xDEAD_BEEF);
+
+    for &dup_idx in &dup_indices {
+        let dup_ip = selected[dup_idx].ip_address.clone();
+
+        // Find a replacement on a different IP
+        if let Some(pos) = replacements.iter().position(|r| {
+            r.ip_address.as_ref() != dup_ip.as_ref()
+                && !used_ips.contains_key(r.ip_address.as_ref().map_or("", |s| s.as_str()))
+        }) {
+            let replacement = replacements.remove(pos);
+            if let Some(ref ip) = replacement.ip_address {
+                used_ips.insert(ip.clone(), dup_idx);
+            }
+            selected[dup_idx] = replacement.clone();
+        } else {
+            // No replacement available — advance RNG for determinism and keep original
+            rng_seed = rng_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        }
     }
 }
 
@@ -2819,12 +2887,12 @@ pub async fn wait_for_direct_ip_path(
     .unwrap_or(false)
 }
 
-/// Connect to a peer and ensure a direct IP path.
+/// Connect to a peer, preferring a direct IP path (best-effort).
 ///
-/// Returns `Err` if the connection is relay-only after the
-/// `direct_path_timeout` expires. Callers already set
-/// `max_tls_tickets(0)` to disable 0-RTT, so a single connect
-/// attempt is sufficient.
+/// Waits up to `direct_path_timeout` for a direct path. If none is
+/// established the relay connection is kept and a warning is logged.
+/// Callers already set `max_tls_tickets(0)` to disable 0-RTT, so a
+/// single connect attempt is sufficient.
 pub async fn connect_with_direct_path(
     endpoint: &iroh::Endpoint,
     addr: iroh::EndpointAddr,
@@ -2832,17 +2900,20 @@ pub async fn connect_with_direct_path(
     connect_timeout: std::time::Duration,
     direct_path_timeout: std::time::Duration,
 ) -> anyhow::Result<iroh::endpoint::Connection> {
-    let conn = tokio::time::timeout(connect_timeout, endpoint.connect(addr, alpn))
+    let conn = tokio::time::timeout(connect_timeout, endpoint.connect(addr.clone(), alpn))
         .await
         .map_err(|_| anyhow::anyhow!("connect timeout"))?
         .map_err(|e| anyhow::anyhow!("connect error: {e}"))?;
 
-    if wait_for_direct_ip_path(&conn, direct_path_timeout).await {
-        return Ok(conn);
+    if !wait_for_direct_ip_path(&conn, direct_path_timeout).await {
+        tracing::warn!(
+            peer = %addr.id.fmt_short(),
+            "no direct path after {}s — using relay (best-effort)",
+            direct_path_timeout.as_secs()
+        );
     }
 
-    conn.close(0u32.into(), b"no_direct_path");
-    Err(anyhow::anyhow!("no direct IP path after timeout"))
+    Ok(conn)
 }
 
 /// Extract miner IP from EndpointAddr direct addresses
