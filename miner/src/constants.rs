@@ -27,7 +27,7 @@
 // ============================================================================
 
 /// Grace period before deleting orphan shards (1 hour default)
-pub const ORPHAN_GRACE_PERIOD_SECS: u64 = 3600;
+pub const ORPHAN_GRACE_PERIOD_SECS: u64 = 604_800; // 7 days
 
 /// Maximum number of orphan entries to track (prevents unbounded memory growth)
 pub const MAX_ORPHAN_ENTRIES: usize = 100_000;

@@ -3795,7 +3795,7 @@ dependencies = [
 
 [[package]]
 name = "miner"
-version = "0.1.13"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "bytes",

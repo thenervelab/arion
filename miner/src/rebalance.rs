@@ -45,6 +45,74 @@ use tracing::{debug, error, info, trace, warn};
 /// Timeout for reading doc replica blob content (seconds).
 const DOC_BLOB_READ_TIMEOUT_SECS: u64 = 5;
 
+/// Fetch a cluster map for a specific epoch from the validator via the
+/// `hippius/gateway-control` ALPN (which handles `GetClusterMapEpoch`).
+/// Returns `None` if the validator cannot serve the requested epoch.
+async fn fetch_cluster_map_for_epoch(
+    endpoint: &Endpoint,
+    validator_addr: &iroh::EndpointAddr,
+    epoch: u64,
+) -> Option<common::ClusterMap> {
+    let conn = match crate::state::get_pooled_connection(
+        endpoint,
+        validator_addr,
+        common::GATEWAY_CONTROL_ALPN,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(
+                epoch = epoch,
+                error = %e,
+                "Failed to connect to validator for placement epoch map"
+            );
+            return None;
+        }
+    };
+
+    let msg = common::GatewayControlMessage::GetClusterMapEpoch { epoch };
+    let msg_bytes = match serde_json::to_vec(&msg) {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
+
+    let result: Option<common::ClusterMap> = async {
+        let (mut send, mut recv) = conn.open_bi().await.ok()?;
+        send.write_all(&msg_bytes).await.ok()?;
+        send.finish().ok()?;
+
+        let response_bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(common::P2P_DEFAULT_TIMEOUT_SECS),
+            recv.read_to_end(common::P2P_MAX_RESPONSE_SIZE),
+        )
+        .await
+        .ok()?
+        .ok()?;
+
+        let response: common::GatewayControlMessage =
+            serde_json::from_slice(&response_bytes).ok()?;
+        match response {
+            common::GatewayControlMessage::ClusterMapResponse {
+                map: Some(map), ..
+            } => Some(map),
+            _ => None,
+        }
+    }
+    .await;
+
+    if result.is_some() {
+        debug!(epoch = epoch, "Fetched placement epoch cluster map");
+    } else {
+        warn!(
+            epoch = epoch,
+            "Could not fetch cluster map for placement epoch"
+        );
+    }
+
+    result
+}
+
 /// PG-based self-rebalancing: Calculate which PGs this miner is responsible for,
 /// query validator for files in each PG, and pull any missing shards.
 ///
@@ -242,6 +310,12 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
     let mut total_manifest_failures: u32 = 0;
     let mut aborted = false;
 
+    // Cache of cluster maps keyed by placement epoch.  Populated lazily as
+    // manifests are processed — prevents orphan GC for files uploaded more
+    // than EPOCH_LOOKBACK epochs ago.
+    let mut placement_epoch_maps: std::collections::HashMap<u64, Arc<common::ClusterMap>> =
+        std::collections::HashMap::new();
+
     // Try validator path first, fall back to doc replica
     let used_doc_fallback = if validator_reachable && validator_addr.is_some() {
         let validator_addr = validator_addr.as_ref().unwrap();
@@ -348,12 +422,31 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
                     match result {
                         Ok(Some(manifest)) => {
                             consecutive_failures = 0;
+                            // Lazily fetch the placement-epoch cluster map if
+                            // we haven't seen this epoch before.
+                            let pe = manifest.placement_epoch;
+                            if !placement_epoch_maps.contains_key(&pe)
+                                && pe != cluster_map.epoch
+                            {
+                                if let Some(pe_map) =
+                                    fetch_cluster_map_for_epoch(
+                                        &endpoint,
+                                        validator_addr,
+                                        pe,
+                                    )
+                                    .await
+                                {
+                                    placement_epoch_maps
+                                        .insert(pe, Arc::new(pe_map));
+                                }
+                            }
                             tally_manifest_shards(
                                 &file_hash,
                                 &manifest,
                                 my_uid,
                                 &cluster_map,
                                 &history_maps,
+                                &placement_epoch_maps,
                                 &store,
                                 &local_hashes,
                                 &mut expected_shards,
@@ -410,12 +503,34 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
                 for file_hash in &file_hashes {
                     match fetch_manifest_from_doc(file_hash).await {
                         Some(manifest) => {
+                            // Lazily fetch the placement-epoch cluster map
+                            // (doc fallback path — validator may still be
+                            // reachable for epoch map queries).
+                            let pe = manifest.placement_epoch;
+                            if !placement_epoch_maps.contains_key(&pe)
+                                && pe != cluster_map.epoch
+                            {
+                                if let Some(val_addr) = validator_addr.as_ref() {
+                                    if let Some(pe_map) =
+                                        fetch_cluster_map_for_epoch(
+                                            &endpoint,
+                                            val_addr,
+                                            pe,
+                                        )
+                                        .await
+                                    {
+                                        placement_epoch_maps
+                                            .insert(pe, Arc::new(pe_map));
+                                    }
+                                }
+                            }
                             tally_manifest_shards(
                                 file_hash,
                                 &manifest,
                                 my_uid,
                                 &cluster_map,
                                 &history_maps,
+                                &placement_epoch_maps,
                                 &store,
                                 &local_hashes,
                                 &mut expected_shards,
@@ -507,6 +622,7 @@ async fn tally_manifest_shards(
     my_uid: u32,
     cluster_map: &common::ClusterMap,
     history_maps: &[Arc<common::ClusterMap>],
+    placement_epoch_maps: &std::collections::HashMap<u64, Arc<common::ClusterMap>>,
     store: &FsStore,
     local_hashes: &std::collections::HashSet<iroh_blobs::Hash>,
     expected_shards: &mut std::collections::HashSet<iroh_blobs::Hash>,
@@ -564,7 +680,33 @@ async fn tally_manifest_shards(
                 false
             };
 
-            if mine_current || mine_historical {
+            // Check placement epoch map: the cluster map that was active when
+            // the file was uploaded.  This prevents orphan GC for files older
+            // than the EPOCH_LOOKBACK window.
+            let mine_placement = if !mine_current && !mine_historical {
+                match placement_epoch_maps.get(&manifest.placement_epoch) {
+                    Some(pe_map) => {
+                        common::calculate_stripe_placement(
+                            file_hash,
+                            stripe_idx as u64,
+                            shards_per_stripe,
+                            pe_map,
+                            manifest.placement_version,
+                        )
+                        .ok()
+                        .and_then(|miners| miners.get(local_idx).cloned())
+                        .is_some_and(|m| m.uid == my_uid)
+                    }
+                    // Placement epoch map unavailable (validator couldn't serve
+                    // it or was unreachable).  Assume ownership — false retention
+                    // is safe; false deletion is data loss.
+                    None => true,
+                }
+            } else {
+                false
+            };
+
+            if mine_current || mine_historical || mine_placement {
                 expected_shards.insert(shard_hash);
 
                 // Only count missing shards for current-epoch placement
