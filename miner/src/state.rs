@@ -21,14 +21,14 @@
 
 use crate::constants::{
     BLOB_CACHE_SIZE, CONNECTION_POOL_EVICTION_FRACTION, CONNECTION_TTL_SECS,
-    MAX_CONNECTION_POOL_SIZE, MAX_TAG_MAP_ENTRIES, POOLED_CONN_DEFAULT_TIMEOUT_SECS,
+    MAX_CONNECTION_POOL_SIZE,
 };
 use anyhow::Result;
 use common::now_secs;
 use dashmap::DashMap;
-use iroh::endpoint::Endpoint;
 use quick_cache::sync::Cache;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
@@ -38,7 +38,8 @@ use tokio::sync::RwLock;
 // Global State (using DashMap for lock-free concurrent access)
 // ============================================================================
 
-/// Global cache of peer miner addresses for M2M transfers (lock-free)
+/// Global cache of peer miner addresses for M2M transfers (lock-free).
+/// Key: node_id hex string, Value: iroh::EndpointAddr (still used for protocol compat)
 static PEER_MINER_CACHE: OnceLock<DashMap<String, iroh::EndpointAddr>> = OnceLock::new();
 
 /// Track current epoch for self-rebalancing detection
@@ -47,21 +48,19 @@ static CURRENT_EPOCH: OnceLock<Arc<RwLock<u64>>> = OnceLock::new();
 /// Store the current cluster map for CRUSH calculations (needs Arc for cloning)
 static CLUSTER_MAP: OnceLock<Arc<RwLock<Option<Arc<common::ClusterMap>>>>> = OnceLock::new();
 
-/// Store the validator endpoint address for P2P queries
-static VALIDATOR_ENDPOINT: OnceLock<Arc<RwLock<Option<iroh::EndpointAddr>>>> = OnceLock::new();
+/// Store the validator's socket address for quinn connections
+static VALIDATOR_ADDR: OnceLock<Arc<RwLock<Option<SocketAddr>>>> = OnceLock::new();
 
-/// Track orphan shards: blob_hash -> timestamp when first identified as orphan (lock-free)
-/// Key is iroh_blobs::Hash (32 bytes, Copy) instead of String to avoid heap allocation.
-static ORPHAN_SHARDS: OnceLock<DashMap<iroh_blobs::Hash, u64>> = OnceLock::new();
+/// Store the validator's node ID (hex string) for identity verification
+static VALIDATOR_NODE_ID: OnceLock<Arc<RwLock<String>>> = OnceLock::new();
 
-/// Store the blobs directory path for GC file system access
+/// Store the blobs directory path for file system access
 static BLOBS_DIR: OnceLock<Arc<RwLock<Option<std::path::PathBuf>>>> = OnceLock::new();
 
-/// Connection pool for P2P connections (with TTL)
-/// Key: iroh::PublicKey (32 bytes, Copy) — avoids Debug-formatting the entire EndpointAddr
-static CONNECTION_POOL: OnceLock<
-    Arc<RwLock<HashMap<iroh::PublicKey, (iroh::endpoint::Connection, u64)>>>,
-> = OnceLock::new();
+/// Connection pool for quinn P2P connections (with TTL)
+/// Key: node_id hex string
+static CONNECTION_POOL: OnceLock<Arc<RwLock<HashMap<String, (quinn::Connection, u64)>>>> =
+    OnceLock::new();
 
 /// Blob cache for FetchBlob responses
 /// Key: iroh_blobs::Hash (32 bytes, Copy — no heap alloc for key)
@@ -71,8 +70,8 @@ static BLOB_CACHE: OnceLock<Arc<Cache<iroh_blobs::Hash, bytes::Bytes>>> = OnceLo
 /// Flag to signal that re-registration is needed (set when validator returns UNKNOWN)
 static NEEDS_REREGISTRATION: OnceLock<Arc<std::sync::atomic::AtomicBool>> = OnceLock::new();
 
-/// Dynamic warden node IDs for PoS challenge authorization (auto-distributed by validator)
-static WARDEN_NODE_IDS: OnceLock<Arc<RwLock<Vec<iroh::PublicKey>>>> = OnceLock::new();
+/// Dynamic warden node IDs for PoS challenge authorization (hex strings)
+static WARDEN_NODE_IDS: OnceLock<Arc<RwLock<Vec<String>>>> = OnceLock::new();
 
 /// Whether the validator is currently reachable (set by heartbeat loop, read by rebalance loop)
 static VALIDATOR_REACHABLE: OnceLock<AtomicBool> = OnceLock::new();
@@ -82,15 +81,6 @@ static RELAY_CONNECTED: OnceLock<AtomicBool> = OnceLock::new();
 
 /// Miner UID computed once from public key hash (avoids repeated hashing + heap alloc)
 static MINER_UID: OnceLock<u32> = OnceLock::new();
-
-/// Tag map for O(1) delete: maps blob Hash to its Tag name.
-/// Populated on Store/Pull, used by Delete to skip full tag scan.
-static TAG_MAP: OnceLock<DashMap<iroh_blobs::Hash, iroh_blobs::api::Tag>> = OnceLock::new();
-
-/// Static discovery provider for seeding peer direct addresses into iroh's
-/// address book. Updated on ClusterMapUpdate so peer-to-peer connections
-/// (PullFromPeer, FetchBlob) resolve directly without relay discovery.
-static STATIC_DISCOVERY: OnceLock<iroh::address_lookup::memory::MemoryLookup> = OnceLock::new();
 
 /// Cached PG assignments: (epoch, pgs) — recomputed only when epoch changes
 static MY_PGS_CACHE: OnceLock<Arc<RwLock<(u64, Vec<u32>)>>> = OnceLock::new();
@@ -140,12 +130,12 @@ pub fn get_cluster_map() -> &'static Arc<RwLock<Option<Arc<common::ClusterMap>>>
     CLUSTER_MAP.get_or_init(|| Arc::new(RwLock::new(None)))
 }
 
-pub fn get_validator_endpoint() -> &'static Arc<RwLock<Option<iroh::EndpointAddr>>> {
-    VALIDATOR_ENDPOINT.get_or_init(|| Arc::new(RwLock::new(None)))
+pub fn get_validator_addr() -> &'static Arc<RwLock<Option<SocketAddr>>> {
+    VALIDATOR_ADDR.get_or_init(|| Arc::new(RwLock::new(None)))
 }
 
-pub fn get_orphan_shards() -> &'static DashMap<iroh_blobs::Hash, u64> {
-    ORPHAN_SHARDS.get_or_init(DashMap::new)
+pub fn get_validator_node_id_global() -> &'static Arc<RwLock<String>> {
+    VALIDATOR_NODE_ID.get_or_init(|| Arc::new(RwLock::new(String::new())))
 }
 
 pub fn get_blobs_dir() -> &'static Arc<RwLock<Option<std::path::PathBuf>>> {
@@ -153,7 +143,7 @@ pub fn get_blobs_dir() -> &'static Arc<RwLock<Option<std::path::PathBuf>>> {
 }
 
 pub fn get_connection_pool()
--> &'static Arc<RwLock<HashMap<iroh::PublicKey, (iroh::endpoint::Connection, u64)>>> {
+-> &'static Arc<RwLock<HashMap<String, (quinn::Connection, u64)>>> {
     CONNECTION_POOL.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
 }
 
@@ -165,7 +155,7 @@ pub fn get_needs_reregistration() -> &'static Arc<std::sync::atomic::AtomicBool>
     NEEDS_REREGISTRATION.get_or_init(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
 }
 
-pub fn get_warden_node_ids() -> &'static Arc<RwLock<Vec<iroh::PublicKey>>> {
+pub fn get_warden_node_ids() -> &'static Arc<RwLock<Vec<String>>> {
     WARDEN_NODE_IDS.get_or_init(|| Arc::new(RwLock::new(Vec::new())))
 }
 
@@ -185,26 +175,6 @@ pub fn get_miner_uid() -> u32 {
     *MINER_UID
         .get()
         .expect("MINER_UID not initialized — call set_miner_uid() during startup")
-}
-
-pub fn get_tag_map() -> &'static DashMap<iroh_blobs::Hash, iroh_blobs::api::Tag> {
-    TAG_MAP.get_or_init(DashMap::new)
-}
-
-/// Insert a tag mapping, respecting the size limit
-pub fn tag_map_insert(hash: iroh_blobs::Hash, tag: iroh_blobs::api::Tag) {
-    let map = get_tag_map();
-    if map.len() < MAX_TAG_MAP_ENTRIES {
-        map.insert(hash, tag);
-    }
-}
-
-pub fn init_static_discovery(discovery: iroh::address_lookup::memory::MemoryLookup) {
-    let _ = STATIC_DISCOVERY.set(discovery);
-}
-
-pub fn get_static_discovery() -> Option<&'static iroh::address_lookup::memory::MemoryLookup> {
-    STATIC_DISCOVERY.get()
 }
 
 pub fn get_my_pgs_cache() -> &'static Arc<RwLock<(u64, Vec<u32>)>> {
@@ -254,29 +224,21 @@ pub fn get_gateway_endpoints() -> &'static DashMap<String, common::GatewayEndpoi
     GATEWAY_ENDPOINTS.get_or_init(DashMap::new)
 }
 
-/// Get a pooled connection or create a new one
-/// Uses read lock for initial check, write lock only when needed
+/// Get a pooled quinn connection or create a new one.
+/// Uses read lock for initial check, write lock only when needed.
 pub async fn get_pooled_connection(
-    endpoint: &Endpoint,
-    peer_addr: &iroh::EndpointAddr,
-    alpn: &'static [u8],
-) -> Result<iroh::endpoint::Connection> {
-    use futures::future::FutureExt;
-
-    // Use node ID as key (32 bytes, Copy — no heap allocation)
-    let key = peer_addr.id;
+    endpoint: &quinn::Endpoint,
+    peer_node_id: &str,
+    peer_addr: SocketAddr,
+) -> Result<quinn::Connection> {
+    let key = peer_node_id.to_string();
     let now = now_secs();
 
     // Guard: if clock skew detected (now_secs returns 0), skip pool and create new connection.
     if now == 0 {
-        return common::connect_with_direct_path(
-            endpoint,
-            peer_addr.clone(),
-            alpn,
-            std::time::Duration::from_secs(crate::constants::DEFAULT_CONNECT_TIMEOUT_SECS),
-            std::time::Duration::from_secs(POOLED_CONN_DEFAULT_TIMEOUT_SECS),
-        )
-        .await;
+        return common::transport::connect(endpoint, peer_addr, peer_node_id)
+            .await
+            .map_err(Into::into);
     }
 
     // Try pool first (read lock - faster for common case)
@@ -286,22 +248,15 @@ pub async fn get_pooled_connection(
             // Check: timestamp valid, not expired, and connection still open
             if *created <= now
                 && now - *created < CONNECTION_TTL_SECS
-                && conn.closed().now_or_never().is_none()
+                && conn.close_reason().is_none()
             {
                 return Ok(conn.clone());
             }
         }
     }
 
-    // Create new connection with direct path guarantee.
-    let conn = common::connect_with_direct_path(
-        endpoint,
-        peer_addr.clone(),
-        alpn,
-        std::time::Duration::from_secs(crate::constants::DEFAULT_CONNECT_TIMEOUT_SECS),
-        std::time::Duration::from_secs(POOLED_CONN_DEFAULT_TIMEOUT_SECS),
-    )
-    .await?;
+    // Create new connection
+    let conn = common::transport::connect(endpoint, peer_addr, peer_node_id).await?;
 
     // Store in pool with double-check to avoid race condition
     {
@@ -311,7 +266,7 @@ pub async fn get_pooled_connection(
         if let Some((existing_conn, created)) = pool.get(&key)
             && *created <= now
             && now - *created < CONNECTION_TTL_SECS
-            && existing_conn.closed().now_or_never().is_none()
+            && existing_conn.close_reason().is_none()
         {
             // Use existing connection, close the one we just created
             conn.close(0u32.into(), b"stale");
@@ -321,19 +276,15 @@ pub async fn get_pooled_connection(
         // Enforce hard cap on pool size to prevent OOM
         if pool.len() >= MAX_CONNECTION_POOL_SIZE {
             // First pass: cheap threshold-based cleanup (expired + closed).
-            // Don't call conn.close() on eviction — it races with
-            // concurrent I/O on cloned handles, triggering quinn slab
-            // panics. Dropped connections drain via idle timeout.
             let threshold = now.saturating_sub(CONNECTION_TTL_SECS);
             pool.retain(|_, (conn, created)| {
-                *created > threshold && *created <= now && conn.closed().now_or_never().is_none()
+                *created > threshold && *created <= now && conn.close_reason().is_none()
             });
             // If still over capacity after TTL cleanup, fall back to sort-based eviction
             if pool.len() >= MAX_CONNECTION_POOL_SIZE {
                 let entries_to_remove = pool.len() / CONNECTION_POOL_EVICTION_FRACTION + 1;
-                let mut oldest: Vec<_> = pool.iter().map(|(k, (_, ts))| (*k, *ts)).collect();
+                let mut oldest: Vec<_> = pool.iter().map(|(k, (_, ts))| (k.clone(), *ts)).collect();
                 oldest.sort_by_key(|(_, ts)| *ts);
-                // Don't call conn.close() — see retain comment above.
                 for (evict_key, _) in oldest.into_iter().take(entries_to_remove) {
                     pool.remove(&evict_key);
                 }
@@ -344,4 +295,12 @@ pub async fn get_pooled_connection(
     }
 
     Ok(conn)
+}
+
+/// Extract a SocketAddr from an iroh::EndpointAddr (first direct IP address).
+pub fn socket_addr_from_endpoint(addr: &iroh::EndpointAddr) -> Option<SocketAddr> {
+    addr.addrs.iter().find_map(|a| match a {
+        iroh::TransportAddr::Ip(sock) => Some(*sock),
+        _ => None,
+    })
 }

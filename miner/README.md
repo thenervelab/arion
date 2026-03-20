@@ -89,18 +89,47 @@ pull_concurrency = 32
 fetch_concurrency = 256
 ```
 
+## Auto-Update
+
+The miner includes a built-in auto-update mechanism that checks GitHub releases every 5 minutes and automatically upgrades to newer versions.
+
+**How it works:**
+1. Every 5 minutes, the miner queries `https://api.github.com/repos/thenervelab/arion/releases/latest`
+2. Compares the latest release tag (semver) with the running version
+3. If a newer version is available, downloads the `miner-linux-x86_64` asset
+4. Verifies the downloaded binary by running `--version`
+5. Stops the service, replaces the binary, restarts
+6. If the service fails to start, automatically rolls back to the previous binary
+
+**Downgrade protection:** The miner will never downgrade. If the running version is higher than the latest release (e.g. dev builds), the update is skipped.
+
+**Disable auto-update:**
+
+```bash
+# Option 1: Environment variable (in systemd service file)
+Environment="AUTO_UPDATE_DISABLED=true"
+
+# Option 2: Sentinel file (in data directory)
+touch /var/lib/hippius/miner/data/miner/.no-auto-update
+```
+
+**Service name:** The update mechanism restarts via `systemctl restart arion-miner`. Override with `MINER_SERVICE_NAME` env var if your service has a different name.
+
 ## Environment Variables
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `HOSTNAME` | auto-detected via STUN | Public IPv4 address (must be routable) |
-| `P2P_PORT` | 11220 | UDP port for Iroh P2P |
+| `P2P_PORT` | 11220 | UDP port for QUIC P2P |
 | `P2P_BIND_IPV4` | 0.0.0.0 | IPv4 address to bind to |
 | `FAMILY_ID` | default | Miner family ID |
-| `VALIDATOR_NODE_ID` | required | Validator's Iroh node ID |
+| `VALIDATOR_NODE_ID` | required | Validator's node ID (hex-encoded Ed25519 public key) |
+| `VALIDATOR_DIRECT_ADDRS` | - | Validator socket address for quinn transport (e.g. `51.210.230.161:11220`) |
 | `WARDEN_NODE_ID` | - | Warden node ID for PoS challenges |
 | `IROH_RELAY_URL` | iroh defaults | Relay server URL |
 | `STUN_ENABLED` | true | Auto-detect public IP via STUN |
+| `AUTO_UPDATE_DISABLED` | false | Set to `true` to disable auto-update |
+| `MINER_SERVICE_NAME` | arion-miner | Systemd service name for restart |
 | `MINER_STORE_CONCURRENCY` | 1024 | Concurrent store operations |
 | `MINER_PULL_CONCURRENCY` | 32 | Concurrent pull operations |
 | `MINER_FETCH_CONCURRENCY` | 256 | Concurrent fetch operations |

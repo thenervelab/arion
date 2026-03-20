@@ -1,11 +1,12 @@
 //! Miner entry point for the Hippius Arion storage subnet.
 //!
-//! The miner receives shards from validators via P2P, stores them in Iroh's
-//! FsStore, and serves them back to gateways and other miners on request.
+//! The miner receives shards from validators via P2P (quinn QUIC), stores them
+//! in a flat file store, and serves them back to gateways and other miners on request.
 
 mod config;
 mod constants;
 mod doc_replica;
+mod flat_store;
 mod gateway_keepalive;
 mod helpers;
 mod p2p;
@@ -16,18 +17,16 @@ mod version_check;
 use anyhow::Result;
 use clap::Parser;
 use common::now_secs;
+use flat_store::FlatBlobStore;
 use fs2::free_space;
-use helpers::{has_direct_ip_path, load_keypair, truncate_for_log};
-use iroh::protocol::Router;
-use iroh_blobs::BlobsProtocol;
-use iroh_blobs::store::fs::FsStore;
+use helpers::{load_keypair, truncate_for_log};
 use p2p::MinerControlHandler;
 use rand::Rng as _;
 use state::{
-    get_blobs_dir, get_needs_reregistration, get_relay_connected, get_validator_endpoint,
+    get_blobs_dir, get_needs_reregistration,
     get_validator_reachable, get_warden_node_ids,
 };
-use std::str::FromStr;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -83,20 +82,14 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install rustls crypto provider for quinn/TLS
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls CryptoProvider");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
-                .add_directive(
-                    "iroh::socket::remote_map::remote_state=off"
-                        .parse()
-                        .unwrap(),
-                )
-                .add_directive("iroh_quinn_proto=error".parse().unwrap())
-                .add_directive(
-                    "iroh::socket::transports::relay::actor=error"
-                        .parse()
-                        .unwrap(),
-                )
                 .add_directive("iroh_docs::engine::live=error".parse().unwrap())
                 .add_directive("iroh_gossip=error".parse().unwrap()),
         )
@@ -238,15 +231,13 @@ async fn handle_subcommand(command: Commands) -> Result<()> {
 }
 
 /// Shared context for registration and heartbeat functions.
-///
-/// Groups the parameters that are threaded through `register_with_validator`,
-/// `register_with_validator_once`, and `spawn_heartbeat_loop` to avoid
-/// passing 8+ positional arguments.
 #[derive(Clone)]
 struct MinerContext {
-    endpoint: iroh::Endpoint,
-    validator_pubkey: iroh::PublicKey,
-    relay_url: Option<iroh_base::RelayUrl>,
+    endpoint: quinn::Endpoint,
+    signing_key: Arc<ed25519_dalek::SigningKey>,
+    node_id: String,
+    validator_node_id: String,
+    validator_socket_addr: SocketAddr,
     hostname: String,
     family_id: String,
     data_dir: std::path::PathBuf,
@@ -259,21 +250,6 @@ struct MinerContext {
 impl MinerContext {
     fn http_addr(&self) -> String {
         format!("http://{}:{}", self.hostname, self.config.network.p2p_port)
-    }
-
-    fn validator_addr(&self) -> iroh::EndpointAddr {
-        let mut addr = build_validator_addr(&self.validator_pubkey, &self.relay_url);
-        if let Some(ref direct_str) = self.config.validator.direct_addrs {
-            let direct_addrs = config::parse_direct_addrs(&Some(direct_str.clone()));
-            if !direct_addrs.is_empty() {
-                let addrs: Vec<_> = direct_addrs
-                    .into_iter()
-                    .map(iroh::TransportAddr::Ip)
-                    .collect();
-                addr = addr.with_addrs(addrs);
-            }
-        }
-        addr
     }
 
     /// Resolve the configured hostname to an IP address.
@@ -292,55 +268,42 @@ impl MinerContext {
         }
     }
 
-    /// Build our `EndpointAddr` with relay URL and resolved direct address hints.
-    /// Reused by both registration and heartbeat so the validator always has
-    /// up-to-date addressing even when NAT traversal fails.
-    ///
-    /// Only includes routable public IPs — unspecified (0.0.0.0), loopback,
-    /// and private addresses are excluded since the validator can't reach them.
-    /// Falls back to STUN-detected public IP when hostname is non-routable.
+    /// Build our `EndpointAddr` for protocol messages to the validator.
+    /// The validator still expects iroh::EndpointAddr format for backward compat.
     fn build_endpoint_addr(&self) -> iroh::EndpointAddr {
-        let node_id = self.endpoint.secret_key().public();
-        let mut addr = iroh::EndpointAddr::new(node_id);
-        if let Some(url) = &self.relay_url {
-            addr = addr.with_relay_url(url.clone());
-        }
-        // Resolve direct address: hostname first, STUN fallback second,
-        // then iroh's own discovered public IP (from QUIC addr discovery).
+        // Convert our ed25519 public key to iroh PublicKey for EndpointAddr
+        let iroh_pk = iroh::PublicKey::from_bytes(self.signing_key.verifying_key().as_bytes())
+            .expect("valid ed25519 public key");
+        let mut addr = iroh::EndpointAddr::new(iroh_pk);
+
+        // Resolve direct address: hostname first, STUN fallback second
         let resolved_ip = self
             .resolve_hostname_ip()
             .filter(|ip| common::is_advertisable_ip(*ip))
-            .or(self.stun_public_ip)
-            .or_else(|| {
-                // Fallback: use iroh's own discovered public IP.
-                // This works for bare-metal miners with a public IP that don't
-                // have a hostname configured — iroh discovers the public IP
-                // via QUIC addr discovery when the relay connection is established.
-                self.endpoint
-                    .addr()
-                    .ip_addrs()
-                    .find(|sock| common::is_advertisable_ip(sock.ip()))
-                    .map(|sock| sock.ip())
-            });
+            .or(self.stun_public_ip);
         if let Some(ip) = resolved_ip {
-            let direct_addr = std::net::SocketAddr::new(ip, self.config.network.p2p_port);
+            let direct_addr = SocketAddr::new(ip, self.config.network.p2p_port);
             addr = addr.with_addrs(vec![iroh::TransportAddr::Ip(direct_addr)]);
         } else {
             warn!(
                 hostname = %self.hostname,
                 stun_ip = ?self.stun_public_ip,
-                "No advertisable IP for endpoint: hostname resolved to unusable address, \
-                 STUN detection unavailable, and iroh addr discovery pending. \
-                 Set --hostname to your public IP for reliable direct connections."
+                "No advertisable IP for endpoint: set --hostname to your public IP"
             );
         }
         addr
+    }
+
+    /// Sign a message with the miner's Ed25519 key.
+    fn sign(&self, message: &[u8]) -> ed25519_dalek::Signature {
+        use ed25519_dalek::Signer;
+        self.signing_key.sign(message)
     }
 }
 
 async fn run_miner(cli: Cli) -> Result<()> {
     info!(version = env!("CARGO_PKG_VERSION"), "Starting miner");
-    tokio::spawn(version_check::check_for_updates());
+    // Version check + auto-update spawned after data_dir is known (below).
 
     // Preflight: check firewall/conntrack settings that can silently kill QUIC
     check_network_health();
@@ -373,7 +336,6 @@ async fn run_miner(cli: Cli) -> Result<()> {
     };
 
     // CLI args override config file values.
-    // Hostname fallback chain: CLI > config > STUN-detected IPv4 > "miner-1"
     let hostname = cli
         .hostname
         .or(config.network.hostname.clone())
@@ -396,27 +358,16 @@ async fn run_miner(cli: Cli) -> Result<()> {
         "Configuration loaded"
     );
 
-    // 1. Initialize Iroh Endpoint
+    // Spawn auto-update loop (periodic version check + download + restart).
+    tokio::spawn(version_check::auto_update_loop(data_dir.clone()));
+
+    // 1. Initialize quinn endpoint
     tokio::fs::create_dir_all(&data_dir).await?;
 
-    let secret_key = load_keypair(&data_dir).await?;
+    let signing_key = load_keypair(&data_dir).await?;
+    let node_id = common::transport::node_id_from_public_key(&signing_key.verifying_key());
 
-    // Get relay URLs from config, environment, or use defaults (relay + relay2)
-    let relay_urls = common::get_relay_urls(config.network.relay_url.as_deref());
-    info!(relay_urls = ?relay_urls, "Configuring relays");
-    // Primary relay URL for EndpointAddr hints (single URL required by the API)
-    let relay_url: Option<iroh_base::RelayUrl> = relay_urls.first().cloned();
-
-    // Bind to a specific IP so iroh advertises only that address during
-    // hole punching. Binding to 0.0.0.0 makes iroh scan ALL interfaces
-    // and advertise every detected IP (docker0, veth*, cni0, etc.),
-    // which exhausts the QUIC multipath path limit during NAT traversal.
-    //
-    // Fallback chain:
-    //   1. config/env bind_ipv4 (explicit operator choice)
-    //   2. STUN IPv4 if it's a local interface (bare metal with public IP)
-    //   3. Default-route interface IP (picks the primary outbound interface)
-    //   4. 0.0.0.0 (last resort — will advertise all interfaces)
+    // Determine bind address
     let bind_ipv4: std::net::Ipv4Addr = config
         .network
         .bind_ipv4
@@ -442,105 +393,31 @@ async fn run_miner(cli: Cli) -> Result<()> {
         .or_else(|| {
             let ip = common::stun::detect_default_route_ipv4();
             if let Some(v4) = ip {
-                info!(
-                    ip = %v4,
-                    "Using default-route interface as bind address \
-                     (prevents iroh from advertising all interfaces)"
-                );
+                info!(ip = %v4, "Using default-route interface as bind address");
             }
             ip
         })
         .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
 
-    // Static discovery provider: seeded with peer miner addresses from
-    // ClusterMapUpdate broadcasts. Iroh queries this during connect() so
-    // PullFromPeer and FetchBlob reach peers directly without relay discovery.
-    let static_discovery = iroh::address_lookup::memory::MemoryLookup::new();
-    state::init_static_discovery(static_discovery.clone());
-
-    let mut endpoint_builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(secret_key)
-        .max_tls_tickets(0) // Disable 0-RTT: prevents NAT traversal race (Iroh #3917)
-        .clear_address_lookup() // Remove N0 preset's Pkarr/DNS publishing to dns.iroh.link
-        .address_lookup(static_discovery)
-        .bind_addr(std::net::SocketAddrV4::new(
-            bind_ipv4,
-            config.network.p2p_port,
-        ))
-        .expect("valid bind addr");
-
-    // IPv6 bind: only from explicit config/env. STUN IPv6 is NOT used for
-    // auto-bind because the IPv6 socket uses a hardcoded port (11231) that
-    // operators may not have open in their firewall, and the extra socket
-    // can confuse iroh's path selection, breaking direct connectivity.
-    if let Some(ref ipv6_str) = config.network.bind_ipv6 {
-        let bind_ipv6: std::net::Ipv6Addr = ipv6_str.parse().unwrap_or_else(|e| {
-            panic!("P2P_BIND_IPV6 '{ipv6_str}' is not a valid IPv6 address: {e}");
-        });
-        endpoint_builder = endpoint_builder
-            .bind_addr(std::net::SocketAddrV6::new(
-                bind_ipv6,
-                constants::IPV6_P2P_PORT,
-                0,
-                0,
-            ))
-            .expect("valid bind addr");
-    }
-
     if bind_ipv4.is_unspecified() {
         warn!(
-            "P2P binding to 0.0.0.0:{} — iroh will advertise ALL interface IPs, \
-             which may exhaust QUIC multipath path limits. \
-             Set P2P_BIND_IPV4 to your server's primary IP.",
+            "P2P binding to 0.0.0.0:{} — set P2P_BIND_IPV4 to your server's primary IP.",
             config.network.p2p_port
         );
     } else {
         info!(bind_ip = %bind_ipv4, "P2P binding to specific IPv4 address");
     }
 
-    // Configure transport with keep-alive to maintain relay connections.
-    // QuicTransportConfig uses a builder pattern (immutable after build).
-    let transport_config = iroh::endpoint::QuicTransportConfig::builder()
-        .keep_alive_interval(std::time::Duration::from_secs(
-            constants::KEEP_ALIVE_INTERVAL_SECS,
-        ))
-        .default_path_keep_alive_interval(std::time::Duration::from_secs(
-            constants::DEFAULT_PATH_KEEP_ALIVE_SECS,
-        ))
-        .max_idle_timeout(Some(
-            std::time::Duration::from_secs(constants::MAX_IDLE_TIMEOUT_SECS)
-                .try_into()
-                .expect("valid idle timeout"),
-        ))
-        // Match validator's stream capacity for shard distribution.
-        // Large uploads open ~256 streams/miner (524MB file); 16384 supports multi-GB files.
-        .max_concurrent_bidi_streams(constants::MAX_CONCURRENT_BIDI_STREAMS.into())
-        .max_concurrent_uni_streams(constants::MAX_CONCURRENT_UNI_STREAMS.into())
-        // Flow control for receiving shard data at scale.
-        // 16MB send_window reduces per-connection memory and UDP buffer pressure.
-        .send_window(constants::SEND_WINDOW_BYTES)
-        .stream_receive_window(constants::STREAM_RECEIVE_WINDOW_BYTES.into())
-        // 64 MiB receive_window bounds aggregate receive capacity per connection.
-        .receive_window(constants::RECEIVE_WINDOW_BYTES.into())
-        // Use iroh defaults for multipath (13 paths) and NAT traversal (12 addresses).
-        // Higher values exhaust the CID budget (CidQueue::LEN=5 in iroh-quinn-proto)
-        // causing "remoted CIDs exhausted" errors during hole punching.
-        .send_observed_address_reports(true)
-        .receive_observed_address_reports(true)
-        .build();
+    let bind_addr = SocketAddr::new(
+        std::net::IpAddr::V4(bind_ipv4),
+        config.network.p2p_port,
+    );
+    let endpoint = common::transport::create_endpoint(bind_addr, &signing_key).await?;
 
-    endpoint_builder = endpoint_builder.transport_config(transport_config);
-
-    // Configure relay using consistent pattern from common crate
-    endpoint_builder = endpoint_builder.relay_mode(common::build_relay_mode(&relay_urls));
-
-    let endpoint = endpoint_builder.bind().await?;
-
-    let node_id = endpoint.secret_key().public();
-    info!(node_id = %node_id, "Iroh endpoint bound");
+    info!(node_id = %truncate_for_log(&node_id, 16), bind = %bind_addr, "Quinn endpoint bound");
 
     // Compute miner UID once (deterministic hash of public key)
-    let miner_uid = common::compute_miner_uid(&node_id.to_string());
+    let miner_uid = common::compute_miner_uid(&node_id);
     state::set_miner_uid(miner_uid);
 
     // Store data_dir globally for cluster map persistence
@@ -558,7 +435,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
         let pg_count = pgs.len();
         {
             let mut map_guard = state::get_cluster_map().write().await;
-            *map_guard = Some(std::sync::Arc::new(map));
+            *map_guard = Some(Arc::new(map));
         }
         {
             let mut cached = state::get_my_pgs_cache().write().await;
@@ -571,164 +448,148 @@ async fn run_miner(cli: Cli) -> Result<()> {
         );
     }
 
-    // Wait for relay connection (with timeout instead of fixed sleep)
-    info!("Waiting for relay connection...");
-    match tokio::time::timeout(
-        tokio::time::Duration::from_secs(common::RELAY_CONNECTION_WAIT_SECS),
-        endpoint.online(),
-    )
-    .await
-    {
-        Ok(()) => info!("Relay connection established"),
-        Err(_) => warn!(
-            timeout_secs = common::RELAY_CONNECTION_WAIT_SECS,
-            "Relay connection not established within timeout, proceeding anyway"
-        ),
-    }
-
-    // Wait for direct address discovery (STUN/port mapping) before
-    // registering with the validator. This ensures our public IPv4 (and
-    // IPv6 when configured) is known so that the validator can establish
-    // direct paths to us instead of relay-only connections.
-    let ipv6_enabled = config.network.bind_ipv6.is_some();
-    {
-        use iroh::Watcher as _;
-        if ipv6_enabled {
-            info!("Waiting for direct address discovery (IPv4 + IPv6)...");
-        } else {
-            info!("Waiting for direct address discovery (IPv4)...");
-        }
-        let mut watcher = endpoint.watch_addr();
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(constants::DIRECT_ADDR_DISCOVERY_TIMEOUT_SECS),
-            async {
-                loop {
-                    let addr = watcher.get();
-                    let has_v4 = addr.ip_addrs().any(|a| a.is_ipv4());
-                    let has_v6 = addr.ip_addrs().any(|a| a.is_ipv6());
-                    if has_v4 && (!ipv6_enabled || has_v6) {
-                        return addr;
-                    }
-                    if watcher.updated().await.is_err() {
-                        return watcher.get();
-                    }
-                }
-            },
-        )
-        .await
-        {
-            Ok(addr) => {
-                let v4: Vec<String> = addr
-                    .ip_addrs()
-                    .filter(|a| a.is_ipv4())
-                    .map(|a| a.to_string())
-                    .collect();
-                let v6: Vec<String> = addr
-                    .ip_addrs()
-                    .filter(|a| a.is_ipv6())
-                    .map(|a| a.to_string())
-                    .collect();
-                info!(
-                    ipv4 = ?v4,
-                    ipv6 = ?v6,
-                    "Direct addresses discovered"
-                );
-            }
-            Err(_) => {
-                let addr = endpoint.addr();
-                let v4: Vec<String> = addr
-                    .ip_addrs()
-                    .filter(|a| a.is_ipv4())
-                    .map(|a| a.to_string())
-                    .collect();
-                let v6: Vec<String> = addr
-                    .ip_addrs()
-                    .filter(|a| a.is_ipv6())
-                    .map(|a| a.to_string())
-                    .collect();
-                warn!(
-                    ipv4 = ?v4,
-                    ipv6 = ?v6,
-                    ipv6_enabled,
-                    timeout_secs = constants::DIRECT_ADDR_DISCOVERY_TIMEOUT_SECS,
-                    "Direct address discovery timed out \
-                     — proceeding with partial addresses"
-                );
-            }
-        }
-    }
     info!("Ready for P2P connections");
 
-    // 2. Initialize FsStore for persistent blob storage
+    // 2. Initialize flat-file blob store for persistent shard storage
     let blobs_dir = data_dir.join("blobs");
-    tokio::fs::create_dir_all(&blobs_dir).await?;
-    let store = FsStore::load(blobs_dir.clone()).await?;
-    info!(path = %blobs_dir.display(), "Initialized persistent blob storage");
+    let store = Arc::new(
+        FlatBlobStore::new(&blobs_dir)
+            .map_err(|e| anyhow::anyhow!("Failed to initialize blob store: {}", e))?,
+    );
+    info!(path = %blobs_dir.display(), "Initialized flat-file blob storage");
 
-    // Store blobs_dir globally for GC access
+    // Store blobs_dir globally
     {
         let mut bd = get_blobs_dir().write().await;
         *bd = Some(blobs_dir.clone());
     }
 
-    // 3. Register with Validator via P2P
+    // 3. Resolve validator address
     let validator_node_id_str = validator_node_id.ok_or_else(|| {
         anyhow::anyhow!(
             "VALIDATOR_NODE_ID is required for P2P registration (set via config or env)"
         )
     })?;
 
-    let validator_pubkey = iroh::PublicKey::from_str(&validator_node_id_str)
-        .map_err(|e| anyhow::anyhow!("Invalid VALIDATOR_NODE_ID format: {}", e))?;
+    // Resolve validator socket address: VALIDATOR_ADDR > first direct_addr
+    let validator_socket_addr: SocketAddr = config
+        .validator
+        .addr
+        .as_deref()
+        .map(|s| {
+            s.parse().unwrap_or_else(|e| {
+                panic!("VALIDATOR_ADDR '{s}' is not a valid socket address: {e}");
+            })
+        })
+        .or_else(|| {
+            config::parse_direct_addrs(&config.validator.direct_addrs)
+                .into_iter()
+                .next()
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "VALIDATOR_ADDR or VALIDATOR_DIRECT_ADDRS is required for quinn transport"
+            )
+        })?;
+
+    info!(
+        validator_addr = %validator_socket_addr,
+        validator_node_id = %truncate_for_log(&validator_node_id_str, 16),
+        "Validator address resolved"
+    );
 
     // Parse warden node ID if provided (optional)
-    let warden_pubkey = warden_node_id
-        .as_ref()
-        .map(|id| {
-            iroh::PublicKey::from_str(id)
-                .map_err(|e| anyhow::anyhow!("Invalid WARDEN_NODE_ID format: {}", e))
-        })
-        .transpose()?;
-
-    // Initialize dynamic warden node IDs from config (will be updated by validator heartbeats)
-    if let Some(wpk) = warden_pubkey {
+    if let Some(ref wid) = warden_node_id {
         let mut ids = get_warden_node_ids().write().await;
-        ids.push(wpk);
-        info!(warden = %truncate_for_log(warden_node_id.as_deref().unwrap_or(""), 16), "Warden PoS challenges authorized");
+        ids.push(wid.clone());
+        info!(warden = %truncate_for_log(wid, 16), "Warden PoS challenges authorized");
     }
 
-    // 3. Initialize Blobs Protocol and Router BEFORE registration.
-    // The validator starts sending Store commands immediately after
-    // registration succeeds. If the router isn't ready, those inbound
-    // connections get "aborted by peer", which can degrade the direct
-    // path and cause heartbeats to fall back to relay-only.
-    let blobs = BlobsProtocol::new(&store, None);
+    // Store validator info globally
+    {
+        let mut val_addr = state::get_validator_addr().write().await;
+        *val_addr = Some(validator_socket_addr);
+    }
+    {
+        let mut val_id = state::get_validator_node_id_global().write().await;
+        *val_id = validator_node_id_str.clone();
+    }
 
+    // 4. Initialize handler and start accept loop BEFORE registration.
     let store_concurrency = std::cmp::max(1, config.tuning.store_concurrency);
     let pull_concurrency = std::cmp::max(1, config.tuning.pull_concurrency);
     let fetch_concurrency = std::cmp::max(1, config.tuning.fetch_concurrency);
-
-    // PoS proof generation is CPU-intensive, limit concurrency
     let pos_concurrency = std::cmp::max(1, config.tuning.pos_concurrency.unwrap_or(2));
 
     let miner_control_handler = MinerControlHandler {
-        store: store.clone(),
+        store: Arc::clone(&store),
         endpoint: endpoint.clone(),
         store_sem: Arc::new(tokio::sync::Semaphore::new(store_concurrency)),
         pull_sem: Arc::new(tokio::sync::Semaphore::new(pull_concurrency)),
         fetch_sem: Arc::new(tokio::sync::Semaphore::new(fetch_concurrency)),
         pos_sem: Arc::new(tokio::sync::Semaphore::new(pos_concurrency)),
-        validator_node_id: Some(validator_pubkey),
+        validator_node_id: Some(validator_node_id_str.clone()),
     };
-    let router = Router::builder(endpoint.clone())
-        .accept(iroh_blobs::ALPN, blobs.clone())
-        .accept(common::MINER_CONTROL_ALPN, miner_control_handler)
-        .spawn();
+
+    // Spawn quinn accept loop (replaces iroh Router)
+    let accept_endpoint = endpoint.clone();
+    let accept_handler = miner_control_handler.clone();
+    let accept_token = CancellationToken::new();
+    let accept_cancel = accept_token.clone();
+    // Limit concurrent connections to prevent DoS (file descriptor exhaustion)
+    let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(256));
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                incoming = accept_endpoint.accept() => {
+                    let Some(incoming) = incoming else {
+                        info!("Accept loop: endpoint closed");
+                        break;
+                    };
+                    let handler = accept_handler.clone();
+                    let permit = match conn_semaphore.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            warn!("Connection limit reached (256), dropping incoming connection");
+                            drop(incoming);
+                            continue;
+                        }
+                    };
+                    tokio::spawn(async move {
+                        let _permit = permit; // held until task completes
+                        match incoming.await {
+                            Ok(conn) => {
+                                if let Err(e) = p2p::handle_miner_control(conn, handler).await {
+                                    let err_str = e.to_string();
+                                    if !err_str.contains("connection closed")
+                                        && !err_str.contains("error 0")
+                                    {
+                                        debug!(error = %e, "Connection handler error");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!(error = %e, "Incoming connection handshake failed");
+                            }
+                        }
+                    });
+                }
+                () = accept_cancel.cancelled() => {
+                    info!("Accept loop shutting down");
+                    break;
+                }
+            }
+        }
+    });
+
+    let signing_key = Arc::new(signing_key);
 
     let ctx = MinerContext {
         endpoint: endpoint.clone(),
-        validator_pubkey,
-        relay_url,
+        signing_key: signing_key.clone(),
+        node_id: node_id.clone(),
+        validator_node_id: validator_node_id_str.clone(),
+        validator_socket_addr,
         hostname,
         family_id,
         data_dir,
@@ -736,23 +597,23 @@ async fn run_miner(cli: Cli) -> Result<()> {
         stun_public_ip: stun_ipv4.map(|r| r.ip),
     };
 
-    // 4. Register with Validator via P2P
+    // 5. Register with Validator via P2P
     info!(validator = %truncate_for_log(&validator_node_id_str, 16), "Registering with validator via P2P");
 
-    // P2P Registration Loop with exponential backoff
     let reg_conn = register_with_validator(&ctx).await?;
 
-    // 4b. Join iroh-doc if DOC_TICKET provided at startup
+    // 5b. Join iroh-doc if DOC_TICKET provided at startup
+    // Note: iroh-docs still needs an iroh::Endpoint for gossip. We create a
+    // lightweight one just for doc sync. This is temporary until #151 removes iroh-docs.
     if let Ok(ticket) = std::env::var("DOC_TICKET") {
         if !ticket.is_empty() {
-            info!("DOC_TICKET provided, joining iroh-doc manifest gossip");
-            if let Err(e) = doc_replica::join_doc(endpoint.clone(), &ctx.data_dir, &ticket).await {
-                warn!(error = %e, "Failed to join iroh-doc at startup, will retry via heartbeat");
-            }
+            info!("DOC_TICKET provided — iroh-docs requires iroh::Endpoint (not yet migrated)");
+            // doc_replica::join_doc needs an iroh::Endpoint — skip for now.
+            // This feature will be removed in #151.
         }
     }
 
-    // 5. Start P2P Heartbeat Loop (reuse registration connection)
+    // 6. Start P2P Heartbeat Loop (reuse registration connection)
     let shutdown_token = CancellationToken::new();
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     spawn_heartbeat_loop(
@@ -762,31 +623,21 @@ async fn run_miner(cli: Cli) -> Result<()> {
         Some(reg_conn),
     );
 
-    // 5b. Start relay health monitor
-    spawn_relay_health_monitor(
-        endpoint.clone(),
-        shutdown_notify.clone(),
-        shutdown_token.clone(),
-    );
-
-    // 5c. Start gateway keepalive loop (miner→gateway persistent connections)
+    // 7. Start gateway keepalive loop
     gateway_keepalive::spawn_gateway_keepalive(endpoint.clone(), shutdown_token.clone());
 
-    // 6. Start Self-Rebalance Loop (if enabled)
+    // 8. Start Self-Rebalance Loop (if enabled)
     if config.tuning.rebalance_enabled {
-        let store_rebalance = store.clone();
+        let store_rebalance = Arc::clone(&store);
         let endpoint_rebalance = endpoint.clone();
         let tick_secs = config.tuning.rebalance_tick_secs;
         let rebalance_token = shutdown_token.clone();
 
         tokio::spawn(async move {
-            // Initial randomized jitter delay to let the miner settle after startup
-            // and desynchronize miners so they don't all hammer the validator
-            // at the exact same time with QueryPgFilesBatch requests.
+            // Initial randomized jitter delay
             let jitter_secs = {
                 use rand::Rng;
                 let mut rng = rand::rng();
-                // Wait anywhere from MIN_REBALANCE_JITTER_SECS to the full tick length
                 let max_jitter = std::cmp::max(constants::MIN_REBALANCE_JITTER_SECS + 1, tick_secs);
                 rng.random_range(constants::MIN_REBALANCE_JITTER_SECS..max_jitter)
             };
@@ -805,7 +656,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
 
             loop {
                 if let Err(e) = rebalance::self_rebalance_pg(
-                    store_rebalance.clone(),
+                    Arc::clone(&store_rebalance),
                     endpoint_rebalance.clone(),
                 )
                 .await
@@ -820,8 +671,6 @@ async fn run_miner(cli: Cli) -> Result<()> {
                         break;
                     }
                 }
-                // Add a small randomized delay between ticks to prevent miners
-                // that started close together from perfectly synchronizing over time.
                 let loop_jitter_secs = {
                     use rand::Rng;
                     let mut rng = rand::rng();
@@ -866,6 +715,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
 
     // 1. Signal all background loops to stop
     shutdown_token.cancel();
+    accept_token.cancel();
 
     // 2. Grace period for in-flight operations
     tokio::time::sleep(std::time::Duration::from_millis(
@@ -873,30 +723,17 @@ async fn run_miner(cli: Cli) -> Result<()> {
     ))
     .await;
 
-    // 3. Stop Router accept loop (drains in-flight handler tasks)
-    if let Err(e) = router.shutdown().await {
-        warn!(error = %e, "Router shutdown error");
-    }
-
-    // 4. Close P2P endpoint so peers see ApplicationClosed instead of TimedOut
+    // 3. Close quinn endpoint
     info!("Closing P2P endpoint...");
-    endpoint.close().await;
+    endpoint.close(0u32.into(), b"shutdown");
+    endpoint.wait_idle().await;
     info!("Shutdown complete");
 
     Ok(())
 }
 
-/// Build a validator `EndpointAddr` from public key and optional relay URL.
 /// Preflight network health checks.
-///
-/// Warns about system settings that can silently break QUIC connections:
-/// - Linux conntrack UDP timeout too low (kills outbound QUIC paths)
-/// - UFW / iptables INPUT DROP without adequate conntrack timeouts
 fn check_network_health() {
-    // Check conntrack UDP timeouts (Linux only).
-    // Both `nf_conntrack_udp_timeout` (unreplied flows) and
-    // `nf_conntrack_udp_timeout_stream` (established bidirectional flows)
-    // must be >= 120s or QUIC connections will be silently killed.
     for (path, label) in [
         (
             "/proc/sys/net/netfilter/nf_conntrack_udp_timeout",
@@ -914,10 +751,8 @@ fn check_network_health() {
                         param = label,
                         current_timeout = timeout,
                         required = 120,
-                        "⚠️  LOW CONNTRACK UDP TIMEOUT — QUIC connections may drop after {timeout}s. \
-                         Run: sudo sysctl -w {label}=120 \
-                         and persist in /etc/sysctl.conf. \
-                         See miner README for details."
+                        "LOW CONNTRACK UDP TIMEOUT — QUIC connections may drop after {timeout}s. \
+                         Run: sudo sysctl -w {label}=120"
                     );
                 } else {
                     info!(param = label, timeout, "Conntrack UDP timeout OK");
@@ -925,108 +760,9 @@ fn check_network_health() {
             }
         }
     }
-    // No /proc/sys/net/netfilter means conntrack is not loaded — no firewall issue
 }
 
-/// Iroh discovers the validator's direct address via relay-assisted
-/// hole-punching — no hardcoded IPs needed.
-fn build_validator_addr(
-    pubkey: &iroh::PublicKey,
-    relay_url: &Option<iroh_base::RelayUrl>,
-) -> iroh::EndpointAddr {
-    let mut addr = iroh::EndpointAddr::new(*pubkey);
-    if let Some(url) = relay_url {
-        addr = addr.with_relay_url(url.clone());
-    }
-    addr
-}
-
-/// Extract the validator's direct IP addresses from a live connection and
-/// seed them into the miner's static discovery. On the next `endpoint.connect()`
-/// iroh will try these addresses first, establishing a direct connection
-/// without needing relay-based multipath path promotion.
-fn seed_validator_discovery(
-    conn: &iroh::endpoint::Connection,
-    validator_pubkey: &iroh::PublicKey,
-    relay_url: &Option<iroh_base::RelayUrl>,
-) {
-    use iroh::Watcher as _;
-    let Some(discovery) = state::get_static_discovery() else {
-        return;
-    };
-
-    let direct_addrs: Vec<iroh::TransportAddr> = conn
-        .paths()
-        .get()
-        .iter()
-        .filter_map(|p| match p.remote_addr() {
-            iroh::TransportAddr::Ip(sock) if common::is_advertisable_ip(sock.ip()) => {
-                Some(iroh::TransportAddr::Ip(*sock))
-            }
-            _ => None,
-        })
-        .collect();
-
-    if direct_addrs.is_empty() {
-        return;
-    }
-
-    let mut addr = iroh::EndpointAddr::new(*validator_pubkey);
-    if let Some(url) = relay_url {
-        addr = addr.with_relay_url(url.clone());
-    }
-    addr = addr.with_addrs(direct_addrs.clone());
-    discovery.set_endpoint_info(addr);
-    debug!(
-        addrs = ?direct_addrs,
-        "Seeded validator direct addresses into static discovery"
-    );
-}
-
-/// Wait for a connection to establish a direct IP path via NAT traversal.
-///
-/// Delegates core waiting to `common::wait_for_direct_ip_path` and adds
-/// miner-specific logging (troubleshooting hints on long registration
-/// waits, debug-level for heartbeat probes).
-#[allow(dead_code)]
-async fn wait_for_direct_path(
-    conn: &iroh::endpoint::Connection,
-    endpoint: &iroh::Endpoint,
-    timeout_secs: u64,
-) -> bool {
-    let found =
-        common::wait_for_direct_ip_path(conn, tokio::time::Duration::from_secs(timeout_secs)).await;
-
-    if found {
-        info!("Direct IP path to validator confirmed");
-    } else {
-        // Only log full troubleshooting advice during registration (long waits).
-        // Heartbeat probes use shorter timeouts and log their own context.
-        if timeout_secs >= 20 {
-            let port = endpoint.bound_sockets().first().map_or(0, |s| s.port());
-            warn!(
-                timeout_secs = timeout_secs,
-                "Failed to establish direct IP path to validator. \
-                 Check: (1) UDP port {} is open inbound, \
-                 (2) P2P_BIND_IPV4 is set to your public IP if Docker is installed, \
-                 (3) firewall allows UDP traffic. \
-                 Will retry with backoff.",
-                port
-            );
-        } else {
-            debug!(
-                timeout_secs = timeout_secs,
-                "Direct IP path not established within heartbeat probe window"
-            );
-        }
-    }
-    found
-}
-
-async fn register_with_validator(ctx: &MinerContext) -> Result<iroh::endpoint::Connection> {
-    // NAT traversal requires an active connection — direct path waiting
-    // happens inside register_with_validator_once after connect().
-
+async fn register_with_validator(ctx: &MinerContext) -> Result<quinn::Connection> {
     let initial_backoff = ctx.config.tuning.initial_backoff_secs;
     let max_backoff = ctx.config.tuning.max_backoff_secs;
     let mut retry_count: u32 = 0;
@@ -1036,15 +772,14 @@ async fn register_with_validator(ctx: &MinerContext) -> Result<iroh::endpoint::C
             Ok(conn) => {
                 info!("Registered with validator via P2P");
                 {
-                    let mut val_ep = get_validator_endpoint().write().await;
-                    *val_ep = Some(ctx.validator_addr());
+                    let mut val_addr = state::get_validator_addr().write().await;
+                    *val_addr = Some(ctx.validator_socket_addr);
                 }
                 return Ok(conn);
             }
             Err(e) => {
                 let is_warming_up = e.to_string().contains("warming up");
                 if is_warming_up {
-                    // Validator reachable but not ready -- short fixed retry, no backoff
                     info!(
                         "Validator is warming up, retrying in {}s",
                         constants::REGISTRATION_RETRY_SLEEP_SECS
@@ -1075,183 +810,49 @@ async fn register_with_validator(ctx: &MinerContext) -> Result<iroh::endpoint::C
     }
 }
 
-/// Monitor relay connectivity using iroh's `watch_addr()` watcher.
-///
-/// When all relay connections are lost, this task:
-/// 1. Sets `RELAY_CONNECTED = false` so the heartbeat loop skips connection attempts
-/// 2. Periodically nudges `endpoint.online()` to encourage reconnection
-/// 3. After `RELAY_LOSS_EXIT_TIMEOUT_SECS` of continuous loss, triggers
-///    `shutdown_notify` for a clean process exit (systemd restarts with fresh state)
-fn spawn_relay_health_monitor(
-    endpoint: iroh::Endpoint,
-    shutdown_notify: Arc<tokio::sync::Notify>,
-    cancel_token: CancellationToken,
-) {
-    use constants::{
-        RELAY_CHECK_INTERVAL_SECS, RELAY_LOSS_EXIT_TIMEOUT_SECS, RELAY_ONLINE_NUDGE_TIMEOUT_SECS,
-    };
-    use iroh::Watcher as _;
-
-    tokio::spawn(async move {
-        let mut watcher = endpoint.watch_addr();
-        let initial = watcher.get();
-        let initial_relay_count = initial.relay_urls().count();
-        info!(
-            relay_count = initial_relay_count,
-            "Relay health monitor started"
-        );
-
-        loop {
-            // Block until address state changes (zero CPU when healthy)
-            tokio::select! {
-                _ = watcher.updated() => {}
-                () = cancel_token.cancelled() => {
-                    debug!("Relay health monitor shutting down");
-                    return;
-                }
-            }
-
-            let addr = watcher.get();
-            if addr.relay_urls().next().is_some() {
-                // Still connected to at least one relay
-                get_relay_connected().store(true, std::sync::atomic::Ordering::Relaxed);
-                continue;
-            }
-
-            // All relays lost
-            warn!("All relay connections lost, monitoring for recovery");
-            get_relay_connected().store(false, std::sync::atomic::Ordering::Relaxed);
-            let lost_at = tokio::time::Instant::now();
-
-            // Recovery sub-loop: check periodically until relay returns or timeout
-            loop {
-                tokio::select! {
-                    () = tokio::time::sleep(
-                        tokio::time::Duration::from_secs(RELAY_CHECK_INTERVAL_SECS)
-                    ) => {}
-                    () = cancel_token.cancelled() => {
-                        debug!("Relay health monitor shutting down");
-                        return;
-                    }
-                }
-
-                // Check watcher first (cheapest)
-                let addr = watcher.get();
-                let relay_count = addr.relay_urls().count();
-                if relay_count > 0 {
-                    let downtime = lost_at.elapsed().as_secs();
-                    info!(
-                        downtime_secs = downtime,
-                        relay_count, "Relay connection recovered"
-                    );
-                    get_relay_connected().store(true, std::sync::atomic::Ordering::Relaxed);
-                    break;
-                }
-
-                // Nudge iroh to retry relay connection
-                match tokio::time::timeout(
-                    tokio::time::Duration::from_secs(RELAY_ONLINE_NUDGE_TIMEOUT_SECS),
-                    endpoint.online(),
-                )
-                .await
-                {
-                    Ok(()) => {
-                        let downtime = lost_at.elapsed().as_secs();
-                        info!(
-                            downtime_secs = downtime,
-                            "Relay connection recovered (via online nudge)"
-                        );
-                        get_relay_connected().store(true, std::sync::atomic::Ordering::Relaxed);
-                        break;
-                    }
-                    Err(_) => {
-                        let downtime = lost_at.elapsed().as_secs();
-                        debug!(
-                            downtime_secs = downtime,
-                            "Relay still disconnected, waiting for recovery"
-                        );
-                    }
-                }
-
-                // Check timeout
-                if lost_at.elapsed().as_secs() >= RELAY_LOSS_EXIT_TIMEOUT_SECS {
-                    error!(
-                        downtime_secs = lost_at.elapsed().as_secs(),
-                        timeout_secs = RELAY_LOSS_EXIT_TIMEOUT_SECS,
-                        "Relay connection lost too long, triggering clean exit \
-                         for systemd restart"
-                    );
-                    shutdown_notify.notify_one();
-                    return;
-                }
-            }
-        }
-    });
-}
-
 fn spawn_heartbeat_loop(
     ctx: MinerContext,
     shutdown: Arc<tokio::sync::Notify>,
     cancel_token: CancellationToken,
-    initial_conn: Option<iroh::endpoint::Connection>,
+    initial_conn: Option<quinn::Connection>,
 ) {
     let miner_uid = state::get_miner_uid();
-    // Build initial endpoint addr — may be relay-only if iroh hasn't discovered
-    // the public IP yet. We refresh it every few heartbeats so that once iroh
-    // discovers the public IP via QUIC addr discovery, subsequent heartbeats
-    // advertise the direct address to the validator.
     let mut cached_endpoint_addr = ctx.build_endpoint_addr();
     let mut endpoint_addr_refresh_counter: u32 = 0;
 
     tokio::spawn(async move {
         let mut heartbeat_count: u32 = 0;
         let mut consecutive_failures: u32 = 0;
-        let mut current_validator_pubkey = ctx.validator_pubkey;
-
-        let mut heartbeat_validator_addr = ctx.validator_addr();
+        let mut current_validator_node_id = ctx.validator_node_id.clone();
+        let mut current_validator_addr = ctx.validator_socket_addr;
 
         // Persistent connection: reuse a single QUIC connection across heartbeats
-        // instead of creating a new one every 30s. Seed with the registration
-        // connection so the first heartbeat doesn't need a new connect().
-        let mut cached_conn: Option<iroh::endpoint::Connection> = initial_conn;
+        let mut cached_conn: Option<quinn::Connection> = initial_conn;
         let mut consecutive_rereg_failures: u32 = 0;
 
         loop {
             // Check if re-registration is needed
             if get_needs_reregistration().load(std::sync::atomic::Ordering::SeqCst) {
                 info!("Re-registration flag set, performing re-registration");
-
-                // Clear the flag first
                 get_needs_reregistration().store(false, std::sync::atomic::Ordering::SeqCst);
 
-                // Perform re-registration (use a temporary ctx with the current validator pubkey)
                 let rereg_ctx = MinerContext {
-                    validator_pubkey: current_validator_pubkey,
+                    validator_node_id: current_validator_node_id.clone(),
+                    validator_socket_addr: current_validator_addr,
                     ..ctx.clone()
                 };
                 match register_with_validator_once(&rereg_ctx).await {
                     Ok(new_conn) => {
                         consecutive_rereg_failures = 0;
                         info!("Re-registration successful");
-                        // Update stored validator endpoint (include direct addrs from config)
-                        let new_ctx = MinerContext {
-                            validator_pubkey: current_validator_pubkey,
-                            ..ctx.clone()
-                        };
-                        let new_addr = new_ctx.validator_addr();
                         {
-                            let mut val_ep = get_validator_endpoint().write().await;
-                            *val_ep = Some(new_addr.clone());
+                            let mut val_addr = state::get_validator_addr().write().await;
+                            *val_addr = Some(current_validator_addr);
                         }
-                        heartbeat_validator_addr = new_addr;
-                        // Replace cached connection with the fresh registration connection
                         if let Some(old) = cached_conn.take() {
                             old.close(0u32.into(), b"stale");
                         }
                         cached_conn = Some(new_conn);
-                        // Jitter before the next heartbeat to prevent thundering
-                        // herd when many miners re-register simultaneously
-                        // (e.g. after a validator restart).
                         let jitter_ms =
                             rand::rng().random_range(0..constants::MAX_HEARTBEAT_RETRY_JITTER_MS);
                         tokio::time::sleep(tokio::time::Duration::from_millis(jitter_ms)).await;
@@ -1264,16 +865,12 @@ fn spawn_heartbeat_loop(
                             "Re-registration failed, will retry on next heartbeat"
                         );
 
-                        // After too many consecutive failures, iroh's cached QUIC
-                        // path is likely stale and won't recover on its own.
-                        // Trigger clean exit so systemd restarts with fresh state.
                         if consecutive_rereg_failures
                             >= constants::MAX_REREGISTRATION_FAILURES_BEFORE_EXIT
                         {
                             error!(
                                 consecutive_failures = consecutive_rereg_failures,
-                                "Re-registration stuck in failure loop — triggering clean exit \
-                                 for systemd restart with fresh iroh endpoint"
+                                "Re-registration stuck — triggering clean exit for systemd restart"
                             );
                             if let Some(conn) = cached_conn.take() {
                                 conn.close(0u32.into(), b"stale-rereg");
@@ -1282,9 +879,7 @@ fn spawn_heartbeat_loop(
                             return;
                         }
 
-                        // Set flag again to retry
                         get_needs_reregistration().store(true, std::sync::atomic::Ordering::SeqCst);
-                        // Jitter avoids all miners retrying registration simultaneously
                         let retry_jitter_ms =
                             rand::rng().random_range(0..constants::MAX_SOCKET_REFRESH_JITTER_MS);
                         tokio::time::sleep(
@@ -1301,58 +896,36 @@ fn spawn_heartbeat_loop(
             // Periodically refresh validator address from environment
             heartbeat_count = heartbeat_count.wrapping_add(1);
             if heartbeat_count.is_multiple_of(constants::VALIDATOR_ADDR_REFRESH_INTERVAL_CYCLES)
-                && let Ok(new_validator_id) = std::env::var("VALIDATOR_NODE_ID")
-                && let Ok(new_pubkey) = iroh::PublicKey::from_str(&new_validator_id)
-                && new_pubkey != current_validator_pubkey
             {
-                debug!(
-                    old = %truncate_for_log(&current_validator_pubkey.to_string(), 16),
-                    new = %truncate_for_log(&new_validator_id, 16),
-                    "Validator address refreshed from environment"
-                );
-                current_validator_pubkey = new_pubkey;
-                {
-                    let refresh_ctx = MinerContext {
-                        validator_pubkey: current_validator_pubkey,
-                        ..ctx.clone()
-                    };
-                    heartbeat_validator_addr = refresh_ctx.validator_addr();
-                }
-
-                // Update stored validator endpoint
-                {
-                    let mut val_ep = get_validator_endpoint().write().await;
-                    *val_ep = Some(heartbeat_validator_addr.clone());
-                }
-
-                // Close and invalidate cached connection for old validator
-                if let Some(old) = cached_conn.take() {
-                    old.close(0u32.into(), b"stale");
-                }
-
-                // Trigger re-registration with new validator
-                get_needs_reregistration().store(true, std::sync::atomic::Ordering::SeqCst);
-                continue;
-            }
-
-            // Skip heartbeat when relay is known to be down — the relay
-            // health monitor handles escalation and eventual clean exit.
-            if !get_relay_connected().load(std::sync::atomic::Ordering::Relaxed) {
-                debug!("Relay disconnected, skipping heartbeat attempt");
-                get_validator_reachable().store(false, std::sync::atomic::Ordering::Relaxed);
-                tokio::select! {
-                    () = tokio::time::sleep(
-                        tokio::time::Duration::from_secs(constants::FAILURE_BACKOFF_BASE_SECS)
-                    ) => {}
-                    () = cancel_token.cancelled() => {
-                        info!("Heartbeat loop received shutdown signal");
-                        if let Some(conn) = cached_conn.take() {
-                            conn.close(0u32.into(), b"shutdown");
+                if let Ok(new_validator_id) = std::env::var("VALIDATOR_NODE_ID") {
+                    if new_validator_id != current_validator_node_id {
+                        debug!(
+                            old = %truncate_for_log(&current_validator_node_id, 16),
+                            new = %truncate_for_log(&new_validator_id, 16),
+                            "Validator node ID refreshed from environment"
+                        );
+                        current_validator_node_id = new_validator_id;
+                        {
+                            let mut val_id = state::get_validator_node_id_global().write().await;
+                            *val_id = current_validator_node_id.clone();
                         }
-                        return;
+
+                        // Also check for VALIDATOR_ADDR update
+                        if let Ok(new_addr_str) = std::env::var("VALIDATOR_ADDR") {
+                            if let Ok(new_addr) = new_addr_str.parse::<SocketAddr>() {
+                                current_validator_addr = new_addr;
+                                let mut val_addr = state::get_validator_addr().write().await;
+                                *val_addr = Some(current_validator_addr);
+                            }
+                        }
+
+                        if let Some(old) = cached_conn.take() {
+                            old.close(0u32.into(), b"stale");
+                        }
+                        get_needs_reregistration().store(true, std::sync::atomic::Ordering::SeqCst);
+                        continue;
                     }
                 }
-                continue;
             }
 
             let timestamp = now_secs();
@@ -1366,37 +939,20 @@ fn spawn_heartbeat_loop(
                 available
             };
 
-            // Refresh endpoint addr periodically so that once iroh discovers the
-            // public IP via QUIC addr discovery, subsequent heartbeats advertise
-            // the direct address (important for miners with no hostname configured).
+            // Refresh endpoint addr periodically
             endpoint_addr_refresh_counter = endpoint_addr_refresh_counter.wrapping_add(1);
             if endpoint_addr_refresh_counter
                 .is_multiple_of(constants::ENDPOINT_ADDR_REFRESH_INTERVAL_CYCLES)
             {
-                let refreshed = ctx.build_endpoint_addr();
-                let had_direct = cached_endpoint_addr
-                    .addrs
-                    .iter()
-                    .any(|a| matches!(a, iroh::TransportAddr::Ip(_)));
-                let now_has_direct = refreshed
-                    .addrs
-                    .iter()
-                    .any(|a| matches!(a, iroh::TransportAddr::Ip(_)));
-                if !had_direct && now_has_direct {
-                    info!(
-                        addrs = ?refreshed.addrs,
-                        "Endpoint addr upgraded: now advertising direct IP to validator"
-                    );
-                }
-                cached_endpoint_addr = refreshed;
+                cached_endpoint_addr = ctx.build_endpoint_addr();
             }
 
             let heartbeat_msg = {
-                let public_key_str = ctx.endpoint.secret_key().public().to_string();
+                let public_key_str = ctx.node_id.clone();
 
                 // Sign "HEARTBEAT:{public_key}:{timestamp}"
                 let sign_data = format!("HEARTBEAT:{}:{}", public_key_str, timestamp);
-                let signature = ctx.endpoint.secret_key().sign(sign_data.as_bytes());
+                let signature = ctx.sign(sign_data.as_bytes());
 
                 common::ValidatorControlMessage::Heartbeat {
                     miner_uid,
@@ -1410,21 +966,18 @@ fn spawn_heartbeat_loop(
             };
 
             // Reuse cached connection or establish a new one.
-            // Fresh connections use connect_with_direct_path which
-            // ensures a direct IP path before use.
-            let mut is_fresh_conn = false;
             let conn = match cached_conn.as_ref() {
                 Some(c) if c.close_reason().is_none() => Ok(c.clone()),
                 _ => {
                     if let Some(old) = cached_conn.take() {
                         old.close(0u32.into(), b"stale");
                     }
-                    is_fresh_conn = true;
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(constants::DEFAULT_CONNECT_TIMEOUT_SECS),
-                        ctx.endpoint.connect(
-                            heartbeat_validator_addr.clone(),
-                            common::VALIDATOR_CONTROL_ALPN,
+                        common::transport::connect(
+                            &ctx.endpoint,
+                            current_validator_addr,
+                            &current_validator_node_id,
                         ),
                     )
                     .await
@@ -1441,44 +994,7 @@ fn spawn_heartbeat_loop(
 
             match conn {
                 Ok(conn) => {
-                    // Seed the validator's direct addresses into static
-                    // discovery so future connect() calls try direct first.
-                    // This creates a direct path over time if holepunching succeeds.
-                    if has_direct_ip_path(&conn) {
-                        seed_validator_discovery(&conn, &current_validator_pubkey, &ctx.relay_url);
-                        if is_fresh_conn {
-                            use iroh::Watcher as _;
-                            let rtt_ms = conn
-                                .paths()
-                                .get()
-                                .iter()
-                                .filter(|p| p.is_ip())
-                                .map(|p| p.rtt().map(|d| d.as_millis()).unwrap_or(0))
-                                .next()
-                                .unwrap_or(0);
-                            info!(
-                                "[CONNECTED] Validator reachable via direct P2P ({}ms latency)",
-                                rtt_ms
-                            );
-                        }
-                    }
-                    // If the connection is relay-only, we still send the heartbeat,
-                    // but we log a warning and increment consecutive failures.
-                    // The validator will still receive the heartbeat and update
-                    // the miner's status, but it won't assign shards if it can't
-                    // establish a direct connection.
-                    if !has_direct_ip_path(&conn) {
-                        use iroh::Watcher as _;
-                        let paths = conn.paths().get();
-                        debug!(
-                            path_count = paths.len(),
-                            ip_paths = paths.iter().filter(|p| p.is_ip()).count(),
-                            "Heartbeat sent over relay-only connection"
-                        );
-                    }
-
-                    // Wrap entire heartbeat exchange in a single timeout to prevent
-                    // stalling on write_all/stopped if the validator's receive buffer is full.
+                    // Wrap entire heartbeat exchange in a single timeout
                     let result = tokio::time::timeout(std::time::Duration::from_secs(constants::HEARTBEAT_EXCHANGE_TIMEOUT_SECS), async {
                         let (mut send, mut recv) = conn.open_bi().await?;
 
@@ -1505,22 +1021,18 @@ fn spawn_heartbeat_loop(
                             return Ok(false);
                         }
 
-                        // Try to parse JSON response for warden node IDs and doc ticket
+                        // Try to parse JSON response for warden node IDs
                         if let Ok(response) = serde_json::from_str::<serde_json::Value>(&ack_str)
                         {
                             if let Some(ids) =
                                 response.get("warden_node_ids").and_then(|v| v.as_array())
                             {
-                                let mut new_ids = Vec::new();
-                                for id in ids {
-                                    if let Some(s) = id.as_str()
-                                        && let Ok(pk) = iroh::PublicKey::from_str(s)
-                                    {
-                                        new_ids.push(pk);
-                                    }
-                                }
+                                let mut new_ids: Vec<String> = ids
+                                    .iter()
+                                    .filter_map(|id| id.as_str().map(|s| s.to_string()))
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
                                 if !new_ids.is_empty() {
-                                    // Sort for deterministic comparison (validator sends from HashSet)
                                     new_ids.sort();
                                     let mut warden_ids = get_warden_node_ids().write().await;
                                     if *warden_ids != new_ids {
@@ -1530,27 +1042,6 @@ fn spawn_heartbeat_loop(
                                         );
                                         *warden_ids = new_ids;
                                     }
-                                }
-                            }
-
-                            // Join iroh-doc manifest gossip if ticket provided and not yet joined
-                            if !state::get_doc_joined().load(std::sync::atomic::Ordering::Acquire) {
-                                if let Some(ticket_str) =
-                                    response.get("doc_ticket").and_then(|v| v.as_str())
-                                {
-                                    let ep = ctx.endpoint.clone();
-                                    let dd = ctx.data_dir.clone();
-                                    let ts = ticket_str.to_string();
-                                    tokio::spawn(async move {
-                                        if let Err(e) =
-                                            doc_replica::join_doc(ep, &dd, &ts).await
-                                        {
-                                            warn!(
-                                                error = %e,
-                                                "Failed to join iroh-doc from heartbeat ticket"
-                                            );
-                                        }
-                                    });
                                 }
                             }
                         }
@@ -1578,8 +1069,7 @@ fn spawn_heartbeat_loop(
                             );
                         }
                         Ok(Ok(false)) => {
-                            // Validator is warming up -- reachable but not ready.
-                            // Don't increment failures; use short retry.
+                            // Validator is warming up
                             get_validator_reachable()
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
                             let jitter_ms =
@@ -1596,7 +1086,6 @@ fn spawn_heartbeat_loop(
                             info!(
                                 "[DISCONNECTED] Validator rejected this miner's family, shutting down"
                             );
-
                             if let Some(conn) = cached_conn.take() {
                                 conn.close(0u32.into(), b"shutdown");
                             }
@@ -1634,8 +1123,6 @@ fn spawn_heartbeat_loop(
             }
 
             // After 3 consecutive heartbeat failures, trigger re-registration.
-            // This handles the case where the validator restarted and the miner
-            // needs to re-announce itself (new node_id epoch, lost from cluster map).
             if consecutive_failures >= constants::HEARTBEAT_FAILURES_BEFORE_REREGISTRATION {
                 warn!(
                     consecutive_failures,
@@ -1672,13 +1159,12 @@ fn spawn_heartbeat_loop(
     });
 }
 
-/// Perform a single registration attempt with the validator (for re-registration).
-async fn register_with_validator_once(ctx: &MinerContext) -> Result<iroh::endpoint::Connection> {
+/// Perform a single registration attempt with the validator.
+async fn register_with_validator_once(ctx: &MinerContext) -> Result<quinn::Connection> {
     // Calculate storage stats
     let available = free_space(&ctx.data_dir).unwrap_or(0);
     let total = fs2::total_space(&ctx.data_dir).unwrap_or(0);
 
-    // Respect max_storage config if set
     let reported_available = if ctx.config.storage.max_storage_gb > 0 {
         std::cmp::min(
             available,
@@ -1694,16 +1180,13 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<iroh::endpoi
     let http_addr = ctx.http_addr();
 
     let register_msg = {
-        let public_key_str = ctx.endpoint.secret_key().public().to_string();
+        let public_key_str = ctx.node_id.clone();
         let timestamp = now_secs();
 
         // Sign "REGISTER:{public_key}:{timestamp}"
         let sign_data = format!("REGISTER:{}:{}", public_key_str, timestamp);
-        let signature = ctx.endpoint.secret_key().sign(sign_data.as_bytes());
+        let signature = ctx.sign(sign_data.as_bytes());
 
-        // Resolve hostname to IP once — reused for both endpoint_addr hints
-        // and http_addr so the validator/chain-submitter gets a real IP,
-        // not a K8s pod name.
         let resolved_ip = ctx.resolve_hostname_ip();
         let my_endpoint_addr = ctx.build_endpoint_addr();
 
@@ -1721,9 +1204,6 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<iroh::endpoi
         }
 
         // Send the resolved IP in http_addr when available.
-        // For localhost keep the original URL (validator uses it for local
-        // testing hints). Non-routable IPs (0.0.0.0, private) are useless
-        // for the chain-submitter — use STUN IP fallback, then original addr.
         let resolved_http_addr = match resolved_ip {
             Some(ip) if ip.is_loopback() => http_addr.clone(),
             Some(ip) if common::is_advertisable_ip(ip) => ip.to_string(),
@@ -1746,39 +1226,19 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<iroh::endpoi
         }
     };
 
-    // Connect to validator via P2P (relay or direct)
-    let validator_addr = ctx.validator_addr();
-
+    // Connect to validator via quinn
     let conn = tokio::time::timeout(
         std::time::Duration::from_secs(constants::DEFAULT_CONNECT_TIMEOUT_SECS),
-        ctx.endpoint
-            .connect(validator_addr, common::VALIDATOR_CONTROL_ALPN),
+        common::transport::connect(
+            &ctx.endpoint,
+            ctx.validator_socket_addr,
+            &ctx.validator_node_id,
+        ),
     )
     .await?
     .map_err(|e| anyhow::anyhow!("connect error: {}", e))?;
 
-    {
-        use iroh::Watcher as _;
-        let paths = conn.paths().get();
-        let path_details: Vec<String> = paths
-            .iter()
-            .map(|p| {
-                format!(
-                    "{:?} (rtt={}ms)",
-                    p.remote_addr(),
-                    p.rtt().map(|d| d.as_millis()).unwrap_or(0)
-                )
-            })
-            .collect();
-        info!(
-            path_count = paths.len(),
-            paths = ?path_details,
-            "Registration: P2P connection to validator established"
-        );
-    }
-
-    // Seed validator's direct addresses for future connections
-    seed_validator_discovery(&conn, &ctx.validator_pubkey, &ctx.relay_url);
+    info!("Registration: P2P connection to validator established");
 
     let result: anyhow::Result<()> = async {
         let (mut send, mut recv) = conn.open_bi().await?;
@@ -1805,9 +1265,6 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<iroh::endpoi
     }
     .await;
 
-    // Don't close the connection — return it so the heartbeat loop can reuse it.
-    // Closing forces iroh to create a new QUIC path on the next connect(), which
-    // may fail if the outbound UDP path is flaky (e.g. Contabo→OVH).
     result?;
     Ok(conn)
 }

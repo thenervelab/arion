@@ -1,12 +1,12 @@
 [package]
 name = "common"
-version = "0.1.8"
+version = "0.1.16"
 edition = "2024"
 
 [features]
 default = []
 # Enable Ed25519 signature verification for attestations
-verify = ["ed25519-dalek"]
+verify = []
 # Enable redb database helpers (open_database with repair logging)
 redb = ["dep:redb"]
 
@@ -34,10 +34,15 @@ parity-scale-codec = { version = "3.6", features = ["derive"] }
 scale-info = { version = "2.11", features = ["derive"] }
 # For merkle tree hashing
 blake3 = "1.5"
-# Optional: Ed25519 signature verification (enabled with "verify" feature)
-ed25519-dalek = { version = "2.1", optional = true }
+# Ed25519 keys — used by transport module and optionally for attestation verification
+ed25519-dalek = { workspace = true }
 # Optional: redb database helpers (enabled with "redb" feature)
 redb = { version = "3", optional = true }
+# Quinn transport foundation (coexists with iroh during migration)
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.14"
+hex = "0.4"
 # For serde support of large arrays (e.g., [u8; 64] for signatures)
 serde-big-array = "0.5"
 bytes = "1"

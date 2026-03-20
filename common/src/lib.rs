@@ -37,6 +37,7 @@ pub mod redb_utils;
 pub mod stun;
 pub mod telemetry;
 pub mod tls;
+pub mod transport;
 
 // Re-export attestation bundle types at crate root for convenience
 pub use attestation_bundle::{

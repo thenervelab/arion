@@ -22,19 +22,14 @@
 use crate::constants::{
     BATCH_RESPONSE_TIMEOUT_SECS, CONCURRENT_MANIFEST_FETCH_STREAMS, EPOCH_LOOKBACK,
     MANIFEST_READ_TIMEOUT_SECS, MANIFEST_RESPONSE_MAX_SIZE, MANIFEST_STREAM_OPEN_TIMEOUT_SECS,
-    MAX_BATCH_PG_RESPONSE_SIZE, MAX_CONSECUTIVE_MANIFEST_FAILURES, MAX_ORPHAN_ENTRIES,
-    MAX_PG_BATCH_FILE_ENTRIES, ORPHAN_GRACE_PERIOD_SECS, PG_BATCH_CHUNK_SIZE,
-    REBALANCE_FETCH_CONCURRENCY, REBALANCE_FETCH_MAX_CONCURRENCY, REBALANCE_FETCH_MIN_CONCURRENCY,
-    REBALANCE_FETCH_SCALEUP_THRESHOLD, REBALANCE_MAX_FILES_PER_CYCLE,
+    MAX_BATCH_PG_RESPONSE_SIZE, MAX_CONSECUTIVE_MANIFEST_FAILURES, MAX_PG_BATCH_FILE_ENTRIES,
+    PG_BATCH_CHUNK_SIZE, REBALANCE_FETCH_CONCURRENCY, REBALANCE_FETCH_MAX_CONCURRENCY,
+    REBALANCE_FETCH_MIN_CONCURRENCY, REBALANCE_FETCH_SCALEUP_THRESHOLD,
+    REBALANCE_MAX_FILES_PER_CYCLE,
 };
-use crate::state::{
-    get_blobs_dir, get_cluster_map, get_orphan_shards, get_validator_endpoint,
-    get_validator_reachable,
-};
+use crate::flat_store::FlatBlobStore;
+use crate::state::{get_cluster_map, get_validator_addr, get_validator_node_id_global, get_validator_reachable};
 use anyhow::Result;
-use common::now_secs;
-use iroh::endpoint::Endpoint;
-use iroh_blobs::store::fs::FsStore;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -49,14 +44,15 @@ const DOC_BLOB_READ_TIMEOUT_SECS: u64 = 5;
 /// `hippius/gateway-control` ALPN (which handles `GetClusterMapEpoch`).
 /// Returns `None` if the validator cannot serve the requested epoch.
 async fn fetch_cluster_map_for_epoch(
-    endpoint: &Endpoint,
-    validator_addr: &iroh::EndpointAddr,
+    endpoint: &quinn::Endpoint,
+    validator_node_id: &str,
+    validator_addr: std::net::SocketAddr,
     epoch: u64,
 ) -> Option<common::ClusterMap> {
     let conn = match crate::state::get_pooled_connection(
         endpoint,
+        validator_node_id,
         validator_addr,
-        common::GATEWAY_CONTROL_ALPN,
     )
     .await
     {
@@ -93,9 +89,7 @@ async fn fetch_cluster_map_for_epoch(
         let response: common::GatewayControlMessage =
             serde_json::from_slice(&response_bytes).ok()?;
         match response {
-            common::GatewayControlMessage::ClusterMapResponse {
-                map: Some(map), ..
-            } => Some(map),
+            common::GatewayControlMessage::ClusterMapResponse { map: Some(map), .. } => Some(map),
             _ => None,
         }
     }
@@ -118,7 +112,7 @@ async fn fetch_cluster_map_for_epoch(
 ///
 /// Uses validator P2P as primary source. Falls back to local iroh-doc replica
 /// when validator is unreachable, enabling fully offline self-healing.
-pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()> {
+pub async fn self_rebalance_pg(store: Arc<FlatBlobStore>, endpoint: quinn::Endpoint) -> Result<()> {
     // Stability window: defer rebalance if the cluster map epoch changed recently.
     // This prevents acting on a stale or rapidly-changing topology.
     {
@@ -171,14 +165,18 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
         }
     };
 
-    // Get validator endpoint for P2P queries (optional when doc replica available)
+    // Get validator address + node_id for P2P queries (optional when doc replica available)
     let validator_addr = {
-        let val_ep = get_validator_endpoint().read().await;
-        val_ep.as_ref().cloned()
+        let val_addr = get_validator_addr().read().await;
+        *val_addr
+    };
+    let validator_node_id = {
+        let nid = get_validator_node_id_global().read().await;
+        nid.clone()
     };
 
     if validator_addr.is_none() && !doc_available {
-        warn!("No validator endpoint stored and no doc replica, skipping rebalance");
+        warn!("No validator address stored and no doc replica, skipping rebalance");
         return Ok(());
     }
 
@@ -278,30 +276,19 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
 
     trace!(pgs = ?my_pgs.iter().take(10).collect::<Vec<_>>(), "My PG assignments (first 10)");
 
-    // Pre-build map of locally present hashes and their tags via FsStore API.
-    // This is authoritative (unlike directory walks which can miss inlined blobs)
-    // and also provides tags for gc_orphan_shards to delete properly.
-    let local_hash_tags: std::collections::HashMap<iroh_blobs::Hash, iroh_blobs::api::Tag> = {
-        use futures::StreamExt;
-        let mut map = std::collections::HashMap::new();
-        match store.tags().list().await {
-            Ok(mut tag_stream) => {
-                while let Some(Ok(tag_info)) = tag_stream.next().await {
-                    map.insert(tag_info.hash, tag_info.name);
-                }
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to list tags from store");
-            }
-        }
+    // Pre-build set of locally present hashes from the flat file store.
+    let local_hashes: std::collections::HashSet<iroh_blobs::Hash> = {
+        let hash_strings = store.list_hashes();
+        let set: std::collections::HashSet<iroh_blobs::Hash> = hash_strings
+            .iter()
+            .filter_map(|h| iroh_blobs::Hash::from_str(h).ok())
+            .collect();
         trace!(
-            local_blobs = map.len(),
-            "Built local hash set from FsStore tags"
+            local_blobs = set.len(),
+            "Built local hash set from flat store"
         );
-        map
+        set
     };
-    let local_hashes: std::collections::HashSet<iroh_blobs::Hash> =
-        local_hash_tags.keys().copied().collect();
 
     let mut missing_shards: usize = 0;
     let mut expected_shards: std::collections::HashSet<iroh_blobs::Hash> =
@@ -318,12 +305,12 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
 
     // Try validator path first, fall back to doc replica
     let used_doc_fallback = if validator_reachable && validator_addr.is_some() {
-        let validator_addr = validator_addr.as_ref().unwrap();
+        let validator_addr = validator_addr.unwrap();
 
         let validator_conn = match crate::state::get_pooled_connection(
             &endpoint,
+            &validator_node_id,
             validator_addr,
-            common::VALIDATOR_CONTROL_ALPN,
         )
         .await
         {
@@ -425,19 +412,11 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
                             // Lazily fetch the placement-epoch cluster map if
                             // we haven't seen this epoch before.
                             let pe = manifest.placement_epoch;
-                            if !placement_epoch_maps.contains_key(&pe)
-                                && pe != cluster_map.epoch
-                            {
+                            if !placement_epoch_maps.contains_key(&pe) && pe != cluster_map.epoch {
                                 if let Some(pe_map) =
-                                    fetch_cluster_map_for_epoch(
-                                        &endpoint,
-                                        validator_addr,
-                                        pe,
-                                    )
-                                    .await
+                                    fetch_cluster_map_for_epoch(&endpoint, &validator_node_id, validator_addr, pe).await
                                 {
-                                    placement_epoch_maps
-                                        .insert(pe, Arc::new(pe_map));
+                                    placement_epoch_maps.insert(pe, Arc::new(pe_map));
                                 }
                             }
                             tally_manifest_shards(
@@ -507,20 +486,12 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
                             // (doc fallback path — validator may still be
                             // reachable for epoch map queries).
                             let pe = manifest.placement_epoch;
-                            if !placement_epoch_maps.contains_key(&pe)
-                                && pe != cluster_map.epoch
-                            {
-                                if let Some(val_addr) = validator_addr.as_ref() {
+                            if !placement_epoch_maps.contains_key(&pe) && pe != cluster_map.epoch {
+                                if let Some(val_addr) = validator_addr {
                                     if let Some(pe_map) =
-                                        fetch_cluster_map_for_epoch(
-                                            &endpoint,
-                                            val_addr,
-                                            pe,
-                                        )
-                                        .await
+                                        fetch_cluster_map_for_epoch(&endpoint, &validator_node_id, val_addr, pe).await
                                     {
-                                        placement_epoch_maps
-                                            .insert(pe, Arc::new(pe_map));
+                                        placement_epoch_maps.insert(pe, Arc::new(pe_map));
                                     }
                                 }
                             }
@@ -590,8 +561,6 @@ pub async fn self_rebalance_pg(store: FsStore, endpoint: Endpoint) -> Result<()>
         );
     }
 
-    // GC: Identify orphan shards, delete tags and files after grace period
-    gc_orphan_shards(&expected_shards, &local_hash_tags, &store).await;
     Ok(())
 }
 
@@ -601,8 +570,8 @@ struct MissingShard {
     shard_hash: iroh_blobs::Hash,
     /// Hex string blob hash for FetchBlob P2P requests.
     blob_hash_str: String,
-    /// Peers that may hold this shard (from current and historical placements).
-    peer_endpoints: Vec<iroh::EndpointAddr>,
+    /// Peers that may hold this shard (node_id hex, SocketAddr).
+    peer_endpoints: Vec<(String, std::net::SocketAddr)>,
 }
 
 /// Walk a manifest and tally which shards this miner should hold,
@@ -623,7 +592,7 @@ async fn tally_manifest_shards(
     cluster_map: &common::ClusterMap,
     history_maps: &[Arc<common::ClusterMap>],
     placement_epoch_maps: &std::collections::HashMap<u64, Arc<common::ClusterMap>>,
-    store: &FsStore,
+    store: &FlatBlobStore,
     local_hashes: &std::collections::HashSet<iroh_blobs::Hash>,
     expected_shards: &mut std::collections::HashSet<iroh_blobs::Hash>,
     missing_shards: &mut usize,
@@ -685,18 +654,16 @@ async fn tally_manifest_shards(
             // than the EPOCH_LOOKBACK window.
             let mine_placement = if !mine_current && !mine_historical {
                 match placement_epoch_maps.get(&manifest.placement_epoch) {
-                    Some(pe_map) => {
-                        common::calculate_stripe_placement(
-                            file_hash,
-                            stripe_idx as u64,
-                            shards_per_stripe,
-                            pe_map,
-                            manifest.placement_version,
-                        )
-                        .ok()
-                        .and_then(|miners| miners.get(local_idx).cloned())
-                        .is_some_and(|m| m.uid == my_uid)
-                    }
+                    Some(pe_map) => common::calculate_stripe_placement(
+                        file_hash,
+                        stripe_idx as u64,
+                        shards_per_stripe,
+                        pe_map,
+                        manifest.placement_version,
+                    )
+                    .ok()
+                    .and_then(|miners| miners.get(local_idx).cloned())
+                    .is_some_and(|m| m.uid == my_uid),
                     // Placement epoch map unavailable (validator couldn't serve
                     // it or was unreachable).  Assume ownership — false retention
                     // is safe; false deletion is data loss.
@@ -711,12 +678,11 @@ async fn tally_manifest_shards(
 
                 // Only count missing shards for current-epoch placement
                 if mine_current && !local_hashes.contains(&shard_hash) {
-                    // Loopback: check if blob exists in store without a tag
-                    if store.blobs().has(shard_hash).await.unwrap_or(false) {
-                        let hash_str = shard_hash.to_string();
+                    // Loopback: check if blob exists on disk
+                    if store.has(&shard.blob_hash) {
                         info!(
                             "[REBALANCE] Shard {} found locally (loopback)",
-                            &hash_str[..8.min(hash_str.len())]
+                            &shard.blob_hash[..8.min(shard.blob_hash.len())]
                         );
                     } else {
                         *missing_shards += 1;
@@ -725,7 +691,7 @@ async fn tally_manifest_shards(
                         // other miners in the same stripe position from current
                         // and historical epochs (the previous holder likely
                         // still has it during the orphan grace period).
-                        let mut peers = Vec::new();
+                        let mut peers: Vec<(String, std::net::SocketAddr)> = Vec::new();
                         // Historical placements: the miner that held this
                         // position in a previous epoch likely still has it.
                         for hist_map in history_maps {
@@ -737,8 +703,10 @@ async fn tally_manifest_shards(
                                 manifest.placement_version,
                             ) {
                                 if let Some(m) = hist_miners.get(local_idx) {
-                                    if m.uid != my_uid && common::has_direct_addr(&m.endpoint) {
-                                        peers.push(m.endpoint.clone());
+                                    if m.uid != my_uid {
+                                        if let Some(addr) = crate::state::socket_addr_from_endpoint(&m.endpoint) {
+                                            peers.push((m.endpoint.id.to_string(), addr));
+                                        }
                                     }
                                 }
                             }
@@ -750,15 +718,14 @@ async fn tally_manifest_shards(
                         // Also try all other stripe miners as FetchBlob sources
                         // (they may have the blob from a previous assignment).
                         for (i, m) in stripe_miners.iter().enumerate() {
-                            if i != local_idx
-                                && m.uid != my_uid
-                                && common::has_direct_addr(&m.endpoint)
-                            {
-                                peers.push(m.endpoint.clone());
+                            if i != local_idx && m.uid != my_uid {
+                                if let Some(addr) = crate::state::socket_addr_from_endpoint(&m.endpoint) {
+                                    peers.push((m.endpoint.id.to_string(), addr));
+                                }
                             }
                         }
                         // Deduplicate by node_id
-                        peers.dedup_by(|a, b| a.id == b.id);
+                        peers.dedup_by(|a, b| a.0 == b.0);
 
                         missing_shard_list.push(MissingShard {
                             shard_hash,
@@ -783,8 +750,8 @@ async fn tally_manifest_shards(
 /// Returns the number of shards successfully fetched.
 async fn fetch_missing_shards(
     missing: Vec<MissingShard>,
-    store: &FsStore,
-    endpoint: &Endpoint,
+    store: &Arc<FlatBlobStore>,
+    endpoint: &quinn::Endpoint,
 ) -> usize {
     if missing.is_empty() {
         return 0;
@@ -814,7 +781,7 @@ async fn fetch_missing_shards(
         let concurrency = concurrency.clone();
         let consecutive_ok = consecutive_ok.clone();
         let fetched = fetched.clone();
-        let store = store.clone();
+        let store = Arc::clone(store);
         let endpoint = endpoint.clone();
 
         join_set.spawn(async move {
@@ -825,17 +792,13 @@ async fn fetch_missing_shards(
 
             // Try each peer until one succeeds
             let mut success = false;
-            for peer_addr in &shard.peer_endpoints {
-                if !common::has_direct_addr(peer_addr) {
-                    continue;
-                }
-
+            for (peer_node_id, peer_addr) in &shard.peer_endpoints {
                 let conn = match tokio::time::timeout(
                     connect_timeout,
                     crate::state::get_pooled_connection(
                         &endpoint,
-                        peer_addr,
-                        common::MINER_CONTROL_ALPN,
+                        peer_node_id,
+                        *peer_addr,
                     ),
                 )
                 .await
@@ -873,33 +836,32 @@ async fn fetch_missing_shards(
 
                 match fetch_result {
                     Ok(Some(data)) => {
-                        // Store the fetched shard
-                        match store.add_bytes(bytes::Bytes::from(data)).await {
-                            Ok(outcome) => {
-                                if outcome.hash == shard.shard_hash {
-                                    crate::state::tag_map_insert(outcome.hash, outcome.name);
+                        // Verify blake3 hash before storing
+                        let computed = blake3::hash(&data);
+                        let computed_hex = computed.to_hex();
+                        if computed_hex.as_str() == shard.blob_hash_str {
+                            match store.store(&shard.blob_hash_str, &data).await {
+                                Ok(()) => {
                                     success = true;
                                     debug!(
                                         shard = hash_short,
                                         "[REBALANCE] Fetched shard from peer"
                                     );
                                     break;
-                                } else {
-                                    // Hash mismatch — delete and try next peer
-                                    let _ = store.tags().delete(&outcome.name).await;
+                                }
+                                Err(e) => {
                                     warn!(
+                                        error = %e,
                                         shard = hash_short,
-                                        "[REBALANCE] Shard hash mismatch from peer"
+                                        "[REBALANCE] Failed to store fetched shard"
                                     );
                                 }
                             }
-                            Err(e) => {
-                                warn!(
-                                    error = %e,
-                                    shard = hash_short,
-                                    "[REBALANCE] Failed to store fetched shard"
-                                );
-                            }
+                        } else {
+                            warn!(
+                                shard = hash_short,
+                                "[REBALANCE] Shard hash mismatch from peer"
+                            );
                         }
                     }
                     Ok(None) => {
@@ -1075,148 +1037,12 @@ async fn fetch_file_hashes_from_doc(
     Ok(file_hashes)
 }
 
-/// Garbage collect orphan shards.
-///
-/// Uses the pre-built `local_hash_tags` map from the rebalance tag listing.
-/// Deletes orphans by removing both the FsStore tag (so the blob becomes
-/// eligible for store-level GC) and the on-disk data file.
-async fn gc_orphan_shards(
-    expected_shards: &std::collections::HashSet<iroh_blobs::Hash>,
-    local_hash_tags: &std::collections::HashMap<iroh_blobs::Hash, iroh_blobs::api::Tag>,
-    store: &FsStore,
-) {
-    let now = now_secs();
-
-    // Guard: if clock skew detected, skip GC entirely
-    if now == 0 {
-        warn!("Clock skew detected (now_secs=0), skipping orphan GC");
-        return;
-    }
-
-    // Get blobs directory for file deletion paths
-    let blobs_path = {
-        let bd = get_blobs_dir().read().await;
-        bd.clone()
-    };
-
-    let Some(blobs_dir) = blobs_path else {
-        return;
-    };
-    let data_dir = blobs_dir.join("data");
-
-    let mut orphan_count = 0;
-    let mut deleted_count = 0;
-    let mut kept_count = 0;
-    let mut skipped_at_capacity = 0u64;
-    let mut tag_delete_failures = 0u32;
-    let mut file_delete_failures = 0u32;
-
-    // Use DashMap for lock-free orphan tracking
-    let orphan_map = get_orphan_shards();
-
-    // Iterate over pre-built local hash/tag map (no directory walk needed)
-    for (blob_hash, tag) in local_hash_tags {
-        if expected_shards.contains(blob_hash) {
-            // This is expected - remove from orphan tracking
-            orphan_map.remove(blob_hash);
-            kept_count += 1;
-        } else {
-            // Potential orphan
-            orphan_count += 1;
-            let hash_str = blob_hash.to_string();
-
-            if let Some(orphan_entry) = orphan_map.get(blob_hash) {
-                let first_seen = *orphan_entry;
-                drop(orphan_entry);
-
-                // Guard: if now < first_seen, entry is corrupted
-                if now < first_seen {
-                    orphan_map.remove(blob_hash);
-                    continue;
-                }
-
-                // Check if grace period expired
-                if now - first_seen > ORPHAN_GRACE_PERIOD_SECS {
-                    let mut removed = false;
-
-                    // Delete the tag first so the blob becomes eligible for store-level GC
-                    match store.tags().delete(tag).await {
-                        Ok(_) => {
-                            removed = true;
-                            // Also remove from TAG_MAP cache
-                            crate::state::get_tag_map().remove(blob_hash);
-                        }
-                        Err(_) => {
-                            tag_delete_failures += 1;
-                        }
-                    }
-
-                    // Best-effort remove data file from disk
-                    let p1 = data_dir.join(format!("{}.data", hash_str));
-                    let p2 = data_dir.join(&hash_str);
-                    for p in [p1, p2] {
-                        match tokio::fs::remove_file(&p).await {
-                            Ok(()) => {
-                                removed = true;
-                                break;
-                            }
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(_) => {
-                                file_delete_failures += 1;
-                            }
-                        }
-                    }
-
-                    if removed {
-                        deleted_count += 1;
-                        orphan_map.remove(blob_hash);
-                    }
-                }
-                // else: still in grace period, keep tracking
-            } else {
-                // New orphan - start tracking with timestamp
-                // Bound orphan map size to prevent unbounded memory growth
-                if orphan_map.len() < MAX_ORPHAN_ENTRIES {
-                    orphan_map.insert(*blob_hash, now);
-                } else {
-                    skipped_at_capacity += 1;
-                }
-            }
-        }
-    }
-
-    if skipped_at_capacity > 0 {
-        warn!(
-            capacity = MAX_ORPHAN_ENTRIES,
-            skipped = skipped_at_capacity,
-            "Orphan map at capacity, skipped tracking new orphans"
-        );
-    }
-
-    if tag_delete_failures > 0 || file_delete_failures > 0 {
-        warn!(
-            tag_delete_failures,
-            file_delete_failures, "Orphan GC encountered delete errors"
-        );
-    }
-
-    if orphan_count > 0 || deleted_count > 0 {
-        debug!(
-            expected = kept_count,
-            orphans_tracked = orphan_count,
-            deleted = deleted_count,
-            grace_period_secs = ORPHAN_GRACE_PERIOD_SECS,
-            "GC complete"
-        );
-    }
-}
-
 /// Fetch manifest using an existing P2P connection (opens a new bidi stream).
 ///
 /// Reuses the connection instead of creating one per file, avoiding
 /// connection storms that overwhelm the validator.
 async fn fetch_manifest_on_conn(
-    conn: &iroh::endpoint::Connection,
+    conn: &quinn::Connection,
     file_hash: &str,
 ) -> Result<Option<common::FileManifest>> {
     let query_msg = common::ValidatorControlMessage::QueryManifest {
@@ -1309,8 +1135,8 @@ pub async fn reconstruct_shard(
     shard_index: usize,
     stripe_index: u64,
     manifest: &common::FileManifest,
-    store: &FsStore,
-    endpoint: &Endpoint,
+    store: &FlatBlobStore,
+    endpoint: &quinn::Endpoint,
     fetch_sem: &Arc<Semaphore>,
 ) -> Result<bool> {
     let shards_per_stripe = manifest.stripe_config.k + manifest.stripe_config.m;
@@ -1335,11 +1161,7 @@ pub async fn reconstruct_shard(
     let mut available_count: usize = 0;
 
     for (i, shard_info) in stripe_shards.iter().enumerate() {
-        let hash = match iroh_blobs::Hash::from_str(&shard_info.blob_hash) {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
-        match store.get_bytes(hash).await {
+        match store.read(&shard_info.blob_hash).await {
             Ok(data) if !data.is_empty() => {
                 shard_data[i] = Some(data.to_vec());
                 available_count += 1;
@@ -1400,10 +1222,12 @@ pub async fn reconstruct_shard(
                 None => continue,
             };
 
-            // Skip relay-only miners
-            if !common::has_direct_addr(&miner.endpoint) {
-                continue;
-            }
+            // Extract direct socket address (skip if none)
+            let peer_addr = match crate::state::socket_addr_from_endpoint(&miner.endpoint) {
+                Some(a) => a,
+                None => continue,
+            };
+            let peer_node_id = miner.endpoint.id.to_string();
 
             // Acquire fetch semaphore permit (bounds concurrency)
             let _permit = match fetch_sem.clone().try_acquire_owned() {
@@ -1416,8 +1240,8 @@ pub async fn reconstruct_shard(
                 connect_timeout,
                 crate::state::get_pooled_connection(
                     endpoint,
-                    &miner.endpoint,
-                    common::MINER_CONTROL_ALPN,
+                    &peer_node_id,
+                    peer_addr,
                 ),
             )
             .await
@@ -1497,24 +1321,23 @@ pub async fn reconstruct_shard(
         }
     };
 
-    let outcome = store
-        .add_bytes(bytes::Bytes::from(reconstructed))
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to store reconstructed shard: {}", e))?;
-
-    // Verify stored hash matches expected
-    if outcome.hash != shard_hash {
+    // Verify blake3 hash matches expected before storing
+    let shard_hash_hex = shard_hash.to_string();
+    let computed = blake3::hash(&reconstructed);
+    let computed_hex = computed.to_hex();
+    if computed_hex.as_str() != shard_hash_hex {
         warn!(
-            expected = %&shard_hash.to_string()[..12],
-            stored = %&outcome.hash.to_string()[..12],
+            expected = %&shard_hash_hex[..12],
+            stored = %&computed_hex.as_str()[..12],
             "[REBALANCE] Reconstructed shard hash mismatch"
         );
-        let _ = store.tags().delete(&outcome.name).await;
         return Ok(false);
     }
 
-    // Track tag for O(1) delete lookup
-    crate::state::tag_map_insert(outcome.hash, outcome.name);
+    store
+        .store(&shard_hash_hex, &reconstructed)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to store reconstructed shard: {}", e))?;
 
     // 6. Return Ok(true) if successful
     info!(

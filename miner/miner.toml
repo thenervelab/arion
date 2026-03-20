@@ -1,0 +1,10 @@
+[network]
+hostname = "localhost"
+family_id = "local-dev"
+
+[storage]
+path = "data/miner/blobs"
+data_dir = "data/miner"
+
+[validator]
+node_id = "FROM_THE_DOCS"  

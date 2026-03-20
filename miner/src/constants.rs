@@ -23,16 +23,6 @@
 //! - **Miscellaneous**: Logging, version check, file permissions, connection pool eviction
 
 // ============================================================================
-// Orphan Management
-// ============================================================================
-
-/// Grace period before deleting orphan shards (1 hour default)
-pub const ORPHAN_GRACE_PERIOD_SECS: u64 = 604_800; // 7 days
-
-/// Maximum number of orphan entries to track (prevents unbounded memory growth)
-pub const MAX_ORPHAN_ENTRIES: usize = 100_000;
-
-// ============================================================================
 // Epoch Validation
 // ============================================================================
 
@@ -67,9 +57,6 @@ pub const BLOB_CACHE_SIZE: usize = 10_000;
 /// Maximum peer cache entries (prevents unbounded memory growth)
 /// Based on typical cluster size: 10k miners should be more than enough
 pub const MAX_PEER_CACHE_ENTRIES: usize = 10_000;
-
-/// Maximum tag map entries (Hash -> Tag) for O(1) delete lookups
-pub const MAX_TAG_MAP_ENTRIES: usize = 200_000;
 
 /// PoS commitment cache size (number of entries, ~200KB each ≈ 20MB max)
 pub const POS_COMMITMENT_CACHE_SIZE: usize = 100;

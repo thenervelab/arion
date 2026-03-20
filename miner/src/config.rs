@@ -191,6 +191,11 @@ pub struct ValidatorConfig {
     /// Validator Node ID (Ed25519 public key) for P2P
     pub node_id: Option<String>,
 
+    /// Validator socket address (IP:PORT) for quinn transport.
+    /// Required for direct QUIC connections. Override with VALIDATOR_ADDR env var.
+    /// Falls back to first entry of direct_addrs if not set.
+    pub addr: Option<String>,
+
     /// Validator direct addresses (comma-separated list of IP:PORT).
     /// Default: production validator IP. Override with VALIDATOR_DIRECT_ADDRS env var.
     pub direct_addrs: Option<String>,
@@ -211,6 +216,7 @@ impl Default for ValidatorConfig {
     fn default() -> Self {
         Self {
             node_id: None,
+            addr: None,
             direct_addrs: Some("51.210.230.161:11220".to_string()),
             warden_node_id: None,
             heartbeat_interval_secs: default_heartbeat_interval(),
@@ -260,6 +266,7 @@ impl MinerConfig {
 
         // Validator overrides
         env_string_opt("VALIDATOR_NODE_ID", &mut config.validator.node_id);
+        env_string_opt("VALIDATOR_ADDR", &mut config.validator.addr);
         env_string_opt("VALIDATOR_DIRECT_ADDRS", &mut config.validator.direct_addrs);
         env_string_opt("WARDEN_NODE_ID", &mut config.validator.warden_node_id);
 

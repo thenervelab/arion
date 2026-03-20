@@ -20,7 +20,6 @@ use crate::helpers::truncate_for_log;
 use crate::state;
 use anyhow::Result;
 use dashmap::DashMap;
-use iroh::endpoint::{Connection, Endpoint};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -28,7 +27,7 @@ use tracing::{debug, info, warn};
 /// Tracks the state of a gateway connection.
 struct GatewayConn {
     /// The live QUIC connection (kept alive across cycles).
-    conn: Connection,
+    conn: quinn::Connection,
 }
 
 /// Spawn the gateway keepalive background loop.
@@ -36,7 +35,7 @@ struct GatewayConn {
 /// The task runs until `shutdown` is cancelled. On each tick it iterates over
 /// known gateway endpoints (populated by `ClusterMapUpdate` handler) and
 /// ensures a live connection exists to each one.
-pub fn spawn_gateway_keepalive(endpoint: Endpoint, shutdown: CancellationToken) {
+pub fn spawn_gateway_keepalive(endpoint: quinn::Endpoint, shutdown: CancellationToken) {
     let interval_secs: u64 = std::env::var("MINER_GATEWAY_KEEPALIVE_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -114,52 +113,32 @@ pub fn spawn_gateway_keepalive(endpoint: Endpoint, shutdown: CancellationToken) 
                     );
                 }
 
-                // Parse gateway node_id to iroh PublicKey
-                let gw_node_id = match gw.node_id.parse::<iroh::PublicKey>() {
-                    Ok(pk) => pk,
-                    Err(e) => {
+                // Parse gateway direct_addr to SocketAddr
+                let gw_addr = match gw.direct_addr.as_ref() {
+                    Some(addr_str) => match addr_str.parse::<std::net::SocketAddr>() {
+                        Ok(addr) => addr,
+                        Err(e) => {
+                            warn!(
+                                miner_uid,
+                                gateway_node_id = %gw_short,
+                                direct_addr = %addr_str,
+                                error = %e,
+                                "Failed to parse gateway direct_addr as SocketAddr"
+                            );
+                            continue;
+                        }
+                    },
+                    None => {
                         warn!(
                             miner_uid,
                             gateway_node_id = %gw_short,
-                            error = %e,
-                            "Failed to parse gateway node_id, skipping"
+                            "Gateway has no direct_addr, skipping"
                         );
                         continue;
                     }
                 };
 
-                // Inject the gateway's direct address into iroh's discovery
-                // so that endpoint.connect() knows where to send QUIC packets.
-                if let Some(ref direct_addr_str) = gw.direct_addr {
-                    if let Ok(addr) = direct_addr_str.parse::<std::net::SocketAddr>() {
-                        if let Some(discovery) = crate::state::get_static_discovery() {
-                            let endpoint_addr = iroh::EndpointAddr::new(gw_node_id)
-                                .with_addrs(vec![iroh::TransportAddr::Ip(addr)]);
-                            discovery.set_endpoint_info(endpoint_addr);
-                            debug!(
-                                miner_uid,
-                                gateway_node_id = %gw_short,
-                                direct_addr = %direct_addr_str,
-                                "Seeded gateway address into discovery"
-                            );
-                        }
-                    } else {
-                        warn!(
-                            miner_uid,
-                            gateway_node_id = %gw_short,
-                            direct_addr = %direct_addr_str,
-                            "Failed to parse gateway direct_addr as SocketAddr"
-                        );
-                    }
-                } else {
-                    warn!(
-                        miner_uid,
-                        gateway_node_id = %gw_short,
-                        "Gateway has no direct_addr, connection may fail"
-                    );
-                }
-
-                match connect_and_handshake(&endpoint, gw_node_id, miner_uid, connect_timeout_secs)
+                match connect_and_handshake(&endpoint, &gw.node_id, gw_addr, miner_uid, connect_timeout_secs)
                     .await
                 {
                     Ok(conn) => {
@@ -195,17 +174,18 @@ pub fn spawn_gateway_keepalive(endpoint: Endpoint, shutdown: CancellationToken) 
 /// exactly 4 bytes, then writes back `b"OK"` or `b"ERR:..."` and finishes
 /// its send side. The miner reads the ACK from `recv`.
 async fn connect_and_handshake(
-    endpoint: &Endpoint,
-    gw_node_id: iroh::PublicKey,
+    endpoint: &quinn::Endpoint,
+    gw_node_id: &str,
+    gw_addr: std::net::SocketAddr,
     miner_uid: u32,
     connect_timeout_secs: u64,
-) -> Result<Connection> {
+) -> Result<quinn::Connection> {
     let timeout = std::time::Duration::from_secs(connect_timeout_secs);
 
-    // Connect using the gateway-inbound ALPN
+    // Connect using quinn transport
     let conn = tokio::time::timeout(
         timeout,
-        endpoint.connect(gw_node_id, common::GATEWAY_INBOUND_ALPN),
+        common::transport::connect(endpoint, gw_addr, gw_node_id),
     )
     .await
     .map_err(|_| {
@@ -224,31 +204,20 @@ async fn connect_and_handshake(
     // Send miner UID as 4-byte little-endian, then finish the send side.
     // finish() signals FIN to the gateway so its read_exact(4) completes cleanly.
     send.write_all(&miner_uid.to_le_bytes()).await?;
-    let _ = send.finish();
+    send.finish()?;
 
     // Read gateway ACK (up to 32 bytes).
     // The gateway writes b"OK" or b"ERR:..." then finishes its send side,
-    // so recv.read() will eventually return None after the data.
-    let mut ack_buf = vec![0u8; 32];
-    let n = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        let mut total = 0usize;
-        loop {
-            match recv.read(&mut ack_buf[total..]).await? {
-                Some(n) if n > 0 => {
-                    total += n;
-                    if total >= ack_buf.len() {
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-        Ok::<usize, anyhow::Error>(total)
-    })
+    // so recv.read_to_end() will return once the gateway finishes.
+    let ack_buf = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recv.read_to_end(32),
+    )
     .await
     .map_err(|_| anyhow::anyhow!("Timeout reading gateway ACK after 5s"))??;
+    let n = ack_buf.len();
 
-    let ack = &ack_buf[..n];
+    let ack = &ack_buf[..];
     if ack.starts_with(b"OK") {
         debug!(miner_uid, ack_bytes = n, "Gateway ACK received");
         Ok(conn)
@@ -265,7 +234,6 @@ async fn connect_and_handshake(
 }
 
 /// Check if a QUIC connection is closed (non-blocking).
-fn is_conn_closed(conn: &Connection) -> bool {
-    use futures::future::FutureExt;
-    conn.closed().now_or_never().is_some()
+fn is_conn_closed(conn: &quinn::Connection) -> bool {
+    conn.close_reason().is_some()
 }

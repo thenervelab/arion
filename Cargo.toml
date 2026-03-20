@@ -11,22 +11,9 @@ resolver = "2"
 # Web Framework
 # ============================================
 axum = { version = "0.8.8", features = ["multipart", "macros"] }
-axum-server = { version = "0.8.0", features = ["tls-openssl"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 tower = "0.5"
 tower-http = { version = "0.6.8", features = ["cors", "limit", "timeout"] }
-
-
-sled = "0.34"
-
-# ============================================
-# Metrics & Observability
-# ============================================
-
-opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "logs"] }
-opentelemetry-appender-tracing = "0.31"
-
 
 # ============================================
 # Async Runtime & Utilities
@@ -156,10 +143,15 @@ bao-tree = "0.16.0"
 crc32fast = "1.5.0"
 
 # ============================================
-# Metrics
+# Metrics & Observability
 # ============================================
 prometheus-client = "0.22"
 sysinfo = "0.30"
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "logs"] }
+opentelemetry-appender-tracing = "0.31"
+
 
 
 # ============================================
@@ -198,6 +190,7 @@ http-body-util = "0.1"
 opt-level = 3
 lto = true
 codegen-units = 1
-strip = true
+debug = 1
+strip = false
 
-
+# Vendor patches removed — iroh 0.97.0 uses noq instead of iroh-quinn

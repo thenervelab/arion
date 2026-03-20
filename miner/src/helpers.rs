@@ -16,14 +16,8 @@
 
 use crate::constants::KEYPAIR_FILE_PERMISSIONS;
 use anyhow::Result;
-use iroh::SecretKey;
+use ed25519_dalek::SigningKey;
 use tracing::{debug, warn};
-
-/// Returns true if the connection has a direct IP path (not relay-only).
-///
-/// Re-exported from common — checks `Connection::paths()` for actual live
-/// transport paths, not just address book metadata.
-pub use common::has_direct_ip_path;
 
 /// Safely truncate a string for logging (handles non-ASCII gracefully)
 pub fn truncate_for_log(s: &str, max_chars: usize) -> &str {
@@ -34,7 +28,7 @@ pub fn truncate_for_log(s: &str, max_chars: usize) -> &str {
 }
 
 /// Load or generate keypair from disk
-pub async fn load_keypair(data_dir: &std::path::Path) -> Result<SecretKey> {
+pub async fn load_keypair(data_dir: &std::path::Path) -> Result<SigningKey> {
     let keypair_path = data_dir.join("keypair.bin");
 
     if keypair_path.exists() {
@@ -45,17 +39,20 @@ pub async fn load_keypair(data_dir: &std::path::Path) -> Result<SecretKey> {
             keypair_path.display(),
             bytes.len()
         );
-        let key = SecretKey::try_from(&bytes[..]).map_err(|_| {
+        let key_bytes: [u8; 32] = bytes[..].try_into().map_err(|_| {
             anyhow::anyhow!(
                 "Invalid keypair file at {}. Delete the file to regenerate.",
                 keypair_path.display()
             )
         })?;
+        let key = SigningKey::from_bytes(&key_bytes);
         debug!(path = %keypair_path.display(), "Loaded existing keypair");
         return Ok(key);
     }
 
-    let key = SecretKey::generate(&mut rand::rng());
+    let mut rng_bytes = [0u8; 32];
+    rand::Fill::fill(&mut rng_bytes, &mut rand::rng());
+    let key = SigningKey::from_bytes(&rng_bytes);
     tokio::fs::write(&keypair_path, key.to_bytes()).await?;
 
     // Set restrictive permissions (0600) to prevent other users from reading the keypair
@@ -70,6 +67,24 @@ pub async fn load_keypair(data_dir: &std::path::Path) -> Result<SecretKey> {
 
     debug!(path = %keypair_path.display(), "Generated new keypair");
     Ok(key)
+}
+
+/// Verify an Ed25519 signature from a node identified by hex node ID.
+///
+/// Returns `true` if the signature is valid, `false` otherwise.
+pub fn verify_signature(node_id_hex: &str, message: &[u8], signature: &[u8; 64]) -> bool {
+    let Ok(key_bytes) = hex::decode(node_id_hex) else {
+        return false;
+    };
+    let Ok(key_array): Result<[u8; 32], _> = key_bytes.try_into() else {
+        return false;
+    };
+    let Ok(verifying_key) = ed25519_dalek::VerifyingKey::from_bytes(&key_array) else {
+        return false;
+    };
+    let sig = ed25519_dalek::Signature::from_bytes(signature);
+    use ed25519_dalek::Verifier;
+    verifying_key.verify(message, &sig).is_ok()
 }
 
 #[cfg(test)]
@@ -119,7 +134,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let key1 = load_keypair(dir.path()).await.unwrap();
         let key2 = load_keypair(dir.path()).await.unwrap();
-        assert_eq!(key1.public(), key2.public());
+        assert_eq!(
+            key1.verifying_key().as_bytes(),
+            key2.verifying_key().as_bytes()
+        );
     }
 
     #[tokio::test]
@@ -128,5 +146,15 @@ mod tests {
         let path = dir.path().join("keypair.bin");
         std::fs::write(&path, b"too_short").unwrap();
         assert!(load_keypair(dir.path()).await.is_err());
+    }
+
+    #[test]
+    fn verify_signature_roundtrip() {
+        use ed25519_dalek::Signer;
+        let key = SigningKey::from_bytes(&[42u8; 32]);
+        let node_id = common::transport::node_id_from_public_key(&key.verifying_key());
+        let message = b"test message";
+        let sig = key.sign(message);
+        assert!(verify_signature(&node_id, message, &sig.to_bytes()));
     }
 }
