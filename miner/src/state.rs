@@ -142,8 +142,7 @@ pub fn get_blobs_dir() -> &'static Arc<RwLock<Option<std::path::PathBuf>>> {
     BLOBS_DIR.get_or_init(|| Arc::new(RwLock::new(None)))
 }
 
-pub fn get_connection_pool()
--> &'static Arc<RwLock<HashMap<String, (quinn::Connection, u64)>>> {
+pub fn get_connection_pool() -> &'static Arc<RwLock<HashMap<String, (quinn::Connection, u64)>>> {
     CONNECTION_POOL.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
 }
 

@@ -218,7 +218,9 @@ impl Default for ValidatorConfig {
             node_id: None,
             addr: None,
             direct_addrs: Some("51.210.230.161:11220".to_string()),
-            warden_node_id: None,
+            warden_node_id: Some(
+                "57ebdaf421864fc44304705ba952b38df5434947df2c2f383343bcae85566137".to_string(),
+            ),
             heartbeat_interval_secs: default_heartbeat_interval(),
             registration_retry_secs: default_registration_retry(),
         }

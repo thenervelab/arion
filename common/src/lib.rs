@@ -665,6 +665,16 @@ pub enum MinerControlMessage {
     /// Used by the validator before PullFromPeer/FetchBlob to avoid
     /// wasting P2P round-trips on miners that lost a shard.
     CheckBlob { hash: String },
+    /// Request a full inventory of all blob hashes stored by this miner.
+    ///
+    /// Wire protocol for the response:
+    ///   1. A JSON header line: `{"count":<N>}\n`
+    ///   2. N lines, each containing one lowercase hex BLAKE3 hash followed by `\n`
+    ///   3. Stream closed (EOF)
+    ///
+    /// The receiver must stream and not buffer everything in memory (miners
+    /// may hold millions of blobs).
+    ListAllBlobs,
 }
 
 /// Magic byte for StoreV2 binary framing protocol.
@@ -727,6 +737,9 @@ pub enum ValidatorControlMessage {
         timestamp: u64,
         /// Current available storage in bytes
         available_storage: u64,
+        /// Total storage capacity in bytes
+        #[serde(default)]
+        total_storage: u64,
         /// Ed25519 public key for signature verification
         public_key: String,
         /// Ed25519 signature of "HEARTBEAT:{public_key}:{timestamp}"
@@ -1017,7 +1030,7 @@ pub fn calculate_placement_for_stripe(
 /// already selected and (b) on a different IP. Best-effort: if no
 /// replacement exists, the original miner stays (degraded diversity is
 /// better than failing the placement).
-fn deduplicate_ips(selected: &mut Vec<MinerNode>, map: &ClusterMap, seed: u64) {
+fn deduplicate_ips(selected: &mut [MinerNode], map: &ClusterMap, seed: u64) {
     // Build set of IPs already used by selected miners (first occurrence wins).
     let mut used_ips: HashMap<String, usize> = HashMap::new(); // ip -> first index
     let mut dup_indices: Vec<usize> = Vec::new();
@@ -2459,6 +2472,81 @@ pub fn calculate_stripe_placement(
     }
 }
 
+/// Calculate stripe placement with fallback candidates per shard.
+///
+/// Returns `Vec<Vec<MinerNode>>` — outer vec is per shard, inner vec is ordered
+/// candidates (primary first, then fallbacks). The primary for each shard is
+/// identical to what `calculate_stripe_placement` returns, preserving CRUSH
+/// determinism.
+///
+/// Fallback miners are drawn from the remaining cluster members (not selected
+/// as primaries), sorted by UID for determinism, and assigned per-shard via
+/// a deterministic hash so different shards get different fallbacks.
+///
+/// # Arguments
+/// * `file_hash` - BLAKE3 hash of the file
+/// * `stripe_idx` - Zero-based stripe index
+/// * `shards_per_stripe` - Number of shards per stripe (k + m)
+/// * `cluster_map` - Cluster map snapshot
+/// * `placement_version` - Algorithm version (1=legacy, 2=PG-based, 3=PG+straw2)
+/// * `fallback_count` - Total candidates per shard (1 = primary only, 2 = primary + 1 fallback)
+pub fn calculate_stripe_placement_with_fallbacks(
+    file_hash: &str,
+    stripe_idx: u64,
+    shards_per_stripe: usize,
+    cluster_map: &ClusterMap,
+    placement_version: u8,
+    fallback_count: usize,
+) -> Result<Vec<Vec<MinerNode>>, String> {
+    let primaries = calculate_stripe_placement(
+        file_hash,
+        stripe_idx,
+        shards_per_stripe,
+        cluster_map,
+        placement_version,
+    )?;
+
+    if fallback_count <= 1 {
+        return Ok(primaries.into_iter().map(|m| vec![m]).collect());
+    }
+
+    // Collect primary UIDs for exclusion
+    let primary_uids: std::collections::HashSet<u32> = primaries.iter().map(|m| m.uid).collect();
+
+    // Build pool of non-primary miners sorted by UID for determinism
+    let mut pool: Vec<&MinerNode> = cluster_map
+        .miners
+        .iter()
+        .filter(|m| !primary_uids.contains(&m.uid) && m.weight > 0)
+        .collect();
+    pool.sort_by_key(|m| m.uid);
+
+    let mut result = Vec::with_capacity(shards_per_stripe);
+    for (shard_idx, primary) in primaries.into_iter().enumerate() {
+        let mut candidates = Vec::with_capacity(fallback_count);
+        candidates.push(primary);
+
+        if !pool.is_empty() {
+            // Deterministic offset per shard so different shards get different fallbacks
+            let mut hasher = xxh3::Xxh3::new();
+            hasher.write(file_hash.as_bytes());
+            hasher.write_u64(stripe_idx);
+            hasher.write_u64(shard_idx as u64);
+            let seed = hasher.finish();
+
+            let start = (seed as usize) % pool.len();
+            for j in 0..(fallback_count - 1).min(pool.len()) {
+                let idx = (start + j) % pool.len();
+                candidates.push(pool[idx].clone());
+            }
+        }
+
+        result.push(candidates);
+    }
+
+    Ok(result)
+}
+
 /// Reliability-aware variant of `calculate_stripe_placement`.
 ///
 /// Multiplies each miner's CRUSH weight by its P2P reliability score,
@@ -2835,6 +2923,14 @@ fn is_reserved_v4(ip: std::net::Ipv4Addr) -> bool {
     (ip.octets()[0] & 0xf0) == 240
 }
 
+/// Returns the first direct IP socket address from an endpoint, if any.
+pub fn socket_addr_from_endpoint(addr: &iroh::EndpointAddr) -> Option<std::net::SocketAddr> {
+    addr.addrs.iter().find_map(|a| match a {
+        iroh::TransportAddr::Ip(sock) => Some(*sock),
+        _ => None,
+    })
+}
+
 /// Returns true if the endpoint has at least one direct IP address
 /// (not relay-only). Iroh handles path selection for all IP ranges.
 pub fn has_direct_addr(addr: &iroh::EndpointAddr) -> bool {
@@ -2975,6 +3071,13 @@ pub fn calculate_uptime_score(
     registration_time: u64,
     current_time: u64,
 ) -> f32 {
+    // Miners registered before the registration_time feature was added have
+    // registration_time == 0. Treat them as having insufficient data so they
+    // are not penalized with a near-zero uptime score.
+    if registration_time == 0 {
+        return 1.0;
+    }
+
     let elapsed = current_time.saturating_sub(registration_time);
     let expected_heartbeats = elapsed / HEARTBEAT_INTERVAL_SECS;
 

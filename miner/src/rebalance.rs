@@ -28,17 +28,30 @@ use crate::constants::{
     REBALANCE_MAX_FILES_PER_CYCLE,
 };
 use crate::flat_store::FlatBlobStore;
-use crate::state::{get_cluster_map, get_validator_addr, get_validator_node_id_global, get_validator_reachable};
+use crate::state::{
+    get_cluster_map, get_validator_addr, get_validator_node_id_global, get_validator_reachable,
+};
 use anyhow::Result;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, trace, warn};
 
 /// Timeout for reading doc replica blob content (seconds).
 const DOC_BLOB_READ_TIMEOUT_SECS: u64 = 5;
+
+/// Maximum number of placement-epoch cluster maps to cache across rebalance cycles.
+const MAX_CACHED_CLUSTER_MAPS: usize = 256;
+
+/// Module-level LRU cache for cluster maps keyed by placement epoch.
+/// Stores `None` for epochs that could not be fetched (negative cache).
+static CLUSTER_MAP_CACHE: LazyLock<
+    TokioRwLock<std::collections::HashMap<u64, Option<Arc<common::ClusterMap>>>>,
+> = LazyLock::new(|| TokioRwLock::new(std::collections::HashMap::new()));
 
 /// Fetch a cluster map for a specific epoch from the validator via the
 /// `hippius/gateway-control` ALPN (which handles `GetClusterMapEpoch`).
@@ -105,6 +118,43 @@ async fn fetch_cluster_map_for_epoch(
     }
 
     result
+}
+
+/// Look up a placement-epoch cluster map, using the module-level cache to avoid
+/// repeated network requests for the same epoch. Failed fetches are negative-cached
+/// so that an unavailable epoch is only requested once.
+async fn get_or_fetch_cluster_map(
+    endpoint: &quinn::Endpoint,
+    validator_node_id: &str,
+    validator_addr: std::net::SocketAddr,
+    epoch: u64,
+) -> Option<Arc<common::ClusterMap>> {
+    // Fast path: check the cache under a read lock.
+    {
+        let cache = CLUSTER_MAP_CACHE.read().await;
+        if let Some(entry) = cache.get(&epoch) {
+            return entry.clone();
+        }
+    }
+
+    // Cache miss — fetch from the validator.
+    let fetched = fetch_cluster_map_for_epoch(endpoint, validator_node_id, validator_addr, epoch)
+        .await
+        .map(|m| Arc::new(m));
+
+    // Store the result (including None for negative caching).
+    let mut cache = CLUSTER_MAP_CACHE.write().await;
+    // Evict oldest entries if over capacity (simple: clear half when full).
+    if cache.len() >= MAX_CACHED_CLUSTER_MAPS {
+        let remove_count = cache.len() / 2;
+        let keys_to_remove: Vec<u64> = cache.keys().copied().take(remove_count).collect();
+        for k in keys_to_remove {
+            cache.remove(&k);
+        }
+    }
+    cache.insert(epoch, fetched.clone());
+
+    fetched
 }
 
 /// PG-based self-rebalancing: Calculate which PGs this miner is responsible for,
@@ -413,10 +463,15 @@ pub async fn self_rebalance_pg(store: Arc<FlatBlobStore>, endpoint: quinn::Endpo
                             // we haven't seen this epoch before.
                             let pe = manifest.placement_epoch;
                             if !placement_epoch_maps.contains_key(&pe) && pe != cluster_map.epoch {
-                                if let Some(pe_map) =
-                                    fetch_cluster_map_for_epoch(&endpoint, &validator_node_id, validator_addr, pe).await
+                                if let Some(pe_map) = get_or_fetch_cluster_map(
+                                    &endpoint,
+                                    &validator_node_id,
+                                    validator_addr,
+                                    pe,
+                                )
+                                .await
                                 {
-                                    placement_epoch_maps.insert(pe, Arc::new(pe_map));
+                                    placement_epoch_maps.insert(pe, pe_map);
                                 }
                             }
                             tally_manifest_shards(
@@ -488,10 +543,15 @@ pub async fn self_rebalance_pg(store: Arc<FlatBlobStore>, endpoint: quinn::Endpo
                             let pe = manifest.placement_epoch;
                             if !placement_epoch_maps.contains_key(&pe) && pe != cluster_map.epoch {
                                 if let Some(val_addr) = validator_addr {
-                                    if let Some(pe_map) =
-                                        fetch_cluster_map_for_epoch(&endpoint, &validator_node_id, val_addr, pe).await
+                                    if let Some(pe_map) = get_or_fetch_cluster_map(
+                                        &endpoint,
+                                        &validator_node_id,
+                                        val_addr,
+                                        pe,
+                                    )
+                                    .await
                                     {
-                                        placement_epoch_maps.insert(pe, Arc::new(pe_map));
+                                        placement_epoch_maps.insert(pe, pe_map);
                                     }
                                 }
                             }
@@ -704,7 +764,9 @@ async fn tally_manifest_shards(
                             ) {
                                 if let Some(m) = hist_miners.get(local_idx) {
                                     if m.uid != my_uid {
-                                        if let Some(addr) = crate::state::socket_addr_from_endpoint(&m.endpoint) {
+                                        if let Some(addr) =
+                                            crate::state::socket_addr_from_endpoint(&m.endpoint)
+                                        {
                                             peers.push((m.endpoint.id.to_string(), addr));
                                         }
                                     }
@@ -719,7 +781,9 @@ async fn tally_manifest_shards(
                         // (they may have the blob from a previous assignment).
                         for (i, m) in stripe_miners.iter().enumerate() {
                             if i != local_idx && m.uid != my_uid {
-                                if let Some(addr) = crate::state::socket_addr_from_endpoint(&m.endpoint) {
+                                if let Some(addr) =
+                                    crate::state::socket_addr_from_endpoint(&m.endpoint)
+                                {
                                     peers.push((m.endpoint.id.to_string(), addr));
                                 }
                             }
@@ -795,11 +859,7 @@ async fn fetch_missing_shards(
             for (peer_node_id, peer_addr) in &shard.peer_endpoints {
                 let conn = match tokio::time::timeout(
                     connect_timeout,
-                    crate::state::get_pooled_connection(
-                        &endpoint,
-                        peer_node_id,
-                        *peer_addr,
-                    ),
+                    crate::state::get_pooled_connection(&endpoint, peer_node_id, *peer_addr),
                 )
                 .await
                 {
@@ -1238,11 +1298,7 @@ pub async fn reconstruct_shard(
             // Connect and fetch via FetchBlob P2P protocol
             let conn = match tokio::time::timeout(
                 connect_timeout,
-                crate::state::get_pooled_connection(
-                    endpoint,
-                    &peer_node_id,
-                    peer_addr,
-                ),
+                crate::state::get_pooled_connection(endpoint, &peer_node_id, peer_addr),
             )
             .await
             {

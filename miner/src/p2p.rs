@@ -33,8 +33,7 @@ use crate::constants::{
     DATA_FRAME_READ_TIMEOUT_SECS, DEFAULT_READ_TIMEOUT_SECS, LOG_STRING_TRUNCATE_LEN,
     MAX_CLUSTER_MAP_JSON_SIZE, MAX_CONCURRENT_HANDLERS, MAX_EPOCH_JUMP, MAX_FETCH_RESPONSE_SIZE,
     MAX_MESSAGE_SIZE, MAX_PEER_CACHE_ENTRIES, MAX_V2_DATA_SIZE, PEER_BLOB_DOWNLOAD_TIMEOUT_SECS,
-    PEER_DATA_RECEPTION_TIMEOUT_SECS, PULL_PERMIT_TIMEOUT_SECS,
-    STORE_PERMIT_TIMEOUT_SECS,
+    PEER_DATA_RECEPTION_TIMEOUT_SECS, PULL_PERMIT_TIMEOUT_SECS, STORE_PERMIT_TIMEOUT_SECS,
 };
 use crate::flat_store::FlatBlobStore;
 use crate::helpers::{truncate_for_log, verify_signature};
@@ -78,18 +77,12 @@ async fn send_response(send: &mut quinn::SendStream, data: &[u8]) -> Result<()> 
 /// this returns `true` for ANY peer. This is intentional for local/dev
 /// testing but means an unconfigured miner accepts Store/Delete from
 /// anyone. Production deployments MUST set `VALIDATOR_NODE_ID`.
-fn is_authorized(
-    remote_node_id: &str,
-    validator_node_id: Option<&str>,
-) -> bool {
+fn is_authorized(remote_node_id: &str, validator_node_id: Option<&str>) -> bool {
     validator_node_id.is_none_or(|v| remote_node_id == v)
 }
 
 /// Check if the remote node is authorized for PoS challenges (validator or warden)
-async fn is_authorized_for_pos(
-    remote_node_id: &str,
-    validator_node_id: Option<&str>,
-) -> bool {
+async fn is_authorized_for_pos(remote_node_id: &str, validator_node_id: Option<&str>) -> bool {
     // Allow if: no validator configured (dev mode), or sender is validator
     if validator_node_id.is_none() {
         return true;
@@ -150,8 +143,8 @@ pub async fn handle_miner_control(
     connection: quinn::Connection,
     handler: MinerControlHandler,
 ) -> Result<()> {
-    let remote_node_id = common::transport::remote_node_id(&connection)
-        .unwrap_or_else(|| "unknown".to_string());
+    let remote_node_id =
+        common::transport::remote_node_id(&connection).unwrap_or_else(|| "unknown".to_string());
     let remote_short = truncate_for_log(&remote_node_id, 8);
     info!("[P2P] Inbound connection from {}", remote_short);
 
@@ -189,9 +182,7 @@ pub async fn handle_miner_control(
             // Hold permit until handler completes
             let _permit = handler_permit;
 
-            if let Err(e) =
-                handle_single_stream(send, recv, &remote_id, &handler, &conn).await
-            {
+            if let Err(e) = handle_single_stream(send, recv, &remote_id, &handler, &conn).await {
                 let err_str = e.to_string();
                 // "sending stopped by peer: error 0" = clean close by remote, not an error
                 // "connection lost" / "connection closed" = expected during reconnects
@@ -400,6 +391,9 @@ async fn handle_single_stream(
         common::MinerControlMessage::CheckBlob { hash } => {
             handle_check_blob(&mut send, &handler.store, hash).await?;
         }
+        common::MinerControlMessage::ListAllBlobs => {
+            handle_list_all_blobs(&mut send, &handler.store).await?;
+        }
         common::MinerControlMessage::StoreV2 { .. } => {
             warn!("Received raw JSON StoreV2 message (not V2-framed), rejecting");
             send_response(&mut send, b"ERROR: StoreV2 requires binary framing").await?;
@@ -502,6 +496,11 @@ async fn handle_store(
         truncate_for_log(remote_node_id, 12),
     );
 
+    // Track in persistent inventory
+    if let Err(e) = crate::inventory::insert_shard(&hash) {
+        warn!(hash = %hash, error = %e, "inventory: failed to insert shard");
+    }
+
     // Send ACK and wait for remote to receive it
     send_response(send, b"OK").await
 }
@@ -556,6 +555,11 @@ async fn handle_delete(
         }
     }
 
+    // Remove from persistent inventory
+    if let Err(e) = crate::inventory::delete_shard(&hash) {
+        warn!(hash = %hash, error = %e, "inventory: failed to delete shard");
+    }
+
     // Invalidate caches to prevent serving stale data
     get_blob_cache().remove(&hash_parsed);
     crate::state::get_pos_commitment_cache().remove(&hash_parsed);
@@ -576,6 +580,52 @@ async fn handle_check_blob(
     } else {
         send_response(send, b"HAS:false").await
     }
+}
+
+/// Stream all stored blob hashes to the requester.
+///
+/// Wire format:
+///   1. JSON header: `{"count":<N>}\n`
+///   2. One hash per line (lowercase hex BLAKE3), terminated with `\n`
+///   3. Stream finished (EOF)
+async fn handle_list_all_blobs(send: &mut quinn::SendStream, store: &FlatBlobStore) -> Result<()> {
+    // Read from persistent SQLite inventory (fast), fall back to FS scan on error.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(10_000);
+
+    match crate::inventory::stream_all_hashes(tx) {
+        Ok(count) => {
+            info!(count, "ListAllBlobs: streaming inventory from DB");
+
+            // Send JSON header
+            let header = format!("{{\"count\":{}}}\n", count);
+            send.write_all(header.as_bytes()).await?;
+
+            // Stream hashes line by line as they arrive from SQLite thread
+            while let Some(hash) = rx.recv().await {
+                send.write_all(hash.as_bytes()).await?;
+                send.write_all(b"\n").await?;
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "inventory: DB failed, falling back to FS scan");
+            let hashes = store.list_hashes();
+            let count = hashes.len();
+
+            info!(count, "ListAllBlobs: streaming inventory from FS");
+
+            // Send JSON header
+            let header = format!("{{\"count\":{}}}\n", count);
+            send.write_all(header.as_bytes()).await?;
+
+            // Stream hashes line by line
+            for hash in hashes {
+                send.write_all(hash.as_bytes()).await?;
+                send.write_all(b"\n").await?;
+            }
+        }
+    }
+
+    finish_stream(send).await
 }
 
 async fn handle_fetch_blob(
@@ -890,9 +940,8 @@ pub async fn pull_blob_from_peer(
     let id_prefix = truncate_for_log(&peer_node_id, 8);
 
     // Extract socket address from EndpointAddr
-    let socket_addr = crate::state::socket_addr_from_endpoint(&peer_addr).ok_or_else(|| {
-        anyhow::anyhow!("Peer {} has no direct IP address", id_prefix)
-    })?;
+    let socket_addr = crate::state::socket_addr_from_endpoint(&peer_addr)
+        .ok_or_else(|| anyhow::anyhow!("Peer {} has no direct IP address", id_prefix))?;
 
     // Quick connectivity check: fail fast if peer is unreachable (3s timeout)
     let conn = match tokio::time::timeout(
@@ -981,6 +1030,12 @@ pub async fn pull_blob_from_peer(
         .store(&hash, data)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to store blob: {}", e))?;
+
+    // Track in persistent inventory
+    if let Err(e) = crate::inventory::insert_shard(&hash) {
+        warn!(hash = %crate::helpers::truncate_for_log(&hash, 12), error = %e, "inventory: failed to insert shard");
+    }
+
     let pull_size_human = if pull_size >= 1_048_576 {
         format!("{:.1} MiB", pull_size as f64 / 1_048_576.0)
     } else {

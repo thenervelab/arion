@@ -9,6 +9,7 @@ mod doc_replica;
 mod flat_store;
 mod gateway_keepalive;
 mod helpers;
+mod inventory;
 mod p2p;
 mod rebalance;
 mod state;
@@ -23,8 +24,7 @@ use helpers::{load_keypair, truncate_for_log};
 use p2p::MinerControlHandler;
 use rand::Rng as _;
 use state::{
-    get_blobs_dir, get_needs_reregistration,
-    get_validator_reachable, get_warden_node_ids,
+    get_blobs_dir, get_needs_reregistration, get_validator_reachable, get_warden_node_ids,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -408,10 +408,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
         info!(bind_ip = %bind_ipv4, "P2P binding to specific IPv4 address");
     }
 
-    let bind_addr = SocketAddr::new(
-        std::net::IpAddr::V4(bind_ipv4),
-        config.network.p2p_port,
-    );
+    let bind_addr = SocketAddr::new(std::net::IpAddr::V4(bind_ipv4), config.network.p2p_port);
     let endpoint = common::transport::create_endpoint(bind_addr, &signing_key).await?;
 
     info!(node_id = %truncate_for_log(&node_id, 16), bind = %bind_addr, "Quinn endpoint bound");
@@ -462,6 +459,16 @@ async fn run_miner(cli: Cli) -> Result<()> {
     {
         let mut bd = get_blobs_dir().write().await;
         *bd = Some(blobs_dir.clone());
+    }
+
+    // Initialize persistent SQLite inventory and rebuild from FS on first run
+    inventory::init_inventory(&data_dir)?;
+    let rebuilt = inventory::rebuild_from_fs(&blobs_dir)?;
+    if rebuilt > 0 {
+        info!(
+            count = rebuilt,
+            "inventory: rebuilt from filesystem on startup"
+        );
     }
 
     // 3. Resolve validator address
@@ -895,8 +902,7 @@ fn spawn_heartbeat_loop(
 
             // Periodically refresh validator address from environment
             heartbeat_count = heartbeat_count.wrapping_add(1);
-            if heartbeat_count.is_multiple_of(constants::VALIDATOR_ADDR_REFRESH_INTERVAL_CYCLES)
-            {
+            if heartbeat_count.is_multiple_of(constants::VALIDATOR_ADDR_REFRESH_INTERVAL_CYCLES) {
                 if let Ok(new_validator_id) = std::env::var("VALIDATOR_NODE_ID") {
                     if new_validator_id != current_validator_node_id {
                         debug!(
@@ -954,10 +960,13 @@ fn spawn_heartbeat_loop(
                 let sign_data = format!("HEARTBEAT:{}:{}", public_key_str, timestamp);
                 let signature = ctx.sign(sign_data.as_bytes());
 
+                let total_storage = fs2::total_space(&ctx.data_dir).unwrap_or(0);
+
                 common::ValidatorControlMessage::Heartbeat {
                     miner_uid,
                     timestamp,
                     available_storage: reported_available,
+                    total_storage,
                     public_key: public_key_str,
                     signature: signature.to_bytes().to_vec(),
                     endpoint_addr: Some(cached_endpoint_addr.clone()),

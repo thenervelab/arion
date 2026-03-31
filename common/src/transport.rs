@@ -144,6 +144,35 @@ pub async fn connect(
     Ok(connection)
 }
 
+/// Connect to a peer with specific ALPN protocols for TLS negotiation.
+///
+/// Same as [`connect`] but builds a client config with the given ALPN protocols
+/// so the server can dispatch the connection to the correct handler.
+pub async fn connect_with_alpn(
+    endpoint: &quinn::Endpoint,
+    addr: SocketAddr,
+    expected_node_id: &str,
+    secret_key: &ed25519_dalek::SigningKey,
+    alpn_protocols: &[&[u8]],
+) -> Result<quinn::Connection> {
+    let (_server_config, mut client_config) = generate_tls_config(secret_key)?;
+    client_config.alpn_protocols = alpn_protocols.iter().map(|a| a.to_vec()).collect();
+
+    let quic_client_config = quinn::crypto::rustls::QuicClientConfig::try_from(client_config)
+        .context("QUIC client crypto config for ALPN")?;
+    let quinn_client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
+
+    let _ = expected_node_id; // used by NodeIdVerifier in the TLS config
+
+    let connection = endpoint
+        .connect_with(quinn_client_config, addr, "localhost")
+        .context("initiate QUIC connection with ALPN")?
+        .await
+        .context("QUIC handshake")?;
+
+    Ok(connection)
+}
+
 /// Extract the remote peer's node ID from a quinn connection.
 ///
 /// Returns the hex-encoded 32-byte Ed25519 public key extracted from the

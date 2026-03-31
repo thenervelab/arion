@@ -138,8 +138,14 @@ pub fn spawn_gateway_keepalive(endpoint: quinn::Endpoint, shutdown: Cancellation
                     }
                 };
 
-                match connect_and_handshake(&endpoint, &gw.node_id, gw_addr, miner_uid, connect_timeout_secs)
-                    .await
+                match connect_and_handshake(
+                    &endpoint,
+                    &gw.node_id,
+                    gw_addr,
+                    miner_uid,
+                    connect_timeout_secs,
+                )
+                .await
                 {
                     Ok(conn) => {
                         info!(
@@ -209,12 +215,9 @@ async fn connect_and_handshake(
     // Read gateway ACK (up to 32 bytes).
     // The gateway writes b"OK" or b"ERR:..." then finishes its send side,
     // so recv.read_to_end() will return once the gateway finishes.
-    let ack_buf = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        recv.read_to_end(32),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Timeout reading gateway ACK after 5s"))??;
+    let ack_buf = tokio::time::timeout(std::time::Duration::from_secs(5), recv.read_to_end(32))
+        .await
+        .map_err(|_| anyhow::anyhow!("Timeout reading gateway ACK after 5s"))??;
     let n = ack_buf.len();
 
     let ack = &ack_buf[..];

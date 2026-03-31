@@ -25,9 +25,8 @@ pub async fn auto_update_loop(data_dir: PathBuf) {
     // Run an initial check immediately at startup.
     run_update_cycle(&data_dir).await;
 
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-        UPDATE_CHECK_INTERVAL_SECS,
-    ));
+    let mut interval =
+        tokio::time::interval(std::time::Duration::from_secs(UPDATE_CHECK_INTERVAL_SECS));
     // The first tick fires immediately, but we already ran above — skip it.
     interval.tick().await;
 
@@ -138,10 +137,10 @@ async fn check_and_update(
 }
 
 /// Find the browser_download_url for the miner asset in the release JSON.
-fn find_asset_url(release: &serde_json::Value) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let assets = release["assets"]
-        .as_array()
-        .ok_or("missing assets array")?;
+fn find_asset_url(
+    release: &serde_json::Value,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let assets = release["assets"].as_array().ok_or("missing assets array")?;
 
     for asset in assets {
         if asset["name"].as_str() == Some(ASSET_NAME) {
@@ -177,10 +176,7 @@ async fn download_binary(
     let bytes = resp.bytes().await?;
     tokio::fs::write(dest, &bytes).await?;
 
-    info!(
-        size_bytes = bytes.len(),
-        "Download complete"
-    );
+    info!(size_bytes = bytes.len(), "Download complete");
     Ok(())
 }
 

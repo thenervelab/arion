@@ -7,4 +7,4 @@ path = "data/miner/blobs"
 data_dir = "data/miner"
 
 [validator]
-node_id = "FROM_THE_DOCS"  
+node_id = "6220472b516ec159b4cbfc37e1884d91020ba62da021806e4a63a538b837319e"  # From your validator logs
