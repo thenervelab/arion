@@ -198,9 +198,11 @@ pub struct ValidatorConfig {
 
     /// Validator direct addresses (comma-separated list of IP:PORT).
     /// Default: production validator IP. Override with VALIDATOR_DIRECT_ADDRS env var.
+    #[serde(default = "default_validator_direct_addrs")]
     pub direct_addrs: Option<String>,
 
     /// Warden Node ID (Ed25519 public key) for PoS challenges
+    #[serde(default = "default_warden_node_id")]
     pub warden_node_id: Option<String>,
 
     /// Heartbeat interval in seconds
@@ -232,6 +234,14 @@ fn default_heartbeat_interval() -> u64 {
 }
 fn default_registration_retry() -> u64 {
     60
+}
+
+fn default_validator_direct_addrs() -> Option<String> {
+    Some("51.210.230.161:11220".to_string())
+}
+
+fn default_warden_node_id() -> Option<String> {
+    Some("57ebdaf421864fc44304705ba952b38df5434947df2c2f383343bcae85566137".to_string())
 }
 
 impl MinerConfig {

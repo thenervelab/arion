@@ -2511,7 +2511,8 @@ pub fn calculate_stripe_placement_with_fallbacks(
     }
 
     // Collect primary UIDs for exclusion
-    let primary_uids: std::collections::HashSet<u32> = primaries.iter().map(|m| m.uid).collect();
+    let primary_uids: std::collections::HashSet<u32> =
+        primaries.iter().map(|m| m.uid).collect();
 
     // Build pool of non-primary miners sorted by UID for determinism
     let mut pool: Vec<&MinerNode> = cluster_map

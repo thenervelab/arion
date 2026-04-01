@@ -448,7 +448,13 @@ async fn run_miner(cli: Cli) -> Result<()> {
     info!("Ready for P2P connections");
 
     // 2. Initialize flat-file blob store for persistent shard storage
-    let blobs_dir = data_dir.join("blobs");
+    let blobs_dir = if let Some(path) = cli.storage_path.clone() {
+        std::path::PathBuf::from(path)
+    } else if config.storage.path != "data/miner/blobs" {
+        std::path::PathBuf::from(&config.storage.path)
+    } else {
+        data_dir.join("blobs")
+    };
     let store = Arc::new(
         FlatBlobStore::new(&blobs_dir)
             .map_err(|e| anyhow::anyhow!("Failed to initialize blob store: {}", e))?,
@@ -465,10 +471,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
     inventory::init_inventory(&data_dir)?;
     let rebuilt = inventory::rebuild_from_fs(&blobs_dir)?;
     if rebuilt > 0 {
-        info!(
-            count = rebuilt,
-            "inventory: rebuilt from filesystem on startup"
-        );
+        info!(count = rebuilt, "inventory: rebuilt from filesystem on startup");
     }
 
     // 3. Resolve validator address
