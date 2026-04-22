@@ -1198,3 +1198,94 @@ async fn handle_pos_challenge(
 
     Ok(())
 }
+
+// --- P2P State Sync ---
+
+use common::P2PStateSyncRequest;
+
+pub async fn handle_state_sync_request(conn: quinn::Connection) -> anyhow::Result<()> {
+    let (mut send, mut recv) = conn.accept_bi().await?;
+
+    let len_bytes = {
+        let mut buf = [0u8; 4];
+        recv.read_exact(&mut buf).await?;
+        u32::from_be_bytes(buf)
+    };
+
+    if len_bytes > 1024 {
+        anyhow::bail!("Request too large: {}", len_bytes);
+    }
+
+    let mut req_bytes = vec![0u8; len_bytes as usize];
+    recv.read_exact(&mut req_bytes).await?;
+
+    let req: P2PStateSyncRequest = serde_json::from_slice(&req_bytes)?;
+    
+    let archive_dir = match crate::state::get_data_dir() {
+        Some(dir) => dir.join("epoch_archive"),
+        None => anyhow::bail!("Data dir not set"),
+    };
+
+    let mut current_epoch = req.start_epoch;
+    
+    loop {
+        let file_path = archive_dir.join(format!("epoch_{}.json", current_epoch));
+        
+        let bytes = match tokio::fs::read(&file_path).await {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => anyhow::bail!("Failed to read epoch {current_epoch}: {e}"),
+        };
+
+        let mut header = Vec::with_capacity(16);
+        header.extend_from_slice(&0x594E4353u32.to_be_bytes()); // "SYNC"
+        header.extend_from_slice(&current_epoch.to_be_bytes());
+        header.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        
+        send.write_all(&header).await?;
+        send.write_all(&bytes).await?;
+        
+        current_epoch += 1;
+    }
+
+    send.write_all(&0x454F4621u32.to_be_bytes()).await?; // "EOF!"
+    send.finish()?;
+    
+    Ok(())
+}
+
+static STATE_SYNC_ENDPOINT: std::sync::OnceLock<quinn::Endpoint> = std::sync::OnceLock::new();
+
+pub fn get_state_sync_client_endpoint() -> anyhow::Result<&'static quinn::Endpoint> {
+    if let Some(ep) = STATE_SYNC_ENDPOINT.get() {
+        return Ok(ep);
+    }
+
+    let data_dir = match crate::state::get_data_dir() {
+        Some(dir) => dir,
+        None => anyhow::bail!("Data dir not set"),
+    };
+
+    let signing_key_path = data_dir.join("keypair.bin");
+    let secret_bytes = std::fs::read(&signing_key_path)?;
+    let mut secret_array = [0u8; 32];
+    secret_array.copy_from_slice(&secret_bytes);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret_array);
+
+    let (_, mut client_config) = common::transport::generate_tls_config(&signing_key)?;
+    client_config.alpn_protocols = vec![common::P2P_STATE_SYNC_ALPN.to_vec()];
+
+    let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())?;
+    let quic_client_config = quinn::crypto::rustls::QuicClientConfig::try_from(client_config)?;
+    let mut client_config = quinn::ClientConfig::new(std::sync::Arc::new(quic_client_config));
+    
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(300).try_into().unwrap()));
+    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+    client_config.transport_config(std::sync::Arc::new(transport_config));
+    
+    endpoint.set_default_client_config(client_config);
+
+    let _ = STATE_SYNC_ENDPOINT.set(endpoint);
+    Ok(STATE_SYNC_ENDPOINT.get().unwrap())
+}

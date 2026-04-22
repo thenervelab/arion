@@ -13,6 +13,7 @@ mod inventory;
 mod p2p;
 mod rebalance;
 mod state;
+mod state_sync;
 mod version_check;
 
 use anyhow::Result;
@@ -245,6 +246,7 @@ struct MinerContext {
     /// STUN-detected public IP, used as fallback when hostname resolves to
     /// a non-routable address (e.g. `--hostname 0.0.0.0`).
     stun_public_ip: Option<std::net::IpAddr>,
+    store: Arc<flat_store::FlatBlobStore>,
 }
 
 impl MinerContext {
@@ -471,7 +473,10 @@ async fn run_miner(cli: Cli) -> Result<()> {
     inventory::init_inventory(&data_dir)?;
     let rebuilt = inventory::rebuild_from_fs(&blobs_dir)?;
     if rebuilt > 0 {
-        info!(count = rebuilt, "inventory: rebuilt from filesystem on startup");
+        info!(
+            count = rebuilt,
+            "inventory: rebuilt from filesystem on startup"
+        );
     }
 
     // 3. Resolve validator address
@@ -569,6 +574,21 @@ async fn run_miner(cli: Cli) -> Result<()> {
                         let _permit = permit; // held until task completes
                         match incoming.await {
                             Ok(conn) => {
+                                let alpn = conn.handshake_data()
+                                    .and_then(|h| h.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+                                    .and_then(|h| h.protocol);
+
+                                if let Some(alpn) = alpn.as_deref() {
+                                    if alpn == common::P2P_STATE_SYNC_ALPN {
+                                        tokio::spawn(async move {
+                                            if let Err(e) = p2p::handle_state_sync_request(conn).await {
+                                                debug!(error = %e, "State sync request failed");
+                                            }
+                                        });
+                                        return;
+                                    }
+                                }
+
                                 if let Err(e) = p2p::handle_miner_control(conn, handler).await {
                                     let err_str = e.to_string();
                                     if !err_str.contains("connection closed")
@@ -605,6 +625,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
         data_dir,
         config: config.clone(),
         stun_public_ip: stun_ipv4.map(|r| r.ip),
+        store: store.clone(),
     };
 
     // 5. Register with Validator via P2P
@@ -615,13 +636,12 @@ async fn run_miner(cli: Cli) -> Result<()> {
     // 5b. Join iroh-doc if DOC_TICKET provided at startup
     // Note: iroh-docs still needs an iroh::Endpoint for gossip. We create a
     // lightweight one just for doc sync. This is temporary until #151 removes iroh-docs.
-    if let Ok(ticket) = std::env::var("DOC_TICKET") {
-        if !ticket.is_empty() {
+    if let Ok(ticket) = std::env::var("DOC_TICKET")
+        && !ticket.is_empty() {
             info!("DOC_TICKET provided — iroh-docs requires iroh::Endpoint (not yet migrated)");
             // doc_replica::join_doc needs an iroh::Endpoint — skip for now.
             // This feature will be removed in #151.
         }
-    }
 
     // 6. Start P2P Heartbeat Loop (reuse registration connection)
     let shutdown_token = CancellationToken::new();
@@ -633,13 +653,17 @@ async fn run_miner(cli: Cli) -> Result<()> {
         Some(reg_conn),
     );
 
-    // 7. Start gateway keepalive loop
+    // 7. Start State Sync loop
+    tokio::spawn(state_sync::run_state_sync_loop());
+
+    // 8. Start gateway keepalive loop
     gateway_keepalive::spawn_gateway_keepalive(endpoint.clone(), shutdown_token.clone());
 
     // 8. Start Self-Rebalance Loop (if enabled)
     if config.tuning.rebalance_enabled {
         let store_rebalance = Arc::clone(&store);
         let endpoint_rebalance = endpoint.clone();
+        let signing_key_rebalance = ctx.signing_key.clone();
         let tick_secs = config.tuning.rebalance_tick_secs;
         let rebalance_token = shutdown_token.clone();
 
@@ -668,6 +692,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
                 if let Err(e) = rebalance::self_rebalance_pg(
                     Arc::clone(&store_rebalance),
                     endpoint_rebalance.clone(),
+                    signing_key_rebalance.clone(),
                 )
                 .await
                 {
@@ -754,8 +779,8 @@ fn check_network_health() {
             "nf_conntrack_udp_timeout_stream",
         ),
     ] {
-        if let Ok(val) = std::fs::read_to_string(path) {
-            if let Ok(timeout) = val.trim().parse::<u64>() {
+        if let Ok(val) = std::fs::read_to_string(path)
+            && let Ok(timeout) = val.trim().parse::<u64>() {
                 if timeout < 120 {
                     warn!(
                         param = label,
@@ -768,7 +793,6 @@ fn check_network_health() {
                     info!(param = label, timeout, "Conntrack UDP timeout OK");
                 }
             }
-        }
     }
 }
 
@@ -905,9 +929,9 @@ fn spawn_heartbeat_loop(
 
             // Periodically refresh validator address from environment
             heartbeat_count = heartbeat_count.wrapping_add(1);
-            if heartbeat_count.is_multiple_of(constants::VALIDATOR_ADDR_REFRESH_INTERVAL_CYCLES) {
-                if let Ok(new_validator_id) = std::env::var("VALIDATOR_NODE_ID") {
-                    if new_validator_id != current_validator_node_id {
+            if heartbeat_count.is_multiple_of(constants::VALIDATOR_ADDR_REFRESH_INTERVAL_CYCLES)
+                && let Ok(new_validator_id) = std::env::var("VALIDATOR_NODE_ID")
+                    && new_validator_id != current_validator_node_id {
                         debug!(
                             old = %truncate_for_log(&current_validator_node_id, 16),
                             new = %truncate_for_log(&new_validator_id, 16),
@@ -920,13 +944,12 @@ fn spawn_heartbeat_loop(
                         }
 
                         // Also check for VALIDATOR_ADDR update
-                        if let Ok(new_addr_str) = std::env::var("VALIDATOR_ADDR") {
-                            if let Ok(new_addr) = new_addr_str.parse::<SocketAddr>() {
+                        if let Ok(new_addr_str) = std::env::var("VALIDATOR_ADDR")
+                            && let Ok(new_addr) = new_addr_str.parse::<SocketAddr>() {
                                 current_validator_addr = new_addr;
                                 let mut val_addr = state::get_validator_addr().write().await;
                                 *val_addr = Some(current_validator_addr);
                             }
-                        }
 
                         if let Some(old) = cached_conn.take() {
                             old.close(0u32.into(), b"stale");
@@ -934,18 +957,20 @@ fn spawn_heartbeat_loop(
                         get_needs_reregistration().store(true, std::sync::atomic::Ordering::SeqCst);
                         continue;
                     }
-                }
-            }
 
             let timestamp = now_secs();
 
             // Calculate available storage
             let max_storage_gb = ctx.config.storage.max_storage_gb;
-            let available = free_space(&ctx.data_dir).unwrap_or(0);
-            let reported_available = if max_storage_gb > 0 {
-                std::cmp::min(available, max_storage_gb * 1024 * 1024 * 1024)
+            let disk_available = free_space(&ctx.data_dir).unwrap_or(0);
+            let disk_total = fs2::total_space(&ctx.data_dir).unwrap_or(0);
+
+            let (total_storage, reported_available) = if max_storage_gb > 0 {
+                let max_bytes = max_storage_gb.saturating_mul(1024 * 1024 * 1024);
+                let quota_remaining = max_bytes.saturating_sub(ctx.store.used_bytes());
+                (max_bytes, std::cmp::min(disk_available, quota_remaining))
             } else {
-                available
+                (disk_total, disk_available)
             };
 
             // Refresh endpoint addr periodically
@@ -963,8 +988,6 @@ fn spawn_heartbeat_loop(
                 let sign_data = format!("HEARTBEAT:{}:{}", public_key_str, timestamp);
                 let signature = ctx.sign(sign_data.as_bytes());
 
-                let total_storage = fs2::total_space(&ctx.data_dir).unwrap_or(0);
-
                 common::ValidatorControlMessage::Heartbeat {
                     miner_uid,
                     timestamp,
@@ -974,6 +997,7 @@ fn spawn_heartbeat_loop(
                     signature: signature.to_bytes().to_vec(),
                     endpoint_addr: Some(cached_endpoint_addr.clone()),
                     version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                    is_historical_seeder: state::get_is_historical_seeder().load(std::sync::atomic::Ordering::Relaxed),
                 }
             };
 
@@ -1035,8 +1059,7 @@ fn spawn_heartbeat_loop(
 
                         // Try to parse JSON response for warden node IDs
                         if let Ok(response) = serde_json::from_str::<serde_json::Value>(&ack_str)
-                        {
-                            if let Some(ids) =
+                            && let Some(ids) =
                                 response.get("warden_node_ids").and_then(|v| v.as_array())
                             {
                                 let mut new_ids: Vec<String> = ids
@@ -1056,7 +1079,6 @@ fn spawn_heartbeat_loop(
                                     }
                                 }
                             }
-                        }
 
                         Ok::<_, anyhow::Error>(true)
                     })
@@ -1174,19 +1196,19 @@ fn spawn_heartbeat_loop(
 /// Perform a single registration attempt with the validator.
 async fn register_with_validator_once(ctx: &MinerContext) -> Result<quinn::Connection> {
     // Calculate storage stats
-    let available = free_space(&ctx.data_dir).unwrap_or(0);
-    let total = fs2::total_space(&ctx.data_dir).unwrap_or(0);
+    let disk_available = free_space(&ctx.data_dir).unwrap_or(0);
+    let disk_total = fs2::total_space(&ctx.data_dir).unwrap_or(0);
 
-    let reported_available = if ctx.config.storage.max_storage_gb > 0 {
-        std::cmp::min(
-            available,
-            ctx.config
-                .storage
-                .max_storage_gb
-                .saturating_mul(1024 * 1024 * 1024),
-        )
+    let (total, reported_available) = if ctx.config.storage.max_storage_gb > 0 {
+        let max_bytes = ctx
+            .config
+            .storage
+            .max_storage_gb
+            .saturating_mul(1024 * 1024 * 1024);
+        let quota_remaining = max_bytes.saturating_sub(ctx.store.used_bytes());
+        (max_bytes, std::cmp::min(disk_available, quota_remaining))
     } else {
-        available
+        (disk_total, disk_available)
     };
 
     let http_addr = ctx.http_addr();

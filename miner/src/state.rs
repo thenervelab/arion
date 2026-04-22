@@ -118,6 +118,9 @@ static DOC_REPLICA_BLOBS: OnceLock<Arc<RwLock<Option<iroh_blobs::store::fs::FsSt
 /// Updated on each ClusterMapUpdate; read by the gateway keepalive background task.
 static GATEWAY_ENDPOINTS: OnceLock<DashMap<String, common::GatewayEndpoint>> = OnceLock::new();
 
+/// Whether the miner has fully synchronized the historical Hash Chain.
+static IS_HISTORICAL_SEEDER: OnceLock<AtomicBool> = OnceLock::new();
+
 pub fn get_peer_cache() -> &'static DashMap<String, iroh::EndpointAddr> {
     PEER_MINER_CACHE.get_or_init(DashMap::new)
 }
@@ -223,6 +226,10 @@ pub fn get_gateway_endpoints() -> &'static DashMap<String, common::GatewayEndpoi
     GATEWAY_ENDPOINTS.get_or_init(DashMap::new)
 }
 
+pub fn get_is_historical_seeder() -> &'static AtomicBool {
+    IS_HISTORICAL_SEEDER.get_or_init(|| AtomicBool::new(false))
+}
+
 /// Get a pooled quinn connection or create a new one.
 /// Uses read lock for initial check, write lock only when needed.
 pub async fn get_pooled_connection(
@@ -236,8 +243,7 @@ pub async fn get_pooled_connection(
     // Guard: if clock skew detected (now_secs returns 0), skip pool and create new connection.
     if now == 0 {
         return common::transport::connect(endpoint, peer_addr, peer_node_id)
-            .await
-            .map_err(Into::into);
+            .await;
     }
 
     // Try pool first (read lock - faster for common case)

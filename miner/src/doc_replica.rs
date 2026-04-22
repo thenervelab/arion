@@ -97,7 +97,7 @@ pub async fn join_doc(endpoint: iroh::Endpoint, data_dir: &Path, ticket_str: &st
                             let hash_str = std::str::from_utf8(key).unwrap_or("?");
                             debug!(doc_id = %doc_id_str, file_hash = %hash_str, total_manifests = manifest_count, "[DOC] Received manifest update via gossip");
                             // Log periodically so we don't flood but confirm sync is working
-                            if manifest_count == 1 || manifest_count % 100 == 0 {
+                            if manifest_count == 1 || manifest_count.is_multiple_of(100) {
                                 info!(doc_id = %doc_id_str, total_manifests = manifest_count, total_maps = map_count, "[DOC] Gossip sync active — manifests received");
                             }
                         }

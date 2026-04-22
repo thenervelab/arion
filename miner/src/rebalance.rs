@@ -58,14 +58,17 @@ static CLUSTER_MAP_CACHE: LazyLock<
 /// Returns `None` if the validator cannot serve the requested epoch.
 async fn fetch_cluster_map_for_epoch(
     endpoint: &quinn::Endpoint,
+    signing_key: &ed25519_dalek::SigningKey,
     validator_node_id: &str,
     validator_addr: std::net::SocketAddr,
     epoch: u64,
 ) -> Option<common::ClusterMap> {
-    let conn = match crate::state::get_pooled_connection(
+    let conn = match common::transport::connect_with_alpn(
         endpoint,
-        validator_node_id,
         validator_addr,
+        validator_node_id,
+        signing_key,
+        &[b"hippius/gateway-control"],
     )
     .await
     {
@@ -74,7 +77,7 @@ async fn fetch_cluster_map_for_epoch(
             debug!(
                 epoch = epoch,
                 error = %e,
-                "Failed to connect to validator for placement epoch map"
+                "Failed to connect to gateway protocol for placement epoch map"
             );
             return None;
         }
@@ -125,6 +128,7 @@ async fn fetch_cluster_map_for_epoch(
 /// so that an unavailable epoch is only requested once.
 async fn get_or_fetch_cluster_map(
     endpoint: &quinn::Endpoint,
+    signing_key: &ed25519_dalek::SigningKey,
     validator_node_id: &str,
     validator_addr: std::net::SocketAddr,
     epoch: u64,
@@ -138,9 +142,15 @@ async fn get_or_fetch_cluster_map(
     }
 
     // Cache miss — fetch from the validator.
-    let fetched = fetch_cluster_map_for_epoch(endpoint, validator_node_id, validator_addr, epoch)
-        .await
-        .map(|m| Arc::new(m));
+    let fetched = fetch_cluster_map_for_epoch(
+        endpoint,
+        signing_key,
+        validator_node_id,
+        validator_addr,
+        epoch,
+    )
+    .await
+    .map(Arc::new);
 
     // Store the result (including None for negative caching).
     let mut cache = CLUSTER_MAP_CACHE.write().await;
@@ -162,7 +172,11 @@ async fn get_or_fetch_cluster_map(
 ///
 /// Uses validator P2P as primary source. Falls back to local iroh-doc replica
 /// when validator is unreachable, enabling fully offline self-healing.
-pub async fn self_rebalance_pg(store: Arc<FlatBlobStore>, endpoint: quinn::Endpoint) -> Result<()> {
+pub async fn self_rebalance_pg(
+    store: Arc<FlatBlobStore>,
+    endpoint: quinn::Endpoint,
+    signing_key: Arc<ed25519_dalek::SigningKey>,
+) -> Result<()> {
     // Stability window: defer rebalance if the cluster map epoch changed recently.
     // This prevents acting on a stale or rapidly-changing topology.
     {
@@ -462,9 +476,10 @@ pub async fn self_rebalance_pg(store: Arc<FlatBlobStore>, endpoint: quinn::Endpo
                             // Lazily fetch the placement-epoch cluster map if
                             // we haven't seen this epoch before.
                             let pe = manifest.placement_epoch;
-                            if !placement_epoch_maps.contains_key(&pe) && pe != cluster_map.epoch {
-                                if let Some(pe_map) = get_or_fetch_cluster_map(
+                            if !placement_epoch_maps.contains_key(&pe) && pe != cluster_map.epoch
+                                && let Some(pe_map) = get_or_fetch_cluster_map(
                                     &endpoint,
+                                    &signing_key,
                                     &validator_node_id,
                                     validator_addr,
                                     pe,
@@ -473,7 +488,6 @@ pub async fn self_rebalance_pg(store: Arc<FlatBlobStore>, endpoint: quinn::Endpo
                                 {
                                     placement_epoch_maps.insert(pe, pe_map);
                                 }
-                            }
                             tally_manifest_shards(
                                 &file_hash,
                                 &manifest,
@@ -541,10 +555,11 @@ pub async fn self_rebalance_pg(store: Arc<FlatBlobStore>, endpoint: quinn::Endpo
                             // (doc fallback path — validator may still be
                             // reachable for epoch map queries).
                             let pe = manifest.placement_epoch;
-                            if !placement_epoch_maps.contains_key(&pe) && pe != cluster_map.epoch {
-                                if let Some(val_addr) = validator_addr {
-                                    if let Some(pe_map) = get_or_fetch_cluster_map(
+                            if !placement_epoch_maps.contains_key(&pe) && pe != cluster_map.epoch
+                                && let Some(val_addr) = validator_addr
+                                    && let Some(pe_map) = get_or_fetch_cluster_map(
                                         &endpoint,
+                                        &signing_key,
                                         &validator_node_id,
                                         val_addr,
                                         pe,
@@ -553,8 +568,6 @@ pub async fn self_rebalance_pg(store: Arc<FlatBlobStore>, endpoint: quinn::Endpo
                                     {
                                         placement_epoch_maps.insert(pe, pe_map);
                                     }
-                                }
-                            }
                             tally_manifest_shards(
                                 file_hash,
                                 &manifest,
@@ -624,6 +637,17 @@ pub async fn self_rebalance_pg(store: Arc<FlatBlobStore>, endpoint: quinn::Endpo
     Ok(())
 }
 
+/// Context needed to reconstruct a missing shard via erasure coding.
+struct ErasureRecoveryCtx {
+    file_hash: String,
+    file_size: u64,
+    stripe_idx: u64,
+    local_idx: usize,
+    stripe_config: common::StripeConfig,
+    stripe_miners: Vec<common::MinerNode>,
+    stripe_shard_hashes: Vec<Option<String>>,
+}
+
 /// Info about a shard that is missing locally and should be fetched from a peer.
 struct MissingShard {
     /// Hash of the missing shard blob.
@@ -632,6 +656,8 @@ struct MissingShard {
     blob_hash_str: String,
     /// Peers that may hold this shard (node_id hex, SocketAddr).
     peer_endpoints: Vec<(String, std::net::SocketAddr)>,
+    /// Context for fallback erasure recovery.
+    erasure_ctx: Option<ErasureRecoveryCtx>,
 }
 
 /// Walk a manifest and tally which shards this miner should hold,
@@ -761,17 +787,14 @@ async fn tally_manifest_shards(
                                 shards_per_stripe,
                                 hist_map,
                                 manifest.placement_version,
-                            ) {
-                                if let Some(m) = hist_miners.get(local_idx) {
-                                    if m.uid != my_uid {
-                                        if let Some(addr) =
+                            )
+                                && let Some(m) = hist_miners.get(local_idx)
+                                    && m.uid != my_uid
+                                        && let Some(addr) =
                                             crate::state::socket_addr_from_endpoint(&m.endpoint)
                                         {
                                             peers.push((m.endpoint.id.to_string(), addr));
                                         }
-                                    }
-                                }
-                            }
                         }
                         // Current placement peers at the SAME stripe position
                         // in other stripes won't help (different shard), but
@@ -780,21 +803,44 @@ async fn tally_manifest_shards(
                         // Also try all other stripe miners as FetchBlob sources
                         // (they may have the blob from a previous assignment).
                         for (i, m) in stripe_miners.iter().enumerate() {
-                            if i != local_idx && m.uid != my_uid {
-                                if let Some(addr) =
+                            if i != local_idx && m.uid != my_uid
+                                && let Some(addr) =
                                     crate::state::socket_addr_from_endpoint(&m.endpoint)
                                 {
                                     peers.push((m.endpoint.id.to_string(), addr));
                                 }
-                            }
                         }
                         // Deduplicate by node_id
                         peers.dedup_by(|a, b| a.0 == b.0);
+
+                        let erasure_ctx = if mine_current {
+                            let start_global_idx = stripe_idx * shards_per_stripe;
+                            let end_global_idx = start_global_idx + shards_per_stripe;
+                            let mut stripe_shard_hashes = vec![None; shards_per_stripe];
+                            for shard in &manifest.shards {
+                                if shard.index >= start_global_idx && shard.index < end_global_idx {
+                                    stripe_shard_hashes[shard.index - start_global_idx] = Some(shard.blob_hash.clone());
+                                }
+                            }
+
+                            Some(ErasureRecoveryCtx {
+                                file_hash: file_hash.to_string(),
+                                file_size: manifest.size,
+                                stripe_idx: stripe_idx as u64,
+                                local_idx,
+                                stripe_config: manifest.stripe_config.clone(),
+                                stripe_miners: stripe_miners.clone(),
+                                stripe_shard_hashes,
+                            })
+                        } else {
+                            None
+                        };
 
                         missing_shard_list.push(MissingShard {
                             shard_hash,
                             blob_hash_str: shard.blob_hash.clone(),
                             peer_endpoints: peers,
+                            erasure_ctx,
                         });
                     }
                 }
@@ -945,6 +991,24 @@ async fn fetch_missing_shards(
                         }
                         consecutive_ok.store(0, Ordering::Relaxed);
                         continue;
+                    }
+                }
+            }
+
+            if !success {
+                if let Some(ctx) = &shard.erasure_ctx {
+                    debug!(
+                        shard = hash_short,
+                        file_hash = %ctx.file_hash,
+                        "Peer fetch failed, attempting local erasure coding recovery"
+                    );
+                    if perform_erasure_recovery(
+                        &shard.blob_hash_str,
+                        ctx,
+                        &store,
+                        &endpoint,
+                    ).await {
+                        success = true;
                     }
                 }
             }
@@ -1405,4 +1469,161 @@ pub async fn reconstruct_shard(
     );
 
     Ok(true)
+}
+
+async fn perform_erasure_recovery(
+    missing_blob_hash: &str,
+    ctx: &ErasureRecoveryCtx,
+    store: &Arc<FlatBlobStore>,
+    endpoint: &quinn::Endpoint,
+) -> bool {
+    let k = ctx.stripe_config.k;
+    let m = ctx.stripe_config.m;
+    let total_shards = k + m;
+
+    if ctx.stripe_shard_hashes.len() != total_shards {
+        error!("Erasure recovery failed: mismatch in stripe_shard_hashes length");
+        return false;
+    }
+
+    // We need exactly 'k' distinct valid shards to reconstruct.
+    // Launch fetches for all OTHER miners in the stripe.
+    // For our own local_idx, we obviously don't fetch.
+    let mut fetch_tasks = tokio::task::JoinSet::new();
+
+    let connect_timeout =
+        std::time::Duration::from_secs(crate::constants::REBALANCE_PEER_CONNECT_TIMEOUT_SECS);
+    let read_timeout = std::time::Duration::from_secs(crate::constants::DEFAULT_READ_TIMEOUT_SECS);
+
+    for (idx, miner) in ctx.stripe_miners.iter().enumerate() {
+        if idx == ctx.local_idx {
+            continue;
+        }
+
+        let peer_node_id = miner.public_key.clone();
+        let peer_addr = match crate::state::socket_addr_from_endpoint(&miner.endpoint) {
+            Some(a) => a,
+            None => continue,
+        };
+        let expected_blob_hash = match &ctx.stripe_shard_hashes[idx] {
+            Some(h) => h.clone(),
+            None => continue,
+        };
+        let endpoint_clone = endpoint.clone();
+
+        fetch_tasks.spawn(async move {
+            let conn = match tokio::time::timeout(
+                connect_timeout,
+                crate::state::get_pooled_connection(&endpoint_clone, &peer_node_id, peer_addr),
+            )
+            .await
+            {
+                Ok(Ok(c)) => c,
+                _ => return (idx, None),
+            };
+
+            let request = common::MinerControlMessage::FetchBlob {
+                hash: expected_blob_hash.clone(),
+            };
+            let request_bytes = match serde_json::to_vec(&request) {
+                Ok(b) => b,
+                Err(_) => return (idx, None),
+            };
+
+            let fetch_result: Result<Option<Vec<u8>>> = async {
+                let (mut send, mut recv) = conn.open_bi().await?;
+                send.write_all(&request_bytes).await?;
+                send.finish()?;
+                let response = tokio::time::timeout(
+                    read_timeout,
+                    recv.read_to_end(crate::constants::MAX_FETCH_RESPONSE_SIZE),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("Read timeout"))??;
+
+                if response.starts_with(b"DATA:") {
+                    Ok(Some(response[5..].to_vec()))
+                } else {
+                    Ok(None)
+                }
+            }
+            .await;
+
+            match fetch_result {
+                Ok(Some(data)) => {
+                    let computed = blake3::hash(&data);
+                    if computed.to_hex().as_str() == expected_blob_hash {
+                        (idx, Some(data))
+                    } else {
+                        (idx, None)
+                    }
+                }
+                _ => (idx, None),
+            }
+        });
+    }
+
+    let mut shards: Vec<Option<Vec<u8>>> = vec![None; total_shards];
+    let mut fetched_count = 0;
+
+    while let Some(res) = fetch_tasks.join_next().await {
+        if let Ok((idx, Some(data))) = res {
+            shards[idx] = Some(data);
+            fetched_count += 1;
+            
+            // Fast-path: if we have enough shards, abort remaining tasks
+            if fetched_count >= k {
+                fetch_tasks.abort_all();
+                break;
+            }
+        }
+    }
+
+    if fetched_count < k {
+        debug!(
+            missing_blob_hash,
+            fetched_count,
+            k,
+            "[REBALANCE] Erasure recovery failed: not enough shards fetched"
+        );
+        return false;
+    }
+
+    // Now reconstruct
+    let stripe_data_len = common::calculate_stripe_data_len(
+        ctx.file_size,
+        ctx.stripe_idx,
+        ctx.stripe_config.size as u64,
+    );
+
+    match common::decode_stripe(&mut shards, &ctx.stripe_config, stripe_data_len) {
+        Ok(_) => {
+            // Reconstructed!
+            if let Some(recovered_bytes) = shards[ctx.local_idx].take() {
+                // Verify hash
+                let computed = blake3::hash(&recovered_bytes);
+                if computed.to_hex().as_str() == missing_blob_hash {
+                    if let Err(e) = store.store(missing_blob_hash, &recovered_bytes).await {
+                        error!(error = %e, "[REBALANCE] Failed to store reconstructed shard");
+                        return false;
+                    }
+                    info!(
+                        missing_blob_hash,
+                        "[REBALANCE] Successfully reconstructed missing shard via Erasure Coding"
+                    );
+                    true
+                } else {
+                    error!("[REBALANCE] Reconstructed shard hash mismatch");
+                    false
+                }
+            } else {
+                error!("[REBALANCE] Reconstructed shard was missing from decode output");
+                false
+            }
+        }
+        Err(e) => {
+            error!(error = %e, "[REBALANCE] Erasure decode failed");
+            false
+        }
+    }
 }

@@ -24,7 +24,7 @@
 //!
 //! # Key Design Principles
 //!
-//! - **Stable placement**: All miners included in CRUSH input (no filtering by online/space)
+//! - **Consistent placement**: Draining miners are filtered from CRUSH input via `filter_map_for_placement`
 //!   to ensure Validator (write) and Gateway (read) calculate identical placements
 //! - **Family diversity**: Shards spread across different family IDs for fault tolerance
 //! - **Deterministic ordering**: Miners sorted by UID before placement to avoid HashMap shuffle
@@ -59,6 +59,17 @@ use xxhash_rust::xxh3;
 // Core Types
 // ============================================================================
 
+/// P2P Repair job instruction dispatched by Validator to Arion-Worker
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WorkerRepairJob {
+    pub blob_hash: String,
+    pub source_uid: u32,
+    pub target_uid: u32,
+    pub source_endpoint: iroh::EndpointAddr,
+    pub target_endpoint: iroh::EndpointAddr,
+    pub validator_signature: Vec<u8>,
+}
+
 /// A storage miner node in the Arion network.
 ///
 /// Miners store erasure-coded shards and serve them to gateways on demand.
@@ -91,6 +102,9 @@ pub struct MinerNode {
     pub strikes: u8,
     /// Unix timestamp of last successful heartbeat
     pub last_seen: u64,
+    /// Whether the miner has the full historical epoch archive and can serve it via P2P State Sync
+    #[serde(default)]
+    pub is_historical_seeder: bool,
 
     // Performance tracking for auto weight adjustment
     /// Total successful heartbeats since registration
@@ -161,6 +175,15 @@ pub struct MinerNode {
     /// Updated by the validator's P2P connectivity probe and FetchBlob outcomes.
     #[serde(default = "default_reliability_score")]
     pub p2p_reliability_score: f64,
+
+    /// Balancer reweight multiplier for smooth capacity shifting without altering physical weight.
+    /// Default is 1.0 (no penalty/bonus).
+    #[serde(default = "default_balancer_reweight")]
+    pub balancer_reweight: f32,
+}
+
+fn default_balancer_reweight() -> f32 {
+    1.0
 }
 
 fn default_reliability_score() -> f64 {
@@ -252,6 +275,12 @@ pub struct GatewayEndpoint {
 pub struct ClusterMap {
     /// Monotonically increasing version number (increments on topology changes)
     pub epoch: u64,
+    /// The Blake3 hash of the PREVIOUS epoch's ClusterMap
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_hash: Option<String>,
+    /// The Ed25519 signature of THIS ClusterMap (only set by Validator on the latest map)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
     /// All registered miners (online and offline - filtering happens at write time)
     pub miners: Vec<MinerNode>,
     /// Number of Placement Groups for CRUSH distribution.
@@ -266,6 +295,10 @@ pub struct ClusterMap {
     /// Default 20 provides 66% fault tolerance with k=10.
     #[serde(default = "default_ec_m")]
     pub ec_m: usize,
+    /// Exception lists overriding CRUSH math to safely move PGs off full disks.
+    /// Maps PG ID -> Vec of miner UIDs.
+    #[serde(default)]
+    pub pg_upmap: std::collections::HashMap<u32, Vec<u32>>,
 }
 
 fn default_pg_count() -> u32 {
@@ -292,10 +325,13 @@ impl ClusterMap {
     pub fn new() -> Self {
         let empty = Self {
             epoch: 0,
+            previous_hash: None,
+            signature: None,
             miners: Vec::new(),
             pg_count: default_pg_count(),
             ec_k: default_ec_k(),
             ec_m: default_ec_m(),
+            pg_upmap: std::collections::HashMap::new(),
         };
 
         let backup_data_path = PathBuf::from("data/validator/cluster_map_backup.json");
@@ -357,6 +393,17 @@ impl ClusterMap {
     /// Removes a miner by UID from the cluster (does not increment epoch).
     pub fn remove_node(&mut self, uid: u32) {
         self.miners.retain(|m| m.uid != uid);
+    }
+
+    /// Computes the deterministic Blake3 hash of this ClusterMap.
+    /// Note: The `signature` field is EXCLUDED from the hash, 
+    /// otherwise signing it would change the hash, invalidating the signature!
+    pub fn compute_hash(&self) -> String {
+        let mut clone = self.clone();
+        clone.signature = None; // Exclude signature from hash calculation
+        let bytes = serde_json::to_vec(&clone).expect("Failed to serialize ClusterMap for hashing");
+        let hash = blake3::hash(&bytes);
+        hex::encode(hash.as_bytes())
     }
 }
 
@@ -517,9 +564,137 @@ pub fn cluster_map_to_bytes(m: &ClusterMap) -> anyhow::Result<Vec<u8>> {
     bincode::serialize(m).map_err(|e| anyhow::anyhow!(e))
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct LegacyMinerNode {
+    pub uid: u32,
+    pub endpoint: iroh::EndpointAddr,
+    pub weight: u32,
+    pub ip_subnet: String,
+    #[serde(default)]
+    pub ip_address: Option<String>,
+    pub http_addr: String,
+    pub public_key: String,
+    pub total_storage: u64,
+    pub available_storage: u64,
+    pub family_id: String,
+    pub strikes: u8,
+    pub last_seen: u64,
+    #[serde(default)]
+    pub heartbeat_count: u32,
+    #[serde(default)]
+    pub registration_time: u64,
+    #[serde(default)]
+    pub bandwidth_total: u64,
+    #[serde(default)]
+    pub bandwidth_window_start: u64,
+    #[serde(default)]
+    pub weight_manual_override: bool,
+    #[serde(default)]
+    pub reputation: f32,
+    #[serde(default)]
+    pub consecutive_audit_passes: u32,
+    #[serde(default)]
+    pub integrity_fails: u32,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub base_weight: u32,
+    #[serde(default)]
+    pub warden_challenges_total: u32,
+    #[serde(default)]
+    pub warden_challenges_passed: u32,
+    #[serde(default)]
+    pub fetch_timeout_count: u32,
+    #[serde(default)]
+    pub expected_shards: u32,
+    #[serde(default)]
+    pub actual_shards: u32,
+    #[serde(default)]
+    pub trust_score: f32,
+    #[serde(default)]
+    pub earned_capacity_bytes: u64,
+    #[serde(default)]
+    pub draining: bool,
+    #[serde(default = "default_reliability_score")]
+    pub p2p_reliability_score: f64,
+}
+
+impl LegacyMinerNode {
+    fn into_current(self) -> MinerNode {
+        MinerNode {
+            uid: self.uid,
+            endpoint: self.endpoint,
+            weight: self.weight,
+            ip_subnet: self.ip_subnet,
+            ip_address: self.ip_address,
+            http_addr: self.http_addr,
+            public_key: self.public_key,
+            total_storage: self.total_storage,
+            available_storage: self.available_storage,
+            family_id: self.family_id,
+            strikes: self.strikes,
+            last_seen: self.last_seen,
+            is_historical_seeder: false,
+            heartbeat_count: self.heartbeat_count,
+            registration_time: self.registration_time,
+            bandwidth_total: self.bandwidth_total,
+            bandwidth_window_start: self.bandwidth_window_start,
+            weight_manual_override: self.weight_manual_override,
+            reputation: self.reputation,
+            consecutive_audit_passes: self.consecutive_audit_passes,
+            integrity_fails: self.integrity_fails,
+            version: self.version,
+            base_weight: self.base_weight,
+            warden_challenges_total: self.warden_challenges_total,
+            warden_challenges_passed: self.warden_challenges_passed,
+            fetch_timeout_count: self.fetch_timeout_count,
+            expected_shards: self.expected_shards,
+            actual_shards: self.actual_shards,
+            trust_score: self.trust_score,
+            earned_capacity_bytes: self.earned_capacity_bytes,
+            draining: self.draining,
+            p2p_reliability_score: self.p2p_reliability_score,
+            balancer_reweight: 1.0,
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct LegacyClusterMap {
+    pub epoch: u64,
+    pub miners: Vec<LegacyMinerNode>,
+    #[serde(default = "default_pg_count")]
+    pub pg_count: u32,
+    #[serde(default = "default_ec_k")]
+    pub ec_k: usize,
+    #[serde(default = "default_ec_m")]
+    pub ec_m: usize,
+}
+
+impl LegacyClusterMap {
+    fn into_current(self) -> ClusterMap {
+        ClusterMap {
+            epoch: self.epoch,
+            previous_hash: None,
+            signature: None,
+            miners: self.miners.into_iter().map(|m| m.into_current()).collect(),
+            pg_count: self.pg_count,
+            ec_k: self.ec_k,
+            ec_m: self.ec_m,
+            pg_upmap: std::collections::HashMap::new(),
+        }
+    }
+}
+
 /// Deserialize a [`ClusterMap`] from bincode bytes.
 pub fn cluster_map_from_bytes(b: &[u8]) -> anyhow::Result<ClusterMap> {
-    bincode::deserialize(b).map_err(|e| anyhow::anyhow!(e))
+    if let Ok(map) = bincode::deserialize::<ClusterMap>(b) {
+        return Ok(map);
+    }
+
+    let legacy: LegacyClusterMap = bincode::deserialize(b)
+        .map_err(|e| anyhow::anyhow!("Failed both V2 and V1 deserialization: {}", e))?;
+    Ok(legacy.into_current())
 }
 
 /// Configuration for Reed-Solomon erasure coding stripes.
@@ -750,6 +925,9 @@ pub enum ValidatorControlMessage {
         /// Miner software version
         #[serde(default)]
         version: Option<String>,
+        /// Whether the miner has the full historical epoch archive and can serve it via P2P State Sync
+        #[serde(default)]
+        is_historical_seeder: bool,
     },
     /// P2P health check - validator responds with Pong
     Ping {
@@ -847,9 +1025,15 @@ pub fn calculate_placement_for_stripe(
     count: usize,
     map: &ClusterMap,
 ) -> Result<Vec<MinerNode>, String> {
-    // Step 1: Use ALL miners to ensure Stable CRUSH placement
-    // We do NOT filter by online/space here because that creates a transient map view
-    // which causes Validator (Write) and Gateway (Read) to diverge.
+    // Step 1: Callers MUST pre-filter the map with `filter_map_for_placement`
+    // before calling this function. Draining miners must be
+    // excluded so that all paths (upload, download, recovery, rebalance)
+    // compute identical placements from the same filtered miner set.
+    if map.miners.iter().any(|m| m.draining) {
+        tracing::error!(
+            "CRUSH placement called with an unfiltered map containing draining miners! Callers MUST pre-filter the map with common::filter_map_for_placement"
+        );
+    }
 
     // Check if we have enough miners for placement
     if map.miners.len() < count {
@@ -1957,6 +2141,11 @@ pub struct WardenShardCommitment {
 /// - Proof-of-storage challenges from wardens
 pub const MINER_CONTROL_ALPN: &[u8] = b"hippius/miner-control";
 
+/// ALPN protocol identifier for Miner → Miner or Miner → Validator P2P state sync.
+///
+/// Used for downloading the historical cluster map hash chain.
+pub const P2P_STATE_SYNC_ALPN: &[u8] = b"hippius/p2p-state-sync";
+
 /// ALPN protocol identifier for Miner → Gateway inbound connections.
 ///
 /// Used for miner-initiated connections to the gateway. The miner connects
@@ -2361,6 +2550,20 @@ pub fn calculate_pg_placement(
     shards_per_file: usize,
     map: &ClusterMap,
 ) -> Result<Vec<MinerNode>, String> {
+    if let Some(upmap_uids) = map.pg_upmap.get(&pg_id) {
+        let mut upmap_miners = Vec::new();
+        for &uid in upmap_uids {
+            if let Some(miner) = map.miners.iter().find(|m| m.uid == uid)
+                && !miner.draining {
+                    upmap_miners.push(miner.clone());
+                }
+        }
+        if upmap_miners.len() >= shards_per_file {
+            upmap_miners.truncate(shards_per_file);
+            return Ok(upmap_miners);
+        }
+    }
+
     // Use PG ID as the placement seed (like using file_hash + stripe_index)
     // This gives each PG a consistent, deterministic set of miners
     let pg_seed = format!("pg:{}", pg_id);
@@ -2393,6 +2596,11 @@ pub fn calculate_pg_placement_for_stripe(
     shards_per_stripe: usize,
     map: &ClusterMap,
 ) -> Result<Vec<MinerNode>, String> {
+    if map.miners.iter().any(|m| m.draining) {
+        tracing::error!(
+            "CRUSH placement called with an unfiltered map containing draining miners! Callers MUST pre-filter the map with common::filter_map_for_placement"
+        );
+    }
     let pg_id = calculate_pg(file_hash, map.pg_count)?;
     let mut miners = calculate_pg_placement(pg_id, shards_per_stripe, map)?;
 
@@ -2412,6 +2620,20 @@ pub fn calculate_pg_placement_straw2(
     shards_per_file: usize,
     map: &ClusterMap,
 ) -> Result<Vec<MinerNode>, String> {
+    if let Some(upmap_uids) = map.pg_upmap.get(&pg_id) {
+        let mut upmap_miners = Vec::new();
+        for &uid in upmap_uids {
+            if let Some(miner) = map.miners.iter().find(|m| m.uid == uid)
+                && !miner.draining {
+                    upmap_miners.push(miner.clone());
+                }
+        }
+        if upmap_miners.len() >= shards_per_file {
+            upmap_miners.truncate(shards_per_file);
+            return Ok(upmap_miners);
+        }
+    }
+
     let pg_seed = format!("pg:{}", pg_id);
     calculate_placement_for_stripe_straw2(&pg_seed, 0, shards_per_file, map)
 }
@@ -2426,6 +2648,11 @@ pub fn calculate_pg_placement_for_stripe_straw2(
     shards_per_stripe: usize,
     map: &ClusterMap,
 ) -> Result<Vec<MinerNode>, String> {
+    if map.miners.iter().any(|m| m.draining) {
+        tracing::error!(
+            "CRUSH placement called with an unfiltered map containing draining miners! Callers MUST pre-filter the map with common::filter_map_for_placement"
+        );
+    }
     let pg_id = calculate_pg(file_hash, map.pg_count)?;
     let mut miners = calculate_pg_placement_straw2(pg_id, shards_per_stripe, map)?;
 
@@ -2511,8 +2738,7 @@ pub fn calculate_stripe_placement_with_fallbacks(
     }
 
     // Collect primary UIDs for exclusion
-    let primary_uids: std::collections::HashSet<u32> =
-        primaries.iter().map(|m| m.uid).collect();
+    let primary_uids: std::collections::HashSet<u32> = primaries.iter().map(|m| m.uid).collect();
 
     // Build pool of non-primary miners sorted by UID for determinism
     let mut pool: Vec<&MinerNode> = cluster_map
@@ -2778,6 +3004,20 @@ pub fn calculate_pg_placement_uids(
     shards_per_file: usize,
     map: &ClusterMap,
 ) -> Result<Vec<u32>, String> {
+    if let Some(upmap_uids) = map.pg_upmap.get(&pg_id) {
+        let mut valid_uids = Vec::new();
+        for &uid in upmap_uids {
+            if let Some(miner) = map.miners.iter().find(|m| m.uid == uid)
+                && !miner.draining {
+                    valid_uids.push(uid);
+                }
+        }
+        if valid_uids.len() >= shards_per_file {
+            valid_uids.truncate(shards_per_file);
+            return Ok(valid_uids);
+        }
+    }
+
     let pg_seed = format!("pg:{}", pg_id);
     placement_uids_for_stripe(&pg_seed, 0, shards_per_file, map)
 }
@@ -2788,6 +3028,20 @@ pub fn calculate_pg_placement_uids_straw2(
     shards_per_file: usize,
     map: &ClusterMap,
 ) -> Result<Vec<u32>, String> {
+    if let Some(upmap_uids) = map.pg_upmap.get(&pg_id) {
+        let mut valid_uids = Vec::new();
+        for &uid in upmap_uids {
+            if let Some(miner) = map.miners.iter().find(|m| m.uid == uid)
+                && !miner.draining {
+                    valid_uids.push(uid);
+                }
+        }
+        if valid_uids.len() >= shards_per_file {
+            valid_uids.truncate(shards_per_file);
+            return Ok(valid_uids);
+        }
+    }
+
     let pg_seed = format!("pg:{}", pg_id);
     placement_uids_for_stripe_straw2(&pg_seed, 0, shards_per_file, map)
 }
@@ -2930,6 +3184,22 @@ pub fn socket_addr_from_endpoint(addr: &iroh::EndpointAddr) -> Option<std::net::
         iroh::TransportAddr::Ip(sock) => Some(*sock),
         _ => None,
     })
+}
+
+/// Return a clone of the cluster map with draining miners removed.
+/// Upload (gateway) filters these miners **before** CRUSH so
+/// that draining nodes never receive new shards. Every other path that
+/// computes CRUSH placement (download, recovery, rebalance) **must** apply
+/// the same filter; otherwise CRUSH sees a different miner set and returns
+/// different placements, causing "shard not found" errors.
+pub fn filter_map_for_placement(map: &ClusterMap) -> ClusterMap {
+    let has_draining = map.miners.iter().any(|m| m.draining);
+    if !has_draining {
+        return map.clone();
+    }
+    let mut filtered = map.clone();
+    filtered.miners.retain(|m| !m.draining);
+    filtered
 }
 
 /// Returns true if the endpoint has at least one direct IP address
@@ -3775,6 +4045,13 @@ impl P2pConnectionManager {
     }
 }
 
+/// Request sent by a miner to download the historical epoch archive from a seeder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct P2PStateSyncRequest {
+    /// The epoch number to start streaming from (inclusive).
+    pub start_epoch: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4173,6 +4450,7 @@ mod tests {
             pg_count: 0,
             ec_k: 0,
             ec_m: 0,
+            pg_upmap: std::collections::HashMap::new(),
         };
         map.ensure_defaults();
         assert_eq!(map.pg_count, 16384);
@@ -4189,6 +4467,7 @@ mod tests {
             pg_count: 8192,
             ec_k: 5,
             ec_m: 15,
+            pg_upmap: std::collections::HashMap::new(),
         };
         map.ensure_defaults();
         assert_eq!(map.pg_count, 8192);
@@ -4204,6 +4483,7 @@ mod tests {
             pg_count: 15000,
             ec_k: 10,
             ec_m: 20,
+            pg_upmap: std::collections::HashMap::new(),
         };
         map.ensure_defaults();
         assert_eq!(map.pg_count, 16384); // next power of 2 above 15000
@@ -4217,6 +4497,7 @@ mod tests {
             pg_count: 4096,
             ec_k: 10,
             ec_m: 20,
+            pg_upmap: std::collections::HashMap::new(),
         };
         map.ensure_defaults();
         assert_eq!(map.pg_count, 4096);
@@ -4231,16 +4512,16 @@ mod tests {
         assert_eq!(calculate_uptime_score(0, 100, 100), 1.0);
 
         // 100% uptime: 10 heartbeats in 300s (expected 10 at 30s interval)
-        assert_eq!(calculate_uptime_score(10, 0, 300), 1.0);
+        assert_eq!(calculate_uptime_score(10, 100, 400), 1.0);
 
         // 50% uptime: 5 heartbeats in 300s
-        assert!((calculate_uptime_score(5, 0, 300) - 0.5).abs() < 0.01);
+        assert!((calculate_uptime_score(5, 100, 400) - 0.5).abs() < 0.01);
 
         // 0 heartbeats, > 60s elapsed
-        assert_eq!(calculate_uptime_score(0, 0, 120), 0.0);
+        assert_eq!(calculate_uptime_score(0, 100, 220), 0.0);
 
         // More heartbeats than expected clamps to 1.0
-        assert_eq!(calculate_uptime_score(100, 0, 300), 1.0);
+        assert_eq!(calculate_uptime_score(100, 100, 400), 1.0);
     }
 
     #[test]
@@ -4336,6 +4617,7 @@ mod tests {
                 MinerNode {
                     uid: i,
                     weight: 100,
+                    balancer_reweight: 1.0,
                     family_id: format!("family-{}", i % 10),
                     endpoint: iroh::EndpointAddr::from(sk.public()),
                     ip_subnet: String::new(),
@@ -4466,6 +4748,7 @@ mod tests {
                 MinerNode {
                     uid: i,
                     weight: 100,
+                    balancer_reweight: 1.0,
                     family_id: format!("family-{}", i % families),
                     endpoint: iroh::EndpointAddr::from(sk.public()),
                     ip_subnet: String::new(),
@@ -4505,6 +4788,7 @@ mod tests {
             pg_count: 64,
             ec_k: 10,
             ec_m: 20,
+            pg_upmap: std::collections::HashMap::new(),
         }
     }
 
@@ -4685,6 +4969,7 @@ mod tests {
                 miners.push(MinerNode {
                     uid: uid_counter,
                     weight: 100,
+                    balancer_reweight: 1.0,
                     family_id: fam.to_string(),
                     endpoint: iroh::EndpointAddr::from(sk.public()),
                     ip_subnet: String::new(),

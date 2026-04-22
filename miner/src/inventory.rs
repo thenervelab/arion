@@ -83,10 +83,8 @@ pub fn stream_all_hashes(tx: tokio::sync::mpsc::Sender<String>) -> Result<usize>
                 match stmt.query_map(rusqlite::params![batch_size, offset], |row| row.get(0)) {
                     Ok(rows) => {
                         let mut batch = Vec::with_capacity(batch_size as usize);
-                        for row in rows {
-                            if let Ok(h) = row {
-                                batch.push(h);
-                            }
+                        for h in rows.flatten() {
+                            batch.push(h);
                         }
                         batch
                     }
