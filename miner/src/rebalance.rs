@@ -371,10 +371,12 @@ pub async fn self_rebalance_pg(
     let used_doc_fallback = if validator_reachable && validator_addr.is_some() {
         let validator_addr = validator_addr.unwrap();
 
-        let validator_conn = match crate::state::get_pooled_connection(
+        let validator_conn = match common::transport::connect_with_alpn(
             &endpoint,
-            &validator_node_id,
             validator_addr,
+            &validator_node_id,
+            &signing_key,
+            &[common::VALIDATOR_CONTROL_ALPN],
         )
         .await
         {

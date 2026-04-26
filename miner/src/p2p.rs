@@ -1275,7 +1275,7 @@ pub fn get_state_sync_client_endpoint() -> anyhow::Result<&'static quinn::Endpoi
     let (_, mut client_config) = common::transport::generate_tls_config(&signing_key)?;
     client_config.alpn_protocols = vec![common::P2P_STATE_SYNC_ALPN.to_vec()];
 
-    let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())?;
+    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
     let quic_client_config = quinn::crypto::rustls::QuicClientConfig::try_from(client_config)?;
     let mut client_config = quinn::ClientConfig::new(std::sync::Arc::new(quic_client_config));
     

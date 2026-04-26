@@ -1010,10 +1010,12 @@ fn spawn_heartbeat_loop(
                     }
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(constants::DEFAULT_CONNECT_TIMEOUT_SECS),
-                        common::transport::connect(
+                        common::transport::connect_with_alpn(
                             &ctx.endpoint,
                             current_validator_addr,
                             &current_validator_node_id,
+                            &ctx.signing_key,
+                            &[common::VALIDATOR_CONTROL_ALPN],
                         ),
                     )
                     .await
@@ -1058,8 +1060,8 @@ fn spawn_heartbeat_loop(
                         }
 
                         // Try to parse JSON response for warden node IDs
-                        if let Ok(response) = serde_json::from_str::<serde_json::Value>(&ack_str)
-                            && let Some(ids) =
+                        if let Ok(response) = serde_json::from_str::<serde_json::Value>(&ack_str) {
+                            if let Some(ids) =
                                 response.get("warden_node_ids").and_then(|v| v.as_array())
                             {
                                 let mut new_ids: Vec<String> = ids
@@ -1079,6 +1081,16 @@ fn spawn_heartbeat_loop(
                                     }
                                 }
                             }
+
+                            // Update current epoch from validator if provided
+                            if let Some(epoch) = response.get("epoch").and_then(|v| v.as_u64()) {
+                                let mut current_epoch = state::get_current_epoch().write().await;
+                                if *current_epoch != epoch {
+                                    debug!(old = *current_epoch, new = epoch, "Updated current epoch from validator heartbeat");
+                                    *current_epoch = epoch;
+                                }
+                            }
+                        }
 
                         Ok::<_, anyhow::Error>(true)
                     })
@@ -1263,10 +1275,12 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<quinn::Conne
     // Connect to validator via quinn
     let conn = tokio::time::timeout(
         std::time::Duration::from_secs(constants::DEFAULT_CONNECT_TIMEOUT_SECS),
-        common::transport::connect(
+        common::transport::connect_with_alpn(
             &ctx.endpoint,
             ctx.validator_socket_addr,
             &ctx.validator_node_id,
+            &ctx.signing_key,
+            &[common::VALIDATOR_CONTROL_ALPN],
         ),
     )
     .await?

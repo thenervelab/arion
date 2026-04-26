@@ -104,7 +104,17 @@ pub async fn create_endpoint(
     bind_addr: SocketAddr,
     secret_key: &ed25519_dalek::SigningKey,
 ) -> Result<quinn::Endpoint> {
-    let (server_config, client_config) = generate_tls_config(secret_key)?;
+    let (mut server_config, client_config) = generate_tls_config(secret_key)?;
+
+    // Configure all known Arion ALPN protocols for the server endpoint
+    server_config.alpn_protocols = vec![
+        crate::VALIDATOR_CONTROL_ALPN.to_vec(),
+        crate::GATEWAY_CONTROL_ALPN.to_vec(),
+        crate::WARDEN_CONTROL_ALPN.to_vec(),
+        crate::SUBMITTER_CONTROL_ALPN.to_vec(),
+        crate::MINER_CONTROL_ALPN.to_vec(),
+        crate::P2P_STATE_SYNC_ALPN.to_vec(),
+    ];
 
     let quic_server_config = quinn::crypto::rustls::QuicServerConfig::try_from(server_config)
         .context("QUIC server crypto config")?;
