@@ -1294,7 +1294,11 @@ pub async fn reconstruct_shard(
         );
         return Ok(false);
     }
-    let stripe_shards = &manifest.shards[stripe_start..stripe_end];
+    // Create a local copy and sort by index to handle out-of-order manifests.
+    // Older manifests may have shards out of order because they were pushed
+    // in upload completion order instead of index order.
+    let mut stripe_shards = manifest.shards[stripe_start..stripe_end].to_vec();
+    stripe_shards.sort_by_key(|s| s.index);
 
     // 2. Check which ones are stored locally first (loopback)
     let mut shard_data: Vec<Option<Vec<u8>>> = vec![None; shards_per_stripe];
@@ -1476,7 +1480,7 @@ pub async fn reconstruct_shard(
         .map_err(|e| anyhow::anyhow!("Failed to store reconstructed shard: {}", e))?;
 
     // 6. Return Ok(true) if successful
-    info!(
+    warn!(
         shard = %&shard_hash.to_string()[..12],
         stripe = stripe_index,
         peers_used = available_count,
@@ -1623,13 +1627,17 @@ async fn perform_erasure_recovery(
                         error!(error = %e, "[REBALANCE] Failed to store reconstructed shard");
                         return false;
                     }
-                    info!(
+                    warn!(
                         missing_blob_hash,
                         "[REBALANCE] Successfully reconstructed missing shard via Erasure Coding"
                     );
                     true
                 } else {
-                    error!("[REBALANCE] Reconstructed shard hash mismatch");
+                    error!(
+                        expected = %missing_blob_hash,
+                        computed = %computed.to_hex(),
+                        "[REBALANCE] Reconstructed shard hash mismatch"
+                    );
                     false
                 }
             } else {
