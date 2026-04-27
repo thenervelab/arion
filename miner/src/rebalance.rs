@@ -141,16 +141,30 @@ async fn get_or_fetch_cluster_map(
         }
     }
 
-    // Cache miss — fetch from the validator.
-    let fetched = fetch_cluster_map_for_epoch(
-        endpoint,
-        signing_key,
-        validator_node_id,
-        validator_addr,
-        epoch,
-    )
-    .await
-    .map(Arc::new);
+    // Secondary path: check local epoch_archive on disk.
+    let mut fetched = None;
+    if let Some(data_dir) = crate::state::get_data_dir() {
+        let path = data_dir.join("epoch_archive").join(format!("epoch_{}.json", epoch));
+        if let Ok(bytes) = tokio::fs::read(&path).await {
+            if let Ok(map) = serde_json::from_slice::<common::ClusterMap>(&bytes) {
+                fetched = Some(map);
+            }
+        }
+    }
+
+    // Cache miss and disk miss — fetch from the validator.
+    if fetched.is_none() {
+        fetched = fetch_cluster_map_for_epoch(
+            endpoint,
+            signing_key,
+            validator_node_id,
+            validator_addr,
+            epoch,
+        )
+        .await;
+    }
+
+    let fetched = fetched.map(|m| Arc::new(common::filter_map_for_placement(&m)));
 
     // Store the result (including None for negative caching).
     let mut cache = CLUSTER_MAP_CACHE.write().await;
@@ -221,7 +235,7 @@ pub async fn self_rebalance_pg(
     let cluster_map: Arc<common::ClusterMap> = {
         let map_guard = get_cluster_map().read().await;
         match map_guard.as_ref() {
-            Some(map) => map.clone(),
+            Some(map) => Arc::new(common::filter_map_for_placement(map)),
             None => {
                 warn!("No cluster map available, skipping rebalance");
                 return Ok(());
@@ -252,7 +266,7 @@ pub async fn self_rebalance_pg(
         history
             .iter()
             .filter(|m| m.epoch >= min_epoch)
-            .cloned()
+            .map(|m| Arc::new(common::filter_map_for_placement(m)))
             .collect()
     };
 
@@ -307,7 +321,7 @@ pub async fn self_rebalance_pg(
             let updated_map: Arc<common::ClusterMap> = {
                 let map_guard = get_cluster_map().read().await;
                 match map_guard.as_ref() {
-                    Some(map) => map.clone(),
+                    Some(map) => Arc::new(common::filter_map_for_placement(map)),
                     None => continue,
                 }
             };
@@ -1310,7 +1324,7 @@ pub async fn reconstruct_shard(
         let cluster_map: Arc<common::ClusterMap> = {
             let map_guard = crate::state::get_cluster_map().read().await;
             match map_guard.as_ref() {
-                Some(map) => map.clone(),
+                Some(map) => Arc::new(common::filter_map_for_placement(map)),
                 None => return Ok(false),
             }
         };

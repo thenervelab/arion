@@ -103,11 +103,10 @@ pub fn generate_tls_config(
 pub async fn create_endpoint(
     bind_addr: SocketAddr,
     secret_key: &ed25519_dalek::SigningKey,
+    transport_config: Option<Arc<quinn::TransportConfig>>,
 ) -> Result<quinn::Endpoint> {
-    let (mut server_config, client_config) = generate_tls_config(secret_key)?;
-
-    // Configure all known Arion ALPN protocols for the server endpoint
-    server_config.alpn_protocols = vec![
+    let (mut server_config, mut client_config) = generate_tls_config(secret_key)?;
+    let alpns = vec![
         crate::VALIDATOR_CONTROL_ALPN.to_vec(),
         crate::GATEWAY_CONTROL_ALPN.to_vec(),
         crate::WARDEN_CONTROL_ALPN.to_vec(),
@@ -116,15 +115,25 @@ pub async fn create_endpoint(
         crate::P2P_STATE_SYNC_ALPN.to_vec(),
     ];
 
+    // Configure all known Arion ALPN protocols for the server and client endpoints
+    server_config.alpn_protocols = alpns.clone();
+    client_config.alpn_protocols = alpns;
+
     let quic_server_config = quinn::crypto::rustls::QuicServerConfig::try_from(server_config)
         .context("QUIC server crypto config")?;
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
+    if let Some(ref config) = transport_config {
+        server_config.transport_config(config.clone());
+    }
     let mut endpoint =
         quinn::Endpoint::server(server_config, bind_addr).context("bind quinn endpoint")?;
 
     let quic_client_config = quinn::crypto::rustls::QuicClientConfig::try_from(client_config)
         .context("QUIC client crypto config")?;
-    let client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
+    if let Some(ref config) = transport_config {
+        client_config.transport_config(config.clone());
+    }
     endpoint.set_default_client_config(client_config);
 
     Ok(endpoint)
@@ -437,12 +446,12 @@ mod tests {
         let client_key = SigningKey::from_bytes(&[20u8; 32]);
         let server_node_id = node_id_from_public_key(&server_key.verifying_key());
 
-        let server = create_endpoint("127.0.0.1:0".parse().unwrap(), &server_key)
+        let server = create_endpoint("127.0.0.1:0".parse().unwrap(), &server_key, None)
             .await
             .unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let client = create_endpoint("127.0.0.1:0".parse().unwrap(), &client_key)
+        let client = create_endpoint("127.0.0.1:0".parse().unwrap(), &client_key, None)
             .await
             .unwrap();
 
@@ -488,12 +497,12 @@ mod tests {
         let client_key = SigningKey::from_bytes(&[40u8; 32]);
         let wrong_node_id = "ff".repeat(32); // 64 hex chars, definitely wrong
 
-        let server = create_endpoint("127.0.0.1:0".parse().unwrap(), &server_key)
+        let server = create_endpoint("127.0.0.1:0".parse().unwrap(), &server_key, None)
             .await
             .unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let client = create_endpoint("127.0.0.1:0".parse().unwrap(), &client_key)
+        let client = create_endpoint("127.0.0.1:0".parse().unwrap(), &client_key, None)
             .await
             .unwrap();
 

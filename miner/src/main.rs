@@ -411,7 +411,16 @@ async fn run_miner(cli: Cli) -> Result<()> {
     }
 
     let bind_addr = SocketAddr::new(std::net::IpAddr::V4(bind_ipv4), config.network.p2p_port);
-    let endpoint = common::transport::create_endpoint(bind_addr, &signing_key).await?;
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.max_concurrent_bidi_streams(16384_u32.into());
+    transport_config.max_concurrent_uni_streams(1024_u32.into());
+    transport_config.send_window(16 * 1024 * 1024);
+    transport_config.stream_receive_window((2 * 1024 * 1024_u32).into());
+    transport_config.receive_window((64 * 1024 * 1024_u32).into());
+    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
+    let transport_config = Arc::new(transport_config);
+
+    let endpoint = common::transport::create_endpoint(bind_addr, &signing_key, Some(transport_config)).await?;
 
     info!(node_id = %truncate_for_log(&node_id, 16), bind = %bind_addr, "Quinn endpoint bound");
 
@@ -426,7 +435,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
     if let Some(map) = rebalance::load_cluster_map_cache(&data_dir).await {
         let epoch = map.epoch;
         let pgs = tokio::task::spawn_blocking({
-            let map_clone = map.clone();
+            let map_clone = common::filter_map_for_placement(&map);
             move || common::calculate_my_pgs(miner_uid, &map_clone)
         })
         .await
