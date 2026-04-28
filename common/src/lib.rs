@@ -2687,17 +2687,57 @@ pub fn calculate_stripe_placement(
     map: &ClusterMap,
     placement_version: u8,
 ) -> Result<Vec<MinerNode>, String> {
+    // Versions 1 and 2 require filtering draining nodes for backward compatibility.
+    // Version 3 (straw2) uses the full map to maintain determinism during reconstruction.
+    let filtered_map_owned: Option<ClusterMap>;
+    let map_ref = if (placement_version == 1 || placement_version == 2)
+        && map.miners.iter().any(|m| m.draining)
+    {
+        filtered_map_owned = Some(filter_map_for_placement(map));
+        filtered_map_owned.as_ref().unwrap()
+    } else {
+        map
+    };
+
     match placement_version {
         3 => calculate_pg_placement_for_stripe_straw2(
             file_hash,
             stripe_index,
             shards_per_stripe,
-            map,
+            map_ref,
         ),
-        2 => calculate_pg_placement_for_stripe(file_hash, stripe_index, shards_per_stripe, map),
-        _ => calculate_placement_for_stripe(file_hash, stripe_index, shards_per_stripe, map),
+        2 => calculate_pg_placement_for_stripe(file_hash, stripe_index, shards_per_stripe, map_ref),
+        _ => calculate_placement_for_stripe(file_hash, stripe_index, shards_per_stripe, map_ref),
     }
 }
+
+/// Returns the sequence of placement versions to attempt for a given manifest.
+///
+/// If a version is explicitly tagged in the manifest, it is tried first.
+/// Fallbacks are added to handle files mis-tagged during protocol transitions.
+pub fn get_placement_probing_sequence(tagged_version: u8) -> Vec<u8> {
+    let mut sequence = vec![tagged_version];
+    match tagged_version {
+        3 => {
+            sequence.push(2);
+            sequence.push(1);
+        }
+        2 => {
+            sequence.push(1);
+        }
+        _ => {
+            if tagged_version != 2 {
+                sequence.push(2);
+            }
+            if tagged_version != 1 {
+                sequence.push(1);
+            }
+        }
+    }
+    sequence.dedup();
+    sequence
+}
+
 
 /// Calculate stripe placement with fallback candidates per shard.
 ///
@@ -3004,10 +3044,19 @@ pub fn calculate_pg_placement_uids(
     shards_per_file: usize,
     map: &ClusterMap,
 ) -> Result<Vec<u32>, String> {
-    if let Some(upmap_uids) = map.pg_upmap.get(&pg_id) {
+    // v2 logic requires filtering draining miners for backward compatibility.
+    let filtered_map_owned: Option<ClusterMap>;
+    let map_ref = if map.miners.iter().any(|m| m.draining) {
+        filtered_map_owned = Some(filter_map_for_placement(map));
+        filtered_map_owned.as_ref().unwrap()
+    } else {
+        map
+    };
+
+    if let Some(upmap_uids) = map_ref.pg_upmap.get(&pg_id) {
         let mut valid_uids = Vec::new();
         for &uid in upmap_uids {
-            if let Some(miner) = map.miners.iter().find(|m| m.uid == uid)
+            if let Some(miner) = map_ref.miners.iter().find(|m| m.uid == uid)
                 && !miner.draining {
                     valid_uids.push(uid);
                 }
@@ -3019,7 +3068,7 @@ pub fn calculate_pg_placement_uids(
     }
 
     let pg_seed = format!("pg:{}", pg_id);
-    placement_uids_for_stripe(&pg_seed, 0, shards_per_file, map)
+    placement_uids_for_stripe(&pg_seed, 0, shards_per_file, map_ref)
 }
 
 /// PG-based UID-only placement using straw2 selection (placement_version=3).
@@ -3028,6 +3077,8 @@ pub fn calculate_pg_placement_uids_straw2(
     shards_per_file: usize,
     map: &ClusterMap,
 ) -> Result<Vec<u32>, String> {
+    // v3 logic (straw2) does NOT filter draining miners to ensure deterministic
+    // reconstruction even as miners transition to draining.
     if let Some(upmap_uids) = map.pg_upmap.get(&pg_id) {
         let mut valid_uids = Vec::new();
         for &uid in upmap_uids {
@@ -4451,6 +4502,7 @@ mod tests {
             ec_k: 0,
             ec_m: 0,
             pg_upmap: std::collections::HashMap::new(),
+            ..ClusterMap::default()
         };
         map.ensure_defaults();
         assert_eq!(map.pg_count, 16384);
@@ -4468,6 +4520,7 @@ mod tests {
             ec_k: 5,
             ec_m: 15,
             pg_upmap: std::collections::HashMap::new(),
+            ..ClusterMap::default()
         };
         map.ensure_defaults();
         assert_eq!(map.pg_count, 8192);
@@ -4484,6 +4537,7 @@ mod tests {
             ec_k: 10,
             ec_m: 20,
             pg_upmap: std::collections::HashMap::new(),
+            ..ClusterMap::default()
         };
         map.ensure_defaults();
         assert_eq!(map.pg_count, 16384); // next power of 2 above 15000
@@ -4498,6 +4552,7 @@ mod tests {
             ec_k: 10,
             ec_m: 20,
             pg_upmap: std::collections::HashMap::new(),
+            ..ClusterMap::default()
         };
         map.ensure_defaults();
         assert_eq!(map.pg_count, 4096);
@@ -4647,6 +4702,7 @@ mod tests {
                     earned_capacity_bytes: 0,
                     draining: false,
                     p2p_reliability_score: 1.0,
+                    is_historical_seeder: false,
                 }
             })
             .collect();
@@ -4778,17 +4834,21 @@ mod tests {
                     earned_capacity_bytes: 0,
                     draining: false,
                     p2p_reliability_score: 1.0,
+                    is_historical_seeder: false,
                 }
             })
             .collect();
 
         ClusterMap {
             epoch: 1,
+            previous_hash: None,
+            signature: None,
             miners,
             pg_count: 64,
             ec_k: 10,
             ec_m: 20,
             pg_upmap: std::collections::HashMap::new(),
+            ..ClusterMap::default()
         }
     }
 
@@ -4999,6 +5059,7 @@ mod tests {
                     earned_capacity_bytes: 0,
                     draining: false,
                     p2p_reliability_score: 1.0,
+                    is_historical_seeder: false,
                 });
                 uid_counter += 1;
             }

@@ -435,7 +435,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
     if let Some(map) = rebalance::load_cluster_map_cache(&data_dir).await {
         let epoch = map.epoch;
         let pgs = tokio::task::spawn_blocking({
-            let map_clone = common::filter_map_for_placement(&map);
+            let map_clone = map.clone();
             move || common::calculate_my_pgs(miner_uid, &map_clone)
         })
         .await

@@ -3831,7 +3831,7 @@ dependencies = [
 
 [[package]]
 name = "miner"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5358,7 +5358,7 @@ dependencies = [
 
 [[package]]
 name = "pos-circuits"
-version = "0.1.2"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "blake3",

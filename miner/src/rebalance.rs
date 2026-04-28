@@ -12,8 +12,9 @@
 //!    stripes to identify shards this miner should hold (CRUSH placement
 //!    with stripe rotation). Compare against a pre-built set of locally
 //!    present blobs (directory walk, O(1) lookups).
-//! 4. **Orphan GC**: Any local blob not in the expected set is tracked as
-//!    an orphan. After a 1-hour grace period, orphans are deleted from disk.
+//! 4. **Missing shard fetch**: Shards identified as missing (should be present but
+//!    not found locally) are fetched concurrently from peer miners or
+//!    reconstructed via erasure coding if enough peers are available.
 //!
 //! Missing shards are fetched concurrently from peer miners with adaptive
 //! throttling (see `fetch_missing_shards`). The validator also handles
@@ -164,7 +165,7 @@ async fn get_or_fetch_cluster_map(
         .await;
     }
 
-    let fetched = fetched.map(|m| Arc::new(common::filter_map_for_placement(&m)));
+    let fetched = fetched.map(Arc::new);
 
     // Store the result (including None for negative caching).
     let mut cache = CLUSTER_MAP_CACHE.write().await;
@@ -235,7 +236,7 @@ pub async fn self_rebalance_pg(
     let cluster_map: Arc<common::ClusterMap> = {
         let map_guard = get_cluster_map().read().await;
         match map_guard.as_ref() {
-            Some(map) => Arc::new(common::filter_map_for_placement(map)),
+            Some(map) => map.clone(),
             None => {
                 warn!("No cluster map available, skipping rebalance");
                 return Ok(());
@@ -258,7 +259,7 @@ pub async fn self_rebalance_pg(
         return Ok(());
     }
 
-    // Snapshot cluster map history for epoch lookback (prevents premature orphan GC).
+    // Snapshot cluster map history for epoch lookback (prevents premature deletion).
     // Only keep maps within the EPOCH_LOOKBACK window.
     let history_maps: Vec<Arc<common::ClusterMap>> = {
         let history = crate::state::get_cluster_map_history().read().await;
@@ -266,7 +267,7 @@ pub async fn self_rebalance_pg(
         history
             .iter()
             .filter(|m| m.epoch >= min_epoch)
-            .map(|m| Arc::new(common::filter_map_for_placement(m)))
+            .map(|m| m.clone())
             .collect()
     };
 
@@ -321,7 +322,7 @@ pub async fn self_rebalance_pg(
             let updated_map: Arc<common::ClusterMap> = {
                 let map_guard = get_cluster_map().read().await;
                 match map_guard.as_ref() {
-                    Some(map) => Arc::new(common::filter_map_for_placement(map)),
+                    Some(map) => map.clone(),
                     None => continue,
                 }
             };
@@ -376,7 +377,7 @@ pub async fn self_rebalance_pg(
     let mut aborted = false;
 
     // Cache of cluster maps keyed by placement epoch.  Populated lazily as
-    // manifests are processed — prevents orphan GC for files uploaded more
+    // manifests are processed — prevents premature deletion for files uploaded more
     // than EPOCH_LOOKBACK epochs ago.
     let mut placement_epoch_maps: std::collections::HashMap<u64, Arc<common::ClusterMap>> =
         std::collections::HashMap::new();
@@ -681,7 +682,7 @@ struct MissingShard {
 ///
 /// Uses epoch lookback: shards assigned to this miner under any historical
 /// cluster map (within EPOCH_LOOKBACK window) are added to `expected_shards`
-/// to prevent premature orphan GC during rebalancing transitions.
+/// to prevent premature deletion during rebalancing transitions.
 ///
 /// Uses loopback: before counting a shard as missing, checks if the blob
 /// exists in the local iroh_blobs store (it may be present without a tag).
@@ -752,7 +753,7 @@ async fn tally_manifest_shards(
             };
 
             // Check placement epoch map: the cluster map that was active when
-            // the file was uploaded.  This prevents orphan GC for files older
+            // the file was uploaded.  This prevents premature deletion for files older
             // than the EPOCH_LOOKBACK window.
             let mine_placement = if !mine_current && !mine_historical {
                 match placement_epoch_maps.get(&manifest.placement_epoch) {
@@ -792,7 +793,7 @@ async fn tally_manifest_shards(
                         // Collect peers that might hold this shard:
                         // other miners in the same stripe position from current
                         // and historical epochs (the previous holder likely
-                        // still has it during the orphan grace period).
+                        // still has it during the rebalancing window).
                         let mut peers: Vec<(String, std::net::SocketAddr)> = Vec::new();
                         // Historical placements: the miner that held this
                         // position in a previous epoch likely still has it.
@@ -1328,7 +1329,7 @@ pub async fn reconstruct_shard(
         let cluster_map: Arc<common::ClusterMap> = {
             let map_guard = crate::state::get_cluster_map().read().await;
             match map_guard.as_ref() {
-                Some(map) => Arc::new(common::filter_map_for_placement(map)),
+                Some(map) => map.clone(),
                 None => return Ok(false),
             }
         };

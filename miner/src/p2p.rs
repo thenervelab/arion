@@ -523,11 +523,19 @@ async fn handle_delete(
     };
 
     if !is_authorized {
-        error!(remote = %remote_node_id, "Delete rejected: invalid validator signature");
+        error!(
+            remote = %remote_node_id,
+            validator = ?validator_node_id,
+            "Delete rejected: invalid validator signature"
+        );
         return send_response(send, b"ERROR: UNAUTHORIZED").await;
     }
 
-    trace!(hash = %hash, "Received Delete command");
+    info!(
+        hash = %hash,
+        authorized_by = ?validator_node_id,
+        "Received authorized Delete command"
+    );
 
     // Parse hash to validate format
     let hash_parsed = match iroh_blobs::Hash::from_str(&hash) {
