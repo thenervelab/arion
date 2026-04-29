@@ -3116,14 +3116,25 @@ pub fn calculate_pg_placement_uids_straw2(
 /// # Returns
 /// List of PG IDs where this miner appears in the CRUSH placement
 pub fn calculate_my_pgs(miner_uid: u32, map: &ClusterMap) -> Vec<u32> {
+    // PG ownership determines which miner is responsible for new placement work.
+    // Draining miners must be excluded here, otherwise callers like miner startup
+    // and self-rebalance flood logs and compute ownership against a topology that
+    // should no longer receive new shards.
+    let filtered_map_owned;
+    let map_ref = if map.miners.iter().any(|m| m.draining) {
+        filtered_map_owned = filter_map_for_placement(map);
+        &filtered_map_owned
+    } else {
+        map
+    };
     let shards_per_file = map.ec_k + map.ec_m;
 
-    (0..map.pg_count)
+    (0..map_ref.pg_count)
         .filter(|&pg_id| {
-            let v2_match = calculate_pg_placement(pg_id, shards_per_file, map)
+            let v2_match = calculate_pg_placement(pg_id, shards_per_file, map_ref)
                 .map(|miners| miners.iter().any(|m| m.uid == miner_uid))
                 .unwrap_or(false);
-            let v3_match = calculate_pg_placement_straw2(pg_id, shards_per_file, map)
+            let v3_match = calculate_pg_placement_straw2(pg_id, shards_per_file, map_ref)
                 .map(|miners| miners.iter().any(|m| m.uid == miner_uid))
                 .unwrap_or(false);
             v2_match || v3_match
@@ -5009,6 +5020,19 @@ mod tests {
             "heavy miner appeared in {}/64 PGs, expected > 50",
             appearances
         );
+    }
+
+    #[test]
+    fn test_calculate_my_pgs_filters_draining_miners() {
+        let mut map = make_straw2_test_map(35, 10);
+        map.miners[0].draining = true;
+        let filtered = filter_map_for_placement(&map);
+
+        let from_unfiltered = calculate_my_pgs(1, &map);
+        let from_filtered = calculate_my_pgs(1, &filtered);
+
+        assert_eq!(from_unfiltered, from_filtered);
+        assert!(calculate_my_pgs(0, &map).is_empty());
     }
 
     /// Regression test for C1: shortfall redistribution.

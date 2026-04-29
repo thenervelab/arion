@@ -54,6 +54,39 @@ static CLUSTER_MAP_CACHE: LazyLock<
     TokioRwLock<std::collections::HashMap<u64, Option<Arc<common::ClusterMap>>>>,
 > = LazyLock::new(|| TokioRwLock::new(std::collections::HashMap::new()));
 
+fn repair_placement_versions_to_try(tagged_version: u8) -> Vec<u8> {
+    common::get_placement_probing_sequence(tagged_version)
+}
+
+fn stripe_candidates_for_versions(
+    file_hash: &str,
+    stripe_idx: u64,
+    shards_per_stripe: usize,
+    map: &common::ClusterMap,
+    placement_versions: &[u8],
+) -> Vec<Vec<common::MinerNode>> {
+    let mut per_shard = vec![Vec::new(); shards_per_stripe];
+    for version in placement_versions {
+        if let Ok(miners) = common::calculate_stripe_placement(
+            file_hash,
+            stripe_idx,
+            shards_per_stripe,
+            map,
+            *version,
+        ) {
+            for (local_idx, miner) in miners.into_iter().enumerate() {
+                if !per_shard[local_idx]
+                    .iter()
+                    .any(|candidate: &common::MinerNode| candidate.uid == miner.uid)
+                {
+                    per_shard[local_idx].push(miner);
+                }
+            }
+        }
+    }
+    per_shard
+}
+
 /// Fetch a cluster map for a specific epoch from the validator via the
 /// `hippius/gateway-control` ALPN (which handles `GetClusterMapEpoch`).
 /// Returns `None` if the validator cannot serve the requested epoch.
@@ -703,6 +736,8 @@ async fn tally_manifest_shards(
 ) {
     let shards_per_stripe = manifest.stripe_config.k + manifest.stripe_config.m;
     let num_stripes = manifest.shards.len().div_ceil(shards_per_stripe);
+    let placement_versions_to_try =
+        repair_placement_versions_to_try(manifest.placement_version);
 
     for stripe_idx in 0..num_stripes {
         let stripe_miners = match common::calculate_stripe_placement(
@@ -737,16 +772,15 @@ async fn tally_manifest_shards(
             // Check historical epoch placements (epoch lookback)
             let mine_historical = if !mine_current {
                 history_maps.iter().any(|hist_map| {
-                    common::calculate_stripe_placement(
+                    stripe_candidates_for_versions(
                         file_hash,
                         stripe_idx as u64,
                         shards_per_stripe,
                         hist_map,
-                        manifest.placement_version,
+                        &placement_versions_to_try,
                     )
-                    .ok()
-                    .and_then(|miners| miners.get(local_idx).cloned())
-                    .is_some_and(|m| m.uid == my_uid)
+                    .get(local_idx)
+                    .is_some_and(|miners| miners.iter().any(|m| m.uid == my_uid))
                 })
             } else {
                 false
@@ -757,16 +791,15 @@ async fn tally_manifest_shards(
             // than the EPOCH_LOOKBACK window.
             let mine_placement = if !mine_current && !mine_historical {
                 match placement_epoch_maps.get(&manifest.placement_epoch) {
-                    Some(pe_map) => common::calculate_stripe_placement(
+                    Some(pe_map) => stripe_candidates_for_versions(
                         file_hash,
                         stripe_idx as u64,
                         shards_per_stripe,
                         pe_map,
-                        manifest.placement_version,
+                        &placement_versions_to_try,
                     )
-                    .ok()
-                    .and_then(|miners| miners.get(local_idx).cloned())
-                    .is_some_and(|m| m.uid == my_uid),
+                    .get(local_idx)
+                    .is_some_and(|miners| miners.iter().any(|m| m.uid == my_uid)),
                     // Placement epoch map unavailable (validator couldn't serve
                     // it or was unreachable).  Assume ownership — false retention
                     // is safe; false deletion is data loss.
@@ -798,20 +831,24 @@ async fn tally_manifest_shards(
                         // Historical placements: the miner that held this
                         // position in a previous epoch likely still has it.
                         for hist_map in history_maps {
-                            if let Ok(hist_miners) = common::calculate_stripe_placement(
+                            for m in stripe_candidates_for_versions(
                                 file_hash,
                                 stripe_idx as u64,
                                 shards_per_stripe,
                                 hist_map,
-                                manifest.placement_version,
+                                &placement_versions_to_try,
                             )
-                                && let Some(m) = hist_miners.get(local_idx)
-                                    && m.uid != my_uid
-                                        && let Some(addr) =
-                                            crate::state::socket_addr_from_endpoint(&m.endpoint)
-                                        {
-                                            peers.push((m.endpoint.id.to_string(), addr));
-                                        }
+                            .get(local_idx)
+                            .into_iter()
+                            .flatten()
+                            {
+                                if m.uid != my_uid
+                                    && let Some(addr) =
+                                        crate::state::socket_addr_from_endpoint(&m.endpoint)
+                                {
+                                    peers.push((m.endpoint.id.to_string(), addr));
+                                }
+                            }
                         }
                         // Current placement peers at the SAME stripe position
                         // in other stripes won't help (different shard), but
@@ -1333,20 +1370,20 @@ pub async fn reconstruct_shard(
                 None => return Ok(false),
             }
         };
+        let placement_versions_to_try =
+            repair_placement_versions_to_try(manifest.placement_version);
 
-        let stripe_miners = match common::calculate_stripe_placement(
+        let stripe_candidates = stripe_candidates_for_versions(
             &manifest.file_hash,
             stripe_index,
             shards_per_stripe,
             &cluster_map,
-            manifest.placement_version,
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(error = %e, "[REBALANCE] Failed to calculate stripe placement for reconstruction");
-                return Ok(false);
-            }
-        };
+            &placement_versions_to_try,
+        );
+        if stripe_candidates.iter().all(|candidates| candidates.is_empty()) {
+            warn!("[REBALANCE] Failed to calculate stripe placement for reconstruction");
+            return Ok(false);
+        }
 
         let connect_timeout =
             std::time::Duration::from_secs(crate::constants::RECONSTRUCT_PEER_CONNECT_TIMEOUT_SECS);
@@ -1361,66 +1398,60 @@ pub async fn reconstruct_shard(
                 continue;
             }
 
-            // Get the miner assigned to this shard via CRUSH
-            let miner = match stripe_miners.get(i) {
-                Some(m) => m,
-                None => continue,
-            };
+            for miner in stripe_candidates.get(i).into_iter().flatten() {
+                let peer_addr = match crate::state::socket_addr_from_endpoint(&miner.endpoint) {
+                    Some(a) => a,
+                    None => continue,
+                };
+                let peer_node_id = miner.endpoint.id.to_string();
 
-            // Extract direct socket address (skip if none)
-            let peer_addr = match crate::state::socket_addr_from_endpoint(&miner.endpoint) {
-                Some(a) => a,
-                None => continue,
-            };
-            let peer_node_id = miner.endpoint.id.to_string();
+                let _permit = match fetch_sem.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
 
-            // Acquire fetch semaphore permit (bounds concurrency)
-            let _permit = match fetch_sem.clone().try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            // Connect and fetch via FetchBlob P2P protocol
-            let conn = match tokio::time::timeout(
-                connect_timeout,
-                crate::state::get_pooled_connection(endpoint, &peer_node_id, peer_addr),
-            )
-            .await
-            {
-                Ok(Ok(c)) => c,
-                _ => continue,
-            };
-
-            let request = common::MinerControlMessage::FetchBlob {
-                hash: shard_info.blob_hash.clone(),
-            };
-            let request_bytes = match serde_json::to_vec(&request) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-
-            let fetch_result: Result<Option<Vec<u8>>> = async {
-                let (mut send, mut recv) = conn.open_bi().await?;
-                send.write_all(&request_bytes).await?;
-                send.finish()?;
-                let response = tokio::time::timeout(
-                    read_timeout,
-                    recv.read_to_end(crate::constants::MAX_FETCH_RESPONSE_SIZE),
+                let conn = match tokio::time::timeout(
+                    connect_timeout,
+                    crate::state::get_pooled_connection(endpoint, &peer_node_id, peer_addr),
                 )
                 .await
-                .map_err(|_| anyhow::anyhow!("Read timeout"))??;
+                {
+                    Ok(Ok(c)) => c,
+                    _ => continue,
+                };
 
-                if response.starts_with(b"DATA:") {
-                    Ok(Some(response[5..].to_vec()))
-                } else {
-                    Ok(None)
+                let request = common::MinerControlMessage::FetchBlob {
+                    hash: shard_info.blob_hash.clone(),
+                };
+                let request_bytes = match serde_json::to_vec(&request) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+
+                let fetch_result: Result<Option<Vec<u8>>> = async {
+                    let (mut send, mut recv) = conn.open_bi().await?;
+                    send.write_all(&request_bytes).await?;
+                    send.finish()?;
+                    let response = tokio::time::timeout(
+                        read_timeout,
+                        recv.read_to_end(crate::constants::MAX_FETCH_RESPONSE_SIZE),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Read timeout"))??;
+
+                    if response.starts_with(b"DATA:") {
+                        Ok(Some(response[5..].to_vec()))
+                    } else {
+                        Ok(None)
+                    }
                 }
-            }
-            .await;
+                .await;
 
-            if let Ok(Some(data)) = fetch_result {
-                shard_data[i] = Some(data);
-                available_count += 1;
+                if let Ok(Some(data)) = fetch_result {
+                    shard_data[i] = Some(data);
+                    available_count += 1;
+                    break;
+                }
             }
         }
     }
@@ -1650,5 +1681,15 @@ async fn perform_erasure_recovery(
             error!(error = %e, "[REBALANCE] Erasure decode failed");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::repair_placement_versions_to_try;
+
+    #[test]
+    fn test_miner_repair_probes_fallback_versions_for_mistagged_v3_manifests() {
+        assert_eq!(repair_placement_versions_to_try(3), vec![3, 2, 1]);
     }
 }
