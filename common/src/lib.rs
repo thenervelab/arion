@@ -396,7 +396,7 @@ impl ClusterMap {
     }
 
     /// Computes the deterministic Blake3 hash of this ClusterMap.
-    /// Note: The `signature` field is EXCLUDED from the hash, 
+    /// Note: The `signature` field is EXCLUDED from the hash,
     /// otherwise signing it would change the hash, invalidating the signature!
     pub fn compute_hash(&self) -> String {
         let mut clone = self.clone();
@@ -850,6 +850,15 @@ pub enum MinerControlMessage {
     /// The receiver must stream and not buffer everything in memory (miners
     /// may hold millions of blobs).
     ListAllBlobs,
+    /// Request ONE bounded keyset page of blob hashes (resumable inventory
+    /// scans). Response uses the same wire format as `ListAllBlobs`
+    /// (`{"count":N}` header + N hash lines + EOF) but for a single page:
+    /// hashes strictly greater than `after_hash`, ascending, at most
+    /// `limit` (server-clamped). An empty page means the scan is complete.
+    ListBlobsPage {
+        after_hash: Option<String>,
+        limit: u32,
+    },
 }
 
 /// Magic byte for StoreV2 binary framing protocol.
@@ -2554,9 +2563,10 @@ pub fn calculate_pg_placement(
         let mut upmap_miners = Vec::new();
         for &uid in upmap_uids {
             if let Some(miner) = map.miners.iter().find(|m| m.uid == uid)
-                && !miner.draining {
-                    upmap_miners.push(miner.clone());
-                }
+                && !miner.draining
+            {
+                upmap_miners.push(miner.clone());
+            }
         }
         if upmap_miners.len() >= shards_per_file {
             upmap_miners.truncate(shards_per_file);
@@ -2624,9 +2634,10 @@ pub fn calculate_pg_placement_straw2(
         let mut upmap_miners = Vec::new();
         for &uid in upmap_uids {
             if let Some(miner) = map.miners.iter().find(|m| m.uid == uid)
-                && !miner.draining {
-                    upmap_miners.push(miner.clone());
-                }
+                && !miner.draining
+            {
+                upmap_miners.push(miner.clone());
+            }
         }
         if upmap_miners.len() >= shards_per_file {
             upmap_miners.truncate(shards_per_file);
@@ -2737,7 +2748,6 @@ pub fn get_placement_probing_sequence(tagged_version: u8) -> Vec<u8> {
     sequence.dedup();
     sequence
 }
-
 
 /// Calculate stripe placement with fallback candidates per shard.
 ///
@@ -3057,9 +3067,10 @@ pub fn calculate_pg_placement_uids(
         let mut valid_uids = Vec::new();
         for &uid in upmap_uids {
             if let Some(miner) = map_ref.miners.iter().find(|m| m.uid == uid)
-                && !miner.draining {
-                    valid_uids.push(uid);
-                }
+                && !miner.draining
+            {
+                valid_uids.push(uid);
+            }
         }
         if valid_uids.len() >= shards_per_file {
             valid_uids.truncate(shards_per_file);
@@ -3083,9 +3094,10 @@ pub fn calculate_pg_placement_uids_straw2(
         let mut valid_uids = Vec::new();
         for &uid in upmap_uids {
             if let Some(miner) = map.miners.iter().find(|m| m.uid == uid)
-                && !miner.draining {
-                    valid_uids.push(uid);
-                }
+                && !miner.draining
+            {
+                valid_uids.push(uid);
+            }
         }
         if valid_uids.len() >= shards_per_file {
             valid_uids.truncate(shards_per_file);

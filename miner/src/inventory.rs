@@ -66,13 +66,17 @@ pub fn stream_all_hashes(tx: tokio::sync::mpsc::Sender<String>) -> Result<usize>
     };
 
     tokio::task::spawn_blocking(move || {
-        let mut offset = 0;
+        // Keyset pagination on the PK index: O(log n) per batch regardless
+        // of depth. The previous OFFSET loop re-skipped from the start on
+        // every batch — minutes of SQL for multi-million-blob inventories,
+        // which made validator-side scans time out.
+        let mut after_hash = String::new();
         let batch_size = 10_000;
         loop {
             let hashes: Vec<String> = {
                 let conn = db().lock().unwrap_or_else(|e| e.into_inner());
                 let mut stmt = match conn
-                    .prepare("SELECT hash FROM shards ORDER BY hash LIMIT ?1 OFFSET ?2")
+                    .prepare("SELECT hash FROM shards WHERE hash > ?1 ORDER BY hash LIMIT ?2")
                 {
                     Ok(s) => s,
                     Err(e) => {
@@ -80,7 +84,7 @@ pub fn stream_all_hashes(tx: tokio::sync::mpsc::Sender<String>) -> Result<usize>
                         break;
                     }
                 };
-                match stmt.query_map(rusqlite::params![batch_size, offset], |row| row.get(0)) {
+                match stmt.query_map(rusqlite::params![after_hash, batch_size], |row| row.get(0)) {
                     Ok(rows) => {
                         let mut batch = Vec::with_capacity(batch_size as usize);
                         for h in rows.flatten() {
@@ -98,7 +102,9 @@ pub fn stream_all_hashes(tx: tokio::sync::mpsc::Sender<String>) -> Result<usize>
             if hashes.is_empty() {
                 break;
             }
-            offset += hashes.len() as i64;
+            if let Some(last) = hashes.last() {
+                after_hash = last.clone();
+            }
 
             for hash in hashes {
                 if tx.blocking_send(hash).is_err() {
@@ -110,6 +116,18 @@ pub fn stream_all_hashes(tx: tokio::sync::mpsc::Sender<String>) -> Result<usize>
     });
 
     Ok(count)
+}
+
+/// One keyset page of hashes for `ListBlobsPage`.
+pub fn list_hashes_page(after_hash: Option<&str>, limit: usize) -> Result<Vec<String>> {
+    let conn = db().lock().unwrap_or_else(|e| e.into_inner());
+    let mut stmt =
+        conn.prepare("SELECT hash FROM shards WHERE hash > ?1 ORDER BY hash LIMIT ?2")?;
+    let rows = stmt.query_map(
+        rusqlite::params![after_hash.unwrap_or(""), limit as i64],
+        |row| row.get(0),
+    )?;
+    Ok(rows.flatten().collect())
 }
 
 /// Populate the inventory from the filesystem if the DB is empty.
