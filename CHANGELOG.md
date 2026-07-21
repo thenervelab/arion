@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.25] - 2026-07-21
+
+### Miner
+
+- **Keyset inventory pagination**: `stream_all_hashes` now pages its SQLite
+  inventory with keyset pagination (`WHERE hash > ? ORDER BY hash`) instead of
+  `LIMIT/OFFSET` — O(log n) per batch. Fixes validator-side inventory scans
+  timing out on multi-million-blob inventories (OFFSET was O(n²) over depth).
+- **New `ListBlobsPage` control message**: serves ONE bounded keyset page of
+  blob hashes per request (limit clamped to 200k). Enables resumable,
+  per-page-bounded inventory scans; per-request miner cost is a single
+  indexed range query.
+
+### Common
+
+- **v3 (straw2) placement now auto-filters draining miners**, matching v1/v2
+  and the validator write path. Fixes miner self-rebalance (and any caller
+  passing a raw cluster map) converging shards toward a placement the writer
+  never used whenever draining miners existed.
+
 ## [0.1.9] - 2026-03-06
 
 ### Miner

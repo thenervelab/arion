@@ -394,6 +394,9 @@ async fn handle_single_stream(
         common::MinerControlMessage::ListAllBlobs => {
             handle_list_all_blobs(&mut send, &handler.store).await?;
         }
+        common::MinerControlMessage::ListBlobsPage { after_hash, limit } => {
+            handle_list_blobs_page(&mut send, after_hash.as_deref(), limit).await?;
+        }
         common::MinerControlMessage::StoreV2 { .. } => {
             warn!("Received raw JSON StoreV2 message (not V2-framed), rejecting");
             send_response(&mut send, b"ERROR: StoreV2 requires binary framing").await?;
@@ -588,6 +591,33 @@ async fn handle_check_blob(
     } else {
         send_response(send, b"HAS:false").await
     }
+}
+
+/// Serve ONE bounded keyset page of blob hashes (resumable inventory scans).
+/// Same wire format as `ListAllBlobs` but for a single page — the miner-side
+/// cost is one indexed SQLite range query, bounded by the clamped limit.
+async fn handle_list_blobs_page(
+    send: &mut quinn::SendStream,
+    after_hash: Option<&str>,
+    limit: u32,
+) -> Result<()> {
+    // Cap a page at ~13 MB of wire data so a single response stays cheap
+    // for the miner regardless of what the caller asks for.
+    const MAX_PAGE: u32 = 200_000;
+    let limit = limit.clamp(1, MAX_PAGE) as usize;
+    let after = after_hash.map(str::to_string);
+    let hashes = tokio::task::spawn_blocking(move || {
+        crate::inventory::list_hashes_page(after.as_deref(), limit)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("page task join: {e}"))??;
+    let header = format!("{{\"count\":{}}}\n", hashes.len());
+    send.write_all(header.as_bytes()).await?;
+    for hash in hashes {
+        send.write_all(hash.as_bytes()).await?;
+        send.write_all(b"\n").await?;
+    }
+    finish_stream(send).await
 }
 
 /// Stream all stored blob hashes to the requester.
@@ -1228,17 +1258,17 @@ pub async fn handle_state_sync_request(conn: quinn::Connection) -> anyhow::Resul
     recv.read_exact(&mut req_bytes).await?;
 
     let req: P2PStateSyncRequest = serde_json::from_slice(&req_bytes)?;
-    
+
     let archive_dir = match crate::state::get_data_dir() {
         Some(dir) => dir.join("epoch_archive"),
         None => anyhow::bail!("Data dir not set"),
     };
 
     let mut current_epoch = req.start_epoch;
-    
+
     loop {
         let file_path = archive_dir.join(format!("epoch_{}.json", current_epoch));
-        
+
         let bytes = match tokio::fs::read(&file_path).await {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
@@ -1249,16 +1279,16 @@ pub async fn handle_state_sync_request(conn: quinn::Connection) -> anyhow::Resul
         header.extend_from_slice(&0x594E4353u32.to_be_bytes()); // "SYNC"
         header.extend_from_slice(&current_epoch.to_be_bytes());
         header.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-        
+
         send.write_all(&header).await?;
         send.write_all(&bytes).await?;
-        
+
         current_epoch += 1;
     }
 
     send.write_all(&0x454F4621u32.to_be_bytes()).await?; // "EOF!"
     send.finish()?;
-    
+
     Ok(())
 }
 
@@ -1286,12 +1316,14 @@ pub fn get_state_sync_client_endpoint() -> anyhow::Result<&'static quinn::Endpoi
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
     let quic_client_config = quinn::crypto::rustls::QuicClientConfig::try_from(client_config)?;
     let mut client_config = quinn::ClientConfig::new(std::sync::Arc::new(quic_client_config));
-    
+
     let mut transport_config = quinn::TransportConfig::default();
-    transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(300).try_into().unwrap()));
+    transport_config.max_idle_timeout(Some(
+        std::time::Duration::from_secs(300).try_into().unwrap(),
+    ));
     transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
     client_config.transport_config(std::sync::Arc::new(transport_config));
-    
+
     endpoint.set_default_client_config(client_config);
 
     let _ = STATE_SYNC_ENDPOINT.set(endpoint);

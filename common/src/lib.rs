@@ -396,7 +396,7 @@ impl ClusterMap {
     }
 
     /// Computes the deterministic Blake3 hash of this ClusterMap.
-    /// Note: The `signature` field is EXCLUDED from the hash, 
+    /// Note: The `signature` field is EXCLUDED from the hash,
     /// otherwise signing it would change the hash, invalidating the signature!
     pub fn compute_hash(&self) -> String {
         let mut clone = self.clone();
@@ -850,6 +850,15 @@ pub enum MinerControlMessage {
     /// The receiver must stream and not buffer everything in memory (miners
     /// may hold millions of blobs).
     ListAllBlobs,
+    /// Request ONE bounded keyset page of blob hashes (resumable inventory
+    /// scans). Response uses the same wire format as `ListAllBlobs`
+    /// (`{"count":N}` header + N hash lines + EOF) but for a single page:
+    /// hashes strictly greater than `after_hash`, ascending, at most
+    /// `limit` (server-clamped). An empty page means the scan is complete.
+    ListBlobsPage {
+        after_hash: Option<String>,
+        limit: u32,
+    },
 }
 
 /// Magic byte for StoreV2 binary framing protocol.
@@ -2554,9 +2563,10 @@ pub fn calculate_pg_placement(
         let mut upmap_miners = Vec::new();
         for &uid in upmap_uids {
             if let Some(miner) = map.miners.iter().find(|m| m.uid == uid)
-                && !miner.draining {
-                    upmap_miners.push(miner.clone());
-                }
+                && !miner.draining
+            {
+                upmap_miners.push(miner.clone());
+            }
         }
         if upmap_miners.len() >= shards_per_file {
             upmap_miners.truncate(shards_per_file);
@@ -2620,13 +2630,23 @@ pub fn calculate_pg_placement_straw2(
     shards_per_file: usize,
     map: &ClusterMap,
 ) -> Result<Vec<MinerNode>, String> {
+    // Auto-filter draining miners — see calculate_pg_placement_uids_straw2
+    // for why v3 must compute on the same filtered set as the write path.
+    let filtered_owned: Option<ClusterMap>;
+    let map = if map.miners.iter().any(|m| m.draining) {
+        filtered_owned = Some(filter_map_for_placement(map));
+        filtered_owned.as_ref().unwrap()
+    } else {
+        map
+    };
     if let Some(upmap_uids) = map.pg_upmap.get(&pg_id) {
         let mut upmap_miners = Vec::new();
         for &uid in upmap_uids {
             if let Some(miner) = map.miners.iter().find(|m| m.uid == uid)
-                && !miner.draining {
-                    upmap_miners.push(miner.clone());
-                }
+                && !miner.draining
+            {
+                upmap_miners.push(miner.clone());
+            }
         }
         if upmap_miners.len() >= shards_per_file {
             upmap_miners.truncate(shards_per_file);
@@ -2648,11 +2668,8 @@ pub fn calculate_pg_placement_for_stripe_straw2(
     shards_per_stripe: usize,
     map: &ClusterMap,
 ) -> Result<Vec<MinerNode>, String> {
-    if map.miners.iter().any(|m| m.draining) {
-        tracing::error!(
-            "CRUSH placement called with an unfiltered map containing draining miners! Callers MUST pre-filter the map with common::filter_map_for_placement"
-        );
-    }
+    // Raw maps are valid input: calculate_pg_placement_straw2 auto-filters
+    // draining miners so all callers compute the write-path placement.
     let pg_id = calculate_pg(file_hash, map.pg_count)?;
     let mut miners = calculate_pg_placement_straw2(pg_id, shards_per_stripe, map)?;
 
@@ -2688,7 +2705,8 @@ pub fn calculate_stripe_placement(
     placement_version: u8,
 ) -> Result<Vec<MinerNode>, String> {
     // Versions 1 and 2 require filtering draining nodes for backward compatibility.
-    // Version 3 (straw2) uses the full map to maintain determinism during reconstruction.
+    // All versions compute placement on the draining-filtered miner set —
+    // v1/v2 are filtered here; v3 auto-filters inside calculate_pg_placement_straw2.
     let filtered_map_owned: Option<ClusterMap>;
     let map_ref = if (placement_version == 1 || placement_version == 2)
         && map.miners.iter().any(|m| m.draining)
@@ -2737,7 +2755,6 @@ pub fn get_placement_probing_sequence(tagged_version: u8) -> Vec<u8> {
     sequence.dedup();
     sequence
 }
-
 
 /// Calculate stripe placement with fallback candidates per shard.
 ///
@@ -3057,9 +3074,10 @@ pub fn calculate_pg_placement_uids(
         let mut valid_uids = Vec::new();
         for &uid in upmap_uids {
             if let Some(miner) = map_ref.miners.iter().find(|m| m.uid == uid)
-                && !miner.draining {
-                    valid_uids.push(uid);
-                }
+                && !miner.draining
+            {
+                valid_uids.push(uid);
+            }
         }
         if valid_uids.len() >= shards_per_file {
             valid_uids.truncate(shards_per_file);
@@ -3077,15 +3095,28 @@ pub fn calculate_pg_placement_uids_straw2(
     shards_per_file: usize,
     map: &ClusterMap,
 ) -> Result<Vec<u32>, String> {
-    // v3 logic (straw2) does NOT filter draining miners to ensure deterministic
-    // reconstruction even as miners transition to draining.
+    // Auto-filter draining miners so EVERY caller (validator write path,
+    // gateway reads, arion-worker rebalance/recovery, miner self-rebalance)
+    // computes the identical placement. v3 previously used the raw map "for
+    // deterministic reconstruction", but the write path pre-filters — so
+    // unfiltered movers/readers converged data toward a placement the writer
+    // never used. Determinism across drain transitions comes from historical
+    // epoch maps, not from keeping draining miners in the CRUSH input.
+    let filtered_owned: Option<ClusterMap>;
+    let map = if map.miners.iter().any(|m| m.draining) {
+        filtered_owned = Some(filter_map_for_placement(map));
+        filtered_owned.as_ref().unwrap()
+    } else {
+        map
+    };
     if let Some(upmap_uids) = map.pg_upmap.get(&pg_id) {
         let mut valid_uids = Vec::new();
         for &uid in upmap_uids {
             if let Some(miner) = map.miners.iter().find(|m| m.uid == uid)
-                && !miner.draining {
-                    valid_uids.push(uid);
-                }
+                && !miner.draining
+            {
+                valid_uids.push(uid);
+            }
         }
         if valid_uids.len() >= shards_per_file {
             valid_uids.truncate(shards_per_file);
