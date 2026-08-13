@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.26] - 2026-08-13
+
+### Miner
+
+- **Two-phase deletes (trash)**: `Delete` now renames blobs into a local
+  `trash/` directory instead of unlinking. Trashed blobs stop being listed,
+  served, or counted against the quota, but stay restorable for
+  `TRASH_TTL_SECS` (default 14 days, cap `TRASH_MAX_BYTES`, opt out with
+  `TRASH_ENABLED=false`). A background loop purges expired entries; the
+  SQLite inventory carries the retention clock (`trashed_at`) and is
+  reconciled with the trash directory at startup.
+- **New `RestoreBlob` control message** (validator-signed, like `Delete`):
+  brings a trashed blob back into the live store with no data transfer —
+  a wrongly deleted shard can be repopulated instantly instead of waiting
+  for a full repair.
+
 ## [0.1.25] - 2026-07-21
 
 ### Miner

@@ -487,6 +487,10 @@ async fn run_miner(cli: Cli) -> Result<()> {
             "inventory: rebuilt from filesystem on startup"
         );
     }
+    // Align the trash directory with the DB retention clocks.
+    if let Err(e) = inventory::reconcile_trash(&store).await {
+        warn!(error = %e, "inventory: trash reconciliation failed");
+    }
 
     // 3. Resolve validator address
     let validator_node_id_str = validator_node_id.ok_or_else(|| {
@@ -553,7 +557,25 @@ async fn run_miner(cli: Cli) -> Result<()> {
         fetch_sem: Arc::new(tokio::sync::Semaphore::new(fetch_concurrency)),
         pos_sem: Arc::new(tokio::sync::Semaphore::new(pos_concurrency)),
         validator_node_id: Some(validator_node_id_str.clone()),
+        trash_enabled: config.storage.trash_enabled,
     };
+
+    // Trash retention: purge blobs past the TTL, keep total trash under the
+    // size cap (0 = auto: 10% of the quota, or 100 GiB when unlimited).
+    if config.storage.trash_enabled {
+        let cap = if config.storage.trash_max_bytes > 0 {
+            config.storage.trash_max_bytes
+        } else if config.storage.max_storage_gb > 0 {
+            config.storage.max_storage_gb * 1024 * 1024 * 1024 / 10
+        } else {
+            100 * 1024 * 1024 * 1024
+        };
+        tokio::spawn(inventory::trash_purge_loop(
+            Arc::clone(&store),
+            config.storage.trash_ttl_secs,
+            cap,
+        ));
+    }
 
     // Spawn quinn accept loop (replaces iroh Router)
     let accept_endpoint = endpoint.clone();
