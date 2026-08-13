@@ -166,6 +166,29 @@ pub struct StorageConfig {
     /// Data directory for keypair and state
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
+
+    /// Two-phase deletes: deleted shards go to a local trash and stay
+    /// restorable until the retention window elapses (false = permanent
+    /// delete immediately, the previous behavior)
+    #[serde(default = "default_trash_enabled")]
+    pub trash_enabled: bool,
+
+    /// How long a trashed shard stays restorable, in seconds
+    #[serde(default = "default_trash_ttl_secs")]
+    pub trash_ttl_secs: u64,
+
+    /// Cap on total trash size in bytes; oldest entries are purged beyond
+    /// it (0 = auto: 10% of max_storage_gb, or 100 GiB when unlimited)
+    #[serde(default)]
+    pub trash_max_bytes: u64,
+}
+
+fn default_trash_enabled() -> bool {
+    true
+}
+
+fn default_trash_ttl_secs() -> u64 {
+    14 * 86_400
 }
 
 impl Default for StorageConfig {
@@ -174,6 +197,9 @@ impl Default for StorageConfig {
             path: default_storage_path(),
             max_storage_gb: 0,
             data_dir: default_data_dir(),
+            trash_enabled: default_trash_enabled(),
+            trash_ttl_secs: default_trash_ttl_secs(),
+            trash_max_bytes: 0,
         }
     }
 }
@@ -275,6 +301,9 @@ impl MinerConfig {
             config.storage.path = val;
         }
         env_parse("MAX_STORAGE_GB", &mut config.storage.max_storage_gb);
+        env_parse("TRASH_ENABLED", &mut config.storage.trash_enabled);
+        env_parse("TRASH_TTL_SECS", &mut config.storage.trash_ttl_secs);
+        env_parse("TRASH_MAX_BYTES", &mut config.storage.trash_max_bytes);
 
         // Validator overrides
         env_string_opt("VALIDATOR_NODE_ID", &mut config.validator.node_id);

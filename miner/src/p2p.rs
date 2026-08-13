@@ -132,6 +132,9 @@ pub struct MinerControlHandler {
     pub fetch_sem: Arc<tokio::sync::Semaphore>,
     pub pos_sem: Arc<tokio::sync::Semaphore>,
     pub validator_node_id: Option<String>,
+    /// Two-phase deletes: Delete moves blobs to the local trash instead of
+    /// unlinking, keeping them restorable via RestoreBlob until purge.
+    pub trash_enabled: bool,
 }
 
 /// Handle incoming miner control messages on a quinn connection.
@@ -309,6 +312,21 @@ async fn handle_single_stream(
             validator_signature,
         } => {
             handle_delete(
+                remote_node_id,
+                handler.validator_node_id.as_deref(),
+                &mut send,
+                &handler.store,
+                handler.trash_enabled,
+                hash,
+                validator_signature,
+            )
+            .await?;
+        }
+        common::MinerControlMessage::RestoreBlob {
+            hash,
+            validator_signature,
+        } => {
+            handle_restore_blob(
                 remote_node_id,
                 handler.validator_node_id.as_deref(),
                 &mut send,
@@ -499,9 +517,13 @@ async fn handle_store(
         truncate_for_log(remote_node_id, 12),
     );
 
-    // Track in persistent inventory
+    // Track in persistent inventory (clears any pending trash mark)
     if let Err(e) = crate::inventory::insert_shard(&hash) {
         warn!(hash = %hash, error = %e, "inventory: failed to insert shard");
+    }
+    // A re-stored blob supersedes any trashed copy — drop the duplicate.
+    if handler.store.has_trashed(&hash) {
+        handler.store.purge_trashed(&hash).await.ok();
     }
 
     // Send ACK and wait for remote to receive it
@@ -513,6 +535,7 @@ async fn handle_delete(
     validator_node_id: Option<&str>,
     send: &mut quinn::SendStream,
     store: &FlatBlobStore,
+    trash_enabled: bool,
     hash: String,
     validator_signature: Vec<u8>,
 ) -> Result<()> {
@@ -549,26 +572,47 @@ async fn handle_delete(
         }
     };
 
-    // Delete the blob file directly
-    match store.delete(&hash).await {
-        Ok(()) => {
-            trace!(
-                hash = %truncate_for_log(&hash, 32),
-                "Delete complete: removed blob file"
-            );
+    // Two-phase by default: move to trash (restorable until the retention
+    // window elapses) and keep the inventory row with its trash mark so the
+    // purge loop has a clock. Hard delete only when the trash is disabled.
+    if trash_enabled {
+        match store.delete(&hash).await {
+            Ok(()) => {
+                trace!(
+                    hash = %truncate_for_log(&hash, 32),
+                    "Delete complete: blob moved to trash"
+                );
+            }
+            Err(e) => {
+                error!(
+                    hash = %truncate_for_log(&hash, 32),
+                    error = %e,
+                    "Delete: failed to move blob to trash"
+                );
+            }
         }
-        Err(e) => {
-            error!(
-                hash = %truncate_for_log(&hash, 32),
-                error = %e,
-                "Delete: failed to remove file"
-            );
+        if let Err(e) = crate::inventory::trash_shard(&hash) {
+            warn!(hash = %hash, error = %e, "inventory: failed to mark shard trashed");
         }
-    }
-
-    // Remove from persistent inventory
-    if let Err(e) = crate::inventory::delete_shard(&hash) {
-        warn!(hash = %hash, error = %e, "inventory: failed to delete shard");
+    } else {
+        match store.remove(&hash).await {
+            Ok(()) => {
+                trace!(
+                    hash = %truncate_for_log(&hash, 32),
+                    "Delete complete: removed blob file"
+                );
+            }
+            Err(e) => {
+                error!(
+                    hash = %truncate_for_log(&hash, 32),
+                    error = %e,
+                    "Delete: failed to remove file"
+                );
+            }
+        }
+        if let Err(e) = crate::inventory::delete_shard(&hash) {
+            warn!(hash = %hash, error = %e, "inventory: failed to delete shard");
+        }
     }
 
     // Invalidate caches to prevent serving stale data
@@ -577,6 +621,65 @@ async fn handle_delete(
 
     // Send ACK
     send_response(send, b"OK").await
+}
+
+/// Bring a trashed blob back into the live store on validator command.
+/// Idempotent: an already-live blob answers `OK:PRESENT`.
+async fn handle_restore_blob(
+    remote_node_id: &str,
+    validator_node_id: Option<&str>,
+    send: &mut quinn::SendStream,
+    store: &FlatBlobStore,
+    hash: String,
+    validator_signature: Vec<u8>,
+) -> Result<()> {
+    let is_authorized = if let Some(val_node_id) = validator_node_id {
+        let message_to_sign = format!("RESTORE:{}", hash);
+        let sig_array = <[u8; 64]>::try_from(validator_signature.as_slice()).unwrap_or([0; 64]);
+        verify_signature(val_node_id, message_to_sign.as_bytes(), &sig_array)
+    } else {
+        false
+    };
+
+    if !is_authorized {
+        error!(
+            remote = %remote_node_id,
+            validator = ?validator_node_id,
+            "RestoreBlob rejected: invalid validator signature"
+        );
+        return send_response(send, b"ERROR: UNAUTHORIZED").await;
+    }
+
+    if store.has(&hash) {
+        // Already live; clear any stale trash mark.
+        if let Err(e) = crate::inventory::insert_shard(&hash) {
+            warn!(hash = %hash, error = %e, "inventory: failed to re-mark shard live");
+        }
+        return send_response(send, b"OK:PRESENT").await;
+    }
+
+    match store.restore(&hash).await {
+        Ok(true) => {
+            if let Err(e) = crate::inventory::insert_shard(&hash) {
+                warn!(hash = %hash, error = %e, "inventory: failed to re-insert restored shard");
+            }
+            info!(
+                hash = %truncate_for_log(&hash, 32),
+                authorized_by = ?validator_node_id,
+                "RestoreBlob: blob restored from trash"
+            );
+            send_response(send, b"OK:RESTORED").await
+        }
+        Ok(false) => send_response(send, b"NOT_FOUND").await,
+        Err(e) => {
+            error!(
+                hash = %truncate_for_log(&hash, 32),
+                error = %e,
+                "RestoreBlob: restore failed"
+            );
+            send_response(send, b"ERROR: restore failed").await
+        }
+    }
 }
 
 async fn handle_check_blob(

@@ -779,6 +779,16 @@ pub enum MinerControlMessage {
         /// Ed25519 signature from the Validator (or authorized Gateway) over `"DELETE:{hash}"`
         validator_signature: Vec<u8>,
     },
+    /// Bring a previously deleted shard back from the miner's local trash.
+    /// Deletes are two-phase on the miner (trash + retention window), so a
+    /// wrongly deleted shard can be repopulated without any data transfer.
+    /// Responses: `OK:RESTORED`, `OK:PRESENT` (already live), `NOT_FOUND`.
+    RestoreBlob {
+        /// BLAKE3 hash of the shard to restore
+        hash: String,
+        /// Ed25519 signature from the Validator over `"RESTORE:{hash}"`
+        validator_signature: Vec<u8>,
+    },
     /// Fetch a blob by hash (Gateway → Miner)
     FetchBlob {
         /// BLAKE3 hash of the requested shard
