@@ -16,6 +16,24 @@ use tracing::{info, warn};
 
 static DB: OnceLock<Mutex<rusqlite::Connection>> = OnceLock::new();
 
+/// Set once the inventory reflects what is actually on disk.
+///
+/// Until then the DB may be empty or half-rebuilt, and answering
+/// `ListAllBlobs`/`ListBlobsPage` from it would report a partial holding as
+/// a *complete, successful* scan — the validator would then read the missing
+/// blobs as data loss (unfair presence penalties, spurious repair jobs).
+static INVENTORY_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the inventory can be served to the validator.
+pub fn is_ready() -> bool {
+    INVENTORY_READY.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Mark the inventory as reflecting on-disk state.
+pub fn mark_ready() {
+    INVENTORY_READY.store(true, std::sync::atomic::Ordering::Release);
+}
+
 /// Open (or create) the inventory database under `data_dir/inventory.db`.
 pub fn init_inventory(data_dir: &Path) -> Result<()> {
     let db_path = data_dir.join("inventory.db");

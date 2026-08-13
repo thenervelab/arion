@@ -704,6 +704,12 @@ async fn handle_list_blobs_page(
     after_hash: Option<&str>,
     limit: u32,
 ) -> Result<()> {
+    // A partial inventory must never be served as a complete answer: the
+    // validator would record a successful scan and read the absent blobs as
+    // data loss.
+    if !crate::inventory::is_ready() {
+        return send_response(send, b"WARMING_UP").await;
+    }
     // Cap a page at ~13 MB of wire data so a single response stays cheap
     // for the miner regardless of what the caller asks for.
     const MAX_PAGE: u32 = 200_000;
@@ -730,6 +736,9 @@ async fn handle_list_blobs_page(
 ///   2. One hash per line (lowercase hex BLAKE3), terminated with `\n`
 ///   3. Stream finished (EOF)
 async fn handle_list_all_blobs(send: &mut quinn::SendStream, store: &FlatBlobStore) -> Result<()> {
+    if !crate::inventory::is_ready() {
+        return send_response(send, b"WARMING_UP").await;
+    }
     // Read from persistent SQLite inventory (fast), fall back to FS scan on error.
     let (tx, mut rx) = tokio::sync::mpsc::channel(10_000);
 

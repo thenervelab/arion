@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.27] - 2026-08-14
+
+### Miner
+
+- **Restarts are no longer blocked by a full store walk**. `FlatBlobStore::new`
+  used to `stat` every blob to compute disk usage — a dnode read per file on
+  ZFS, so on nodes holding millions of blobs it ran for hours *after* logging
+  "Ready for P2P connections", during which the miner never registered, never
+  heartbeated and stored nothing. Sizing now runs in the background
+  (`recompute_usage`), and it only feeds storage reporting.
+- **Inventory reconciliation moved off the startup path**: the filesystem
+  rebuild and trash reconciliation run in a background task, so registration
+  and heartbeats start immediately.
+- **`ListAllBlobs` / `ListBlobsPage` answer `WARMING_UP` until the inventory
+  reflects what is on disk**, so a partial holding is never recorded as a
+  complete, successful scan (which would look like data loss to the validator).
+
 ## [0.1.26] - 2026-08-13
 
 ### Miner
