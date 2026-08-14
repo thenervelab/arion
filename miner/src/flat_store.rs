@@ -35,27 +35,21 @@ pub struct FlatBlobStore {
 impl FlatBlobStore {
     /// Create a new flat blob store, ensuring the data and trash
     /// directories exist.
+    ///
+    /// Returns immediately: usage counters start at zero and are filled in
+    /// by [`recompute_usage`](Self::recompute_usage), which the caller must
+    /// run off the startup path. Sizing used to happen here and cost one
+    /// `stat` per blob — a dnode read per file on ZFS — which took hours on
+    /// nodes holding millions of blobs, during which the miner never
+    /// registered or heartbeated.
     pub fn new(data_dir: impl AsRef<Path>) -> std::io::Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
         let trash_dir = data_dir.join(TRASH_DIR);
         std::fs::create_dir_all(&data_dir)?;
         std::fs::create_dir_all(&trash_dir)?;
 
-        let scan_dir = |dir: &Path| -> u64 {
-            let mut size = 0;
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    if let Ok(metadata) = entry.metadata()
-                        && metadata.is_file()
-                    {
-                        size += metadata.len();
-                    }
-                }
-            }
-            size
-        };
-        let initial_size = scan_dir(&data_dir);
-        let initial_trash = scan_dir(&trash_dir);
+        let initial_size = 0;
+        let initial_trash = 0;
 
         Ok(Self {
             data_dir,
@@ -63,6 +57,40 @@ impl FlatBlobStore {
             used_bytes: AtomicU64::new(initial_size),
             trash_bytes: AtomicU64::new(initial_trash),
         })
+    }
+
+    /// Walk both directories and set the usage counters.
+    ///
+    /// EXPENSIVE and blocking: one `stat` per stored blob. On ZFS that is a
+    /// dnode read each, so on a node with millions of blobs and a metadata
+    /// working set larger than ARC it is hours of random HDD reads. Never
+    /// call this on the startup path — run it from `spawn_blocking` once the
+    /// miner is already registered and serving.
+    pub fn recompute_usage(&self) {
+        let scan_dir = |dir: &Path| -> (u64, u64) {
+            let (mut bytes, mut files) = (0u64, 0u64);
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    if let Ok(metadata) = entry.metadata()
+                        && metadata.is_file()
+                    {
+                        bytes += metadata.len();
+                        files += 1;
+                    }
+                }
+            }
+            (bytes, files)
+        };
+        let (bytes, files) = scan_dir(&self.data_dir);
+        let (trash_bytes, _) = scan_dir(&self.trash_dir);
+        self.used_bytes.store(bytes, Ordering::Relaxed);
+        self.trash_bytes.store(trash_bytes, Ordering::Relaxed);
+        tracing::info!(
+            blobs = files,
+            used_bytes = bytes,
+            trash_bytes,
+            "storage: usage recomputed"
+        );
     }
 
     /// Path to the blob file for a given hash hex string.
@@ -310,6 +338,11 @@ mod tests {
             store.delete("gone").await.unwrap();
         }
         let reopened = FlatBlobStore::new(dir.path()).unwrap();
+        // Startup must not walk the store: counters stay at zero until the
+        // background pass runs (this is what keeps restarts instant).
+        assert_eq!(reopened.used_bytes(), 0);
+        assert_eq!(reopened.trash_bytes(), 0);
+        reopened.recompute_usage();
         assert_eq!(reopened.used_bytes(), 5);
         assert_eq!(reopened.trash_bytes(), 7);
         assert!(reopened.has("live"));

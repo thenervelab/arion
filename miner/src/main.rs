@@ -478,18 +478,45 @@ async fn run_miner(cli: Cli) -> Result<()> {
         *bd = Some(blobs_dir.clone());
     }
 
-    // Initialize persistent SQLite inventory and rebuild from FS on first run
+    // Open the inventory DB (cheap), then reconcile it with the filesystem in
+    // the BACKGROUND. Both the FS rebuild and the usage scan are O(blobs) and
+    // took hours on nodes holding millions of them; running them here meant
+    // the miner logged "Ready for P2P" and then never registered, never
+    // heartbeated and stored nothing until they finished. Until reconciliation
+    // completes the inventory answers WARMING_UP, so a partial holding is
+    // never mistaken for a successful scan.
     inventory::init_inventory(&data_dir)?;
-    let rebuilt = inventory::rebuild_from_fs(&blobs_dir)?;
-    if rebuilt > 0 {
-        info!(
-            count = rebuilt,
-            "inventory: rebuilt from filesystem on startup"
-        );
-    }
-    // Align the trash directory with the DB retention clocks.
-    if let Err(e) = inventory::reconcile_trash(&store).await {
-        warn!(error = %e, "inventory: trash reconciliation failed");
+    {
+        let store_bg = Arc::clone(&store);
+        let blobs_bg = blobs_dir.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let rebuild_dir = blobs_bg.clone();
+            match tokio::task::spawn_blocking(move || inventory::rebuild_from_fs(&rebuild_dir)).await
+            {
+                Ok(Ok(rebuilt)) if rebuilt > 0 => {
+                    info!(count = rebuilt, "inventory: rebuilt from filesystem")
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => warn!(error = %e, "inventory: FS rebuild failed"),
+                Err(e) => warn!(error = %e, "inventory: FS rebuild task panicked"),
+            }
+            if let Err(e) = inventory::reconcile_trash(&store_bg).await {
+                warn!(error = %e, "inventory: trash reconciliation failed");
+            }
+            inventory::mark_ready();
+            info!(
+                elapsed_secs = started.elapsed().as_secs(),
+                "inventory: ready to serve"
+            );
+
+            // Usage counters last: one stat per blob, pure reporting data.
+            let sizing_store = Arc::clone(&store_bg);
+            if let Err(e) = tokio::task::spawn_blocking(move || sizing_store.recompute_usage()).await
+            {
+                warn!(error = %e, "storage: usage recompute task panicked");
+            }
+        });
     }
 
     // 3. Resolve validator address
