@@ -510,6 +510,14 @@ async fn run_miner(cli: Cli) -> Result<()> {
                 "inventory: ready to serve"
             );
 
+            // Crash leftovers, then the gentle legacy->sharded migration
+            // (pure renames, throttled; resumable across restarts).
+            let cleanup_store = Arc::clone(&store_bg);
+            let _ = tokio::task::spawn_blocking(move || cleanup_store.cleanup_stale_tmp()).await;
+            store_bg
+                .migrate_legacy_layout(1_000, std::time::Duration::from_millis(500))
+                .await;
+
             // Usage counters last: one stat per blob, pure reporting data.
             let sizing_store = Arc::clone(&store_bg);
             if let Err(e) = tokio::task::spawn_blocking(move || sizing_store.recompute_usage()).await

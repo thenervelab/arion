@@ -210,20 +210,12 @@ pub fn rebuild_from_fs(blobs_dir: &Path) -> Result<usize> {
     }
 
     // Collect FS entries before acquiring the lock (I/O can be slow).
-    let entries: Vec<String> = std::fs::read_dir(blobs_dir)?
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
-            // Blobs are stored as "<64-char-hash>.bin"
-            if name.ends_with(".bin") && name.len() == 68 {
-                Some(name[..64].to_string())
-            } else if name.len() == 64 {
-                // Legacy: no extension
-                Some(name)
-            } else {
-                None
-            }
-        })
+    // Walks the flat legacy level AND the sharded ab/cd tree; a fresh DB on
+    // a sharded-layout node must see every blob or ListAllBlobs would
+    // truthfully report an empty inventory as a successful scan.
+    let entries: Vec<String> = crate::flat_store::walk_bin_names(blobs_dir)
+        .into_iter()
+        .filter(|h| h.len() == 64)
         .collect();
 
     let conn = db().lock().unwrap_or_else(|e| e.into_inner());

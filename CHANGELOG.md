@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.28] - 2026-08-15
+
+### Miner
+
+- **Sharded blob layout**: blobs now live under `storage/<h[0:2]>/<h[2:4]>/`
+  (65,536 leaf directories) instead of one flat directory. Fixes the ext4
+  `dir_index` ENOSPC at ~10M entries and the ZFS dnode-read storms that made
+  every enumeration and restart walk prohibitively slow on large nodes.
+  Reads fall back to the legacy flat path; writes always go sharded; a
+  throttled background migrator renames legacy entries into the sharded tree
+  (same-filesystem renames — metadata-only, no data copied; resumable).
+  The trash uses the same sharded layout.
+- **Stale write artifacts are cleaned at startup**: crash-leftover `.tmp.*`
+  files at the store root and day-old `.tmp/*.part` entries are removed.
+- Inventory rebuild and usage accounting walk both layouts.
+
 ## [0.1.27] - 2026-08-14
 
 ### Miner

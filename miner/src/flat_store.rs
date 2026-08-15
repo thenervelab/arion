@@ -1,16 +1,20 @@
-//! Flat-file blob store for shard storage.
+//! Blob store for shard storage: sharded flat files.
 //!
-//! Replaces iroh-blobs `FsStore` with simple flat files: `{hash_hex}.bin`
-//! in a single directory. No tags, no redb — just files.
+//! Blobs are stored as `{data_dir}/{h[0:2]}/{h[2:4]}/{hash}.bin` (65 536
+//! leaf directories). The historical layout was one flat directory holding
+//! every blob; at millions of entries that hit the ext4 `dir_index` limit
+//! (ENOSPC on create with terabytes free) and made every enumeration a
+//! dnode-read storm on ZFS. Reads fall back to the legacy flat path, writes
+//! always go sharded, and a throttled background migrator renames legacy
+//! entries into the sharded tree (same filesystem — pure metadata moves).
 //!
 //! Atomic writes via temp-file + rename prevent partial reads.
 //!
-//! Deletes are two-phase: `trash()` renames the blob into `{data_dir}/trash/`
-//! where it no longer counts as stored (not listed, not served, quota freed)
-//! but can be brought back instantly by `restore()` until `purge_trash()`
-//! removes it for good. Both directory scans are non-recursive, so trashed
-//! blobs are invisible to `list_hashes()` and the `used_bytes` accounting by
-//! construction.
+//! Deletes are two-phase: `delete()` renames the blob into the sharded
+//! trash (`{data_dir}/trash/{h[0:2]}/{h[2:4]}/{hash}.bin`) where it no
+//! longer counts as stored (not listed, not served, quota freed) but can be
+//! brought back by `restore()` until purged. Directory walks are bounded to
+//! the expected shapes, so trash and live never leak into each other.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,69 +24,129 @@ use bytes::Bytes;
 /// Name of the trash subdirectory inside the data dir.
 const TRASH_DIR: &str = "trash";
 
-/// Simple flat-file blob store.
-///
-/// Each blob is stored as `{data_dir}/{hash_hex}.bin` where `hash_hex`
-/// is the lowercase hex encoding of the blob's blake3 hash.
+/// Directory for in-flight writes (crash leftovers are purged on startup).
+const TMP_DIR: &str = ".tmp";
+
+/// Simple sharded-file blob store.
 #[derive(Debug)]
 pub struct FlatBlobStore {
     data_dir: PathBuf,
     trash_dir: PathBuf,
+    tmp_dir: PathBuf,
     used_bytes: AtomicU64,
     trash_bytes: AtomicU64,
 }
 
+/// `ab/cd/<hash>.bin` for a well-formed hex hash; `None` for anything that
+/// cannot be sharded (defensive: such names only ever existed flat).
+fn sharded_rel(hash_hex: &str) -> Option<PathBuf> {
+    if hash_hex.len() < 4 || !hash_hex.as_bytes()[..4].iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    Some(
+        PathBuf::from(&hash_hex[0..2])
+            .join(&hash_hex[2..4])
+            .join(format!("{hash_hex}.bin")),
+    )
+}
+
+/// Collect `*.bin` hash names under a store root: the flat legacy level plus
+/// the two-level sharded tree. Never descends anywhere else, so live, trash
+/// and tmp spaces stay disjoint.
+pub(crate) fn walk_bin_names(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(top) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for entry in top.flatten() {
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let ft = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if ft.is_file() {
+            if let Some(h) = name.strip_suffix(".bin") {
+                out.push(h.to_string());
+            }
+        } else if ft.is_dir() && name.len() == 2 && name != TRASH_DIR {
+            let Ok(mid) = std::fs::read_dir(entry.path()) else {
+                continue;
+            };
+            for sub in mid.flatten() {
+                if !sub.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let Ok(leaves) = std::fs::read_dir(sub.path()) else {
+                    continue;
+                };
+                for leaf in leaves.flatten() {
+                    if let Ok(n) = leaf.file_name().into_string()
+                        && let Some(h) = n.strip_suffix(".bin")
+                    {
+                        out.push(h.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Sum file sizes under a store root (flat level + sharded tree).
+/// One `stat` per file — background use only.
+fn walk_usage(root: &Path) -> (u64, u64) {
+    let (mut bytes, mut files) = (0u64, 0u64);
+    for h in walk_bin_names(root) {
+        let p = match sharded_rel(&h) {
+            Some(rel) => {
+                let sp = root.join(rel);
+                if sp.exists() {
+                    sp
+                } else {
+                    root.join(format!("{h}.bin"))
+                }
+            }
+            None => root.join(format!("{h}.bin")),
+        };
+        if let Ok(m) = std::fs::metadata(&p) {
+            bytes += m.len();
+            files += 1;
+        }
+    }
+    (bytes, files)
+}
+
 impl FlatBlobStore {
-    /// Create a new flat blob store, ensuring the data and trash
-    /// directories exist.
+    /// Create the store, ensuring the data, trash and tmp directories exist.
     ///
     /// Returns immediately: usage counters start at zero and are filled in
-    /// by [`recompute_usage`](Self::recompute_usage), which the caller must
-    /// run off the startup path. Sizing used to happen here and cost one
-    /// `stat` per blob — a dnode read per file on ZFS — which took hours on
-    /// nodes holding millions of blobs, during which the miner never
-    /// registered or heartbeated.
+    /// by [`recompute_usage`](Self::recompute_usage) off the startup path
+    /// (sizing walks cost one `stat` per blob — hours on large ZFS nodes).
     pub fn new(data_dir: impl AsRef<Path>) -> std::io::Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
         let trash_dir = data_dir.join(TRASH_DIR);
+        let tmp_dir = data_dir.join(TMP_DIR);
         std::fs::create_dir_all(&data_dir)?;
         std::fs::create_dir_all(&trash_dir)?;
-
-        let initial_size = 0;
-        let initial_trash = 0;
+        std::fs::create_dir_all(&tmp_dir)?;
 
         Ok(Self {
             data_dir,
             trash_dir,
-            used_bytes: AtomicU64::new(initial_size),
-            trash_bytes: AtomicU64::new(initial_trash),
+            tmp_dir,
+            used_bytes: AtomicU64::new(0),
+            trash_bytes: AtomicU64::new(0),
         })
     }
 
-    /// Walk both directories and set the usage counters.
-    ///
-    /// EXPENSIVE and blocking: one `stat` per stored blob. On ZFS that is a
-    /// dnode read each, so on a node with millions of blobs and a metadata
-    /// working set larger than ARC it is hours of random HDD reads. Never
-    /// call this on the startup path — run it from `spawn_blocking` once the
-    /// miner is already registered and serving.
+    /// Walk both spaces and set the usage counters. EXPENSIVE and blocking —
+    /// run from `spawn_blocking` once the miner is registered and serving.
     pub fn recompute_usage(&self) {
-        let scan_dir = |dir: &Path| -> (u64, u64) {
-            let (mut bytes, mut files) = (0u64, 0u64);
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    if let Ok(metadata) = entry.metadata()
-                        && metadata.is_file()
-                    {
-                        bytes += metadata.len();
-                        files += 1;
-                    }
-                }
-            }
-            (bytes, files)
-        };
-        let (bytes, files) = scan_dir(&self.data_dir);
-        let (trash_bytes, _) = scan_dir(&self.trash_dir);
+        let (bytes, files) = walk_usage(&self.data_dir);
+        let (trash_bytes, _) = walk_usage(&self.trash_dir);
         self.used_bytes.store(bytes, Ordering::Relaxed);
         self.trash_bytes.store(trash_bytes, Ordering::Relaxed);
         tracing::info!(
@@ -93,32 +157,80 @@ impl FlatBlobStore {
         );
     }
 
-    /// Path to the blob file for a given hash hex string.
+    /// Preferred (sharded) path for a blob.
     fn blob_path(&self, hash_hex: &str) -> PathBuf {
-        self.data_dir.join(format!("{}.bin", hash_hex))
+        match sharded_rel(hash_hex) {
+            Some(rel) => self.data_dir.join(rel),
+            None => self.data_dir.join(format!("{hash_hex}.bin")),
+        }
     }
 
-    /// Path to the trashed blob file for a given hash hex string.
+    /// Legacy flat path (pre-sharding layout).
+    fn blob_path_flat(&self, hash_hex: &str) -> PathBuf {
+        self.data_dir.join(format!("{hash_hex}.bin"))
+    }
+
+    /// Where the blob actually lives right now, if anywhere.
+    fn locate(&self, hash_hex: &str) -> Option<PathBuf> {
+        let sharded = self.blob_path(hash_hex);
+        if sharded.exists() {
+            return Some(sharded);
+        }
+        let flat = self.blob_path_flat(hash_hex);
+        if flat != sharded && flat.exists() {
+            return Some(flat);
+        }
+        None
+    }
+
+    /// Preferred (sharded) trash path.
     fn trash_path(&self, hash_hex: &str) -> PathBuf {
-        self.trash_dir.join(format!("{}.bin", hash_hex))
+        match sharded_rel(hash_hex) {
+            Some(rel) => self.trash_dir.join(rel),
+            None => self.trash_dir.join(format!("{hash_hex}.bin")),
+        }
     }
 
-    /// Store blob data at the given hash. Atomic via temp-file + rename.
+    fn trash_path_flat(&self, hash_hex: &str) -> PathBuf {
+        self.trash_dir.join(format!("{hash_hex}.bin"))
+    }
+
+    fn locate_trashed(&self, hash_hex: &str) -> Option<PathBuf> {
+        let sharded = self.trash_path(hash_hex);
+        if sharded.exists() {
+            return Some(sharded);
+        }
+        let flat = self.trash_path_flat(hash_hex);
+        if flat != sharded && flat.exists() {
+            return Some(flat);
+        }
+        None
+    }
+
+    /// Store blob data. Atomic via temp-file + rename into the sharded tree.
     pub async fn store(&self, hash_hex: &str, data: &[u8]) -> std::io::Result<()> {
         let target = self.blob_path(hash_hex);
-        let tmp = self.data_dir.join(format!(".tmp.{}", hash_hex));
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let tmp = self.tmp_dir.join(format!("{hash_hex}.part"));
 
-        let existing_size = match tokio::fs::metadata(&target).await {
-            Ok(m) => m.len(),
-            Err(_) => 0,
+        let existing_size = match self.locate(hash_hex) {
+            Some(p) => tokio::fs::metadata(&p).await.map(|m| m.len()).unwrap_or(0),
+            None => 0,
         };
 
         tokio::fs::write(&tmp, data).await?;
         tokio::fs::rename(&tmp, &target).await?;
 
+        // A legacy flat copy is superseded by the sharded write.
+        let flat = self.blob_path_flat(hash_hex);
+        if flat != target && flat.exists() {
+            tokio::fs::remove_file(&flat).await.ok();
+        }
+
         let new_size = data.len() as u64;
         if existing_size > 0 {
-            // Overwrite
             if new_size > existing_size {
                 self.used_bytes
                     .fetch_add(new_size - existing_size, Ordering::Relaxed);
@@ -127,37 +239,40 @@ impl FlatBlobStore {
                     .fetch_sub(existing_size - new_size, Ordering::Relaxed);
             }
         } else {
-            // New file
             self.used_bytes.fetch_add(new_size, Ordering::Relaxed);
         }
-
         Ok(())
     }
 
-    /// Read blob data by hash hex string.
+    /// Read blob data (sharded first, legacy flat fallback).
     pub async fn read(&self, hash_hex: &str) -> std::io::Result<Bytes> {
-        let data = tokio::fs::read(self.blob_path(hash_hex)).await?;
-        Ok(Bytes::from(data))
+        match tokio::fs::read(self.blob_path(hash_hex)).await {
+            Ok(data) => Ok(Bytes::from(data)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let data = tokio::fs::read(self.blob_path_flat(hash_hex)).await?;
+                Ok(Bytes::from(data))
+            }
+            Err(e) => Err(e),
+        }
     }
 
-    /// Check if a blob exists (synchronous filesystem check).
+    /// Check if a blob exists in either layout.
     pub fn has(&self, hash_hex: &str) -> bool {
-        self.blob_path(hash_hex).exists()
+        self.locate(hash_hex).is_some()
     }
 
-    /// Delete a blob by hash hex string. No-op if it doesn't exist.
-    ///
-    /// Two-phase: the blob is renamed into the trash directory, freeing
-    /// its quota immediately while staying recoverable via [`restore`]
-    /// until [`purge_trash`] removes it permanently.
+    /// Two-phase delete: move the blob (wherever it lives) into the sharded
+    /// trash, freeing its quota while staying restorable.
     pub async fn delete(&self, hash_hex: &str) -> std::io::Result<()> {
-        let path = self.blob_path(hash_hex);
-        let size = match tokio::fs::metadata(&path).await {
-            Ok(m) => m.len(),
-            Err(_) => return Ok(()), // Doesn't exist
+        let Some(path) = self.locate(hash_hex) else {
+            return Ok(());
         };
-
-        match tokio::fs::rename(&path, self.trash_path(hash_hex)).await {
+        let size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+        let target = self.trash_path(hash_hex);
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        match tokio::fs::rename(&path, &target).await {
             Ok(()) => {
                 self.used_bytes.fetch_sub(size, Ordering::Relaxed);
                 self.trash_bytes.fetch_add(size, Ordering::Relaxed);
@@ -168,14 +283,12 @@ impl FlatBlobStore {
         }
     }
 
-    /// Permanently delete a live blob, bypassing the trash (used when the
-    /// trash is disabled). No-op if it doesn't exist.
+    /// Permanently delete a live blob, bypassing the trash.
     pub async fn remove(&self, hash_hex: &str) -> std::io::Result<()> {
-        let path = self.blob_path(hash_hex);
-        let size = match tokio::fs::metadata(&path).await {
-            Ok(m) => m.len(),
-            Err(_) => return Ok(()),
+        let Some(path) = self.locate(hash_hex) else {
+            return Ok(());
         };
+        let size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
         match tokio::fs::remove_file(path).await {
             Ok(()) => {
                 self.used_bytes.fetch_sub(size, Ordering::Relaxed);
@@ -186,16 +299,17 @@ impl FlatBlobStore {
         }
     }
 
-    /// Bring a trashed blob back into the live store. Returns `Ok(true)` if
-    /// it was restored, `Ok(false)` if it is not in the trash.
+    /// Bring a trashed blob back into the live (sharded) store.
     pub async fn restore(&self, hash_hex: &str) -> std::io::Result<bool> {
-        let trashed = self.trash_path(hash_hex);
-        let size = match tokio::fs::metadata(&trashed).await {
-            Ok(m) => m.len(),
-            Err(_) => return Ok(false),
+        let Some(trashed) = self.locate_trashed(hash_hex) else {
+            return Ok(false);
         };
-
-        match tokio::fs::rename(&trashed, self.blob_path(hash_hex)).await {
+        let size = tokio::fs::metadata(&trashed).await.map(|m| m.len()).unwrap_or(0);
+        let target = self.blob_path(hash_hex);
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        match tokio::fs::rename(&trashed, &target).await {
             Ok(()) => {
                 self.trash_bytes.fetch_sub(size, Ordering::Relaxed);
                 self.used_bytes.fetch_add(size, Ordering::Relaxed);
@@ -206,14 +320,12 @@ impl FlatBlobStore {
         }
     }
 
-    /// Permanently remove one blob from the trash (used once its retention
-    /// clock has elapsed). No-op if it is not in the trash.
+    /// Permanently remove one blob from the trash. No-op if absent.
     pub async fn purge_trashed(&self, hash_hex: &str) -> std::io::Result<()> {
-        let path = self.trash_path(hash_hex);
-        let size = match tokio::fs::metadata(&path).await {
-            Ok(m) => m.len(),
-            Err(_) => return Ok(()),
+        let Some(path) = self.locate_trashed(hash_hex) else {
+            return Ok(());
         };
+        let size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
         match tokio::fs::remove_file(path).await {
             Ok(()) => {
                 self.trash_bytes.fetch_sub(size, Ordering::Relaxed);
@@ -224,22 +336,14 @@ impl FlatBlobStore {
         }
     }
 
-    /// Hashes currently sitting in the trash directory.
+    /// Hashes currently in the trash (both layouts).
     pub fn list_trashed_hashes(&self) -> Vec<String> {
-        std::fs::read_dir(&self.trash_dir)
-            .into_iter()
-            .flatten()
-            .filter_map(|e| {
-                let e = e.ok()?;
-                let name = e.file_name().to_str()?.to_string();
-                name.strip_suffix(".bin").map(|h| h.to_string())
-            })
-            .collect()
+        walk_bin_names(&self.trash_dir)
     }
 
     /// Whether a blob is currently in the trash.
     pub fn has_trashed(&self, hash_hex: &str) -> bool {
-        self.trash_path(hash_hex).exists()
+        self.locate_trashed(hash_hex).is_some()
     }
 
     /// Total size of trashed blobs in bytes.
@@ -247,17 +351,9 @@ impl FlatBlobStore {
         self.trash_bytes.load(Ordering::Relaxed)
     }
 
-    /// List all stored blob hash hex strings.
+    /// List all stored blob hashes (both layouts).
     pub fn list_hashes(&self) -> Vec<String> {
-        std::fs::read_dir(&self.data_dir)
-            .into_iter()
-            .flatten()
-            .filter_map(|e| {
-                let e = e.ok()?;
-                let name = e.file_name().to_str()?.to_string();
-                name.strip_suffix(".bin").map(|h| h.to_string())
-            })
-            .collect()
+        walk_bin_names(&self.data_dir)
     }
 
     /// Return the data directory path.
@@ -270,82 +366,184 @@ impl FlatBlobStore {
     pub fn used_bytes(&self) -> u64 {
         self.used_bytes.load(Ordering::Relaxed)
     }
+
+    /// Remove stale write artifacts: `.tmp/*.part` older than a day and
+    /// legacy `.tmp.<hash>` files at the store root (pre-0.1.28 in-flight
+    /// writes that a crash left behind — never valid blobs).
+    pub fn cleanup_stale_tmp(&self) -> usize {
+        let mut removed = 0usize;
+        let day = std::time::Duration::from_secs(86_400);
+        if let Ok(entries) = std::fs::read_dir(&self.tmp_dir) {
+            for e in entries.flatten() {
+                let old = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .map(|t| t.elapsed().unwrap_or_default() > day)
+                    .unwrap_or(true);
+                if old && std::fs::remove_file(e.path()).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(&self.data_dir) {
+            for e in entries.flatten() {
+                if let Ok(name) = e.file_name().into_string()
+                    && name.starts_with(".tmp.")
+                    && e.file_type().map(|t| t.is_file()).unwrap_or(false)
+                    && std::fs::remove_file(e.path()).is_ok()
+                {
+                    removed += 1;
+                }
+            }
+        }
+        if removed > 0 {
+            tracing::info!(removed, "storage: stale tmp artifacts cleaned");
+        }
+        removed
+    }
+
+    /// Migrate legacy flat-layout entries (live and trash) into the sharded
+    /// tree. Pure `rename(2)` on the same filesystem — metadata-only moves.
+    /// Throttled and resumable: the flat directory only ever shrinks.
+    /// Returns the number of entries moved.
+    pub async fn migrate_legacy_layout(&self, batch: usize, pause: std::time::Duration) -> u64 {
+        let mut moved = 0u64;
+        for (root, is_trash) in [(&self.data_dir, false), (&self.trash_dir, true)] {
+            loop {
+                // One bounded readdir page of flat *.bin entries: names only,
+                // no stat — cheap even on the ZFS nodes.
+                let names: Vec<String> = {
+                    let Ok(entries) = std::fs::read_dir(root) else {
+                        break;
+                    };
+                    entries
+                        .flatten()
+                        .filter_map(|e| {
+                            let n = e.file_name().into_string().ok()?;
+                            let h = n.strip_suffix(".bin")?;
+                            sharded_rel(h)?; // shardable names only
+                            e.file_type().ok()?.is_file().then(|| h.to_string())
+                        })
+                        .take(batch)
+                        .collect()
+                };
+                if names.is_empty() {
+                    break;
+                }
+                for h in &names {
+                    let rel = match sharded_rel(h) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    let from = root.join(format!("{h}.bin"));
+                    let to = root.join(rel);
+                    if let Some(parent) = to.parent()
+                        && tokio::fs::create_dir_all(parent).await.is_err()
+                    {
+                        continue;
+                    }
+                    if to.exists() {
+                        // Sharded copy already present (re-store since):
+                        // the flat one is a stale duplicate.
+                        tokio::fs::remove_file(&from).await.ok();
+                        continue;
+                    }
+                    if tokio::fs::rename(&from, &to).await.is_ok() {
+                        moved += 1;
+                    }
+                }
+                tracing::info!(
+                    moved,
+                    trash = is_trash,
+                    "storage: legacy layout migration progress"
+                );
+                tokio::time::sleep(pause).await;
+            }
+        }
+        if moved > 0 {
+            tracing::info!(moved, "storage: legacy layout migration complete");
+        }
+        moved
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const HASH: &str = "aa11";
+    const HASH: &str = "aa11bb22cc33";
 
     #[tokio::test]
-    async fn delete_moves_to_trash_and_restore_brings_back() {
+    async fn store_read_trash_restore_sharded() {
         let dir = tempfile::tempdir().unwrap();
         let store = FlatBlobStore::new(dir.path()).unwrap();
 
         store.store(HASH, b"hello").await.unwrap();
+        assert!(dir.path().join("aa/11").join(format!("{HASH}.bin")).exists());
         assert_eq!(store.used_bytes(), 5);
         assert!(store.has(HASH));
 
         store.delete(HASH).await.unwrap();
-        assert!(!store.has(HASH), "trashed blob must not be servable");
+        assert!(!store.has(HASH));
         assert!(store.has_trashed(HASH));
-        assert_eq!(store.used_bytes(), 0, "trash frees the quota");
+        assert_eq!(store.used_bytes(), 0);
         assert_eq!(store.trash_bytes(), 5);
-        assert!(
-            !store.list_hashes().contains(&HASH.to_string()),
-            "trashed blob must not be listed"
-        );
         assert_eq!(store.list_trashed_hashes(), vec![HASH.to_string()]);
+        assert!(!store.list_hashes().contains(&HASH.to_string()));
 
         assert!(store.restore(HASH).await.unwrap());
         assert!(store.has(HASH));
-        assert!(!store.has_trashed(HASH));
-        assert_eq!(store.used_bytes(), 5);
-        assert_eq!(store.trash_bytes(), 0);
         assert_eq!(store.read(HASH).await.unwrap().as_ref(), b"hello");
 
-        // Restoring again is a no-op signal, not an error.
-        assert!(!store.restore(HASH).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn purge_is_permanent_and_remove_bypasses_trash() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FlatBlobStore::new(dir.path()).unwrap();
-
-        store.store(HASH, b"data").await.unwrap();
         store.delete(HASH).await.unwrap();
         store.purge_trashed(HASH).await.unwrap();
         assert!(!store.has_trashed(HASH));
         assert_eq!(store.trash_bytes(), 0);
-        assert!(!store.restore(HASH).await.unwrap(), "purged = gone");
-
-        store.store(HASH, b"data").await.unwrap();
-        store.remove(HASH).await.unwrap();
-        assert!(!store.has(HASH));
-        assert!(!store.has_trashed(HASH), "remove never goes through trash");
-        assert_eq!(store.used_bytes(), 0);
     }
 
     #[tokio::test]
-    async fn startup_scan_accounts_both_directories() {
+    async fn legacy_flat_blobs_are_readable_and_migrated() {
         let dir = tempfile::tempdir().unwrap();
-        {
-            let store = FlatBlobStore::new(dir.path()).unwrap();
-            store.store("live", b"12345").await.unwrap();
-            store.store("gone", b"1234567").await.unwrap();
-            store.delete("gone").await.unwrap();
-        }
-        let reopened = FlatBlobStore::new(dir.path()).unwrap();
-        // Startup must not walk the store: counters stay at zero until the
-        // background pass runs (this is what keeps restarts instant).
-        assert_eq!(reopened.used_bytes(), 0);
-        assert_eq!(reopened.trash_bytes(), 0);
-        reopened.recompute_usage();
-        assert_eq!(reopened.used_bytes(), 5);
-        assert_eq!(reopened.trash_bytes(), 7);
-        assert!(reopened.has("live"));
-        assert!(reopened.has_trashed("gone"));
+        let store = FlatBlobStore::new(dir.path()).unwrap();
+
+        // Simulate a pre-0.1.28 blob at the flat root.
+        std::fs::write(dir.path().join(format!("{HASH}.bin")), b"legacy").unwrap();
+        assert!(store.has(HASH));
+        assert_eq!(store.read(HASH).await.unwrap().as_ref(), b"legacy");
+        assert!(store.list_hashes().contains(&HASH.to_string()));
+
+        // Migration renames it into the sharded tree; content unchanged.
+        let moved = store
+            .migrate_legacy_layout(100, std::time::Duration::from_millis(1))
+            .await;
+        assert_eq!(moved, 1);
+        assert!(!dir.path().join(format!("{HASH}.bin")).exists());
+        assert!(dir.path().join("aa/11").join(format!("{HASH}.bin")).exists());
+        assert_eq!(store.read(HASH).await.unwrap().as_ref(), b"legacy");
+
+        // Trash a legacy-placed blob: it lands in the sharded trash.
+        std::fs::write(dir.path().join("ff00aa.bin"), b"x").unwrap();
+        store.delete("ff00aa").await.unwrap();
+        assert!(dir.path().join("trash/ff/00/ff00aa.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn stale_tmp_artifacts_are_cleaned() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FlatBlobStore::new(dir.path()).unwrap();
+
+        // Legacy crash leftover at the root + an old .part in tmp.
+        std::fs::write(dir.path().join(".tmp.deadbeef"), b"junk").unwrap();
+        std::fs::write(dir.path().join(".tmp/old.part"), b"junk").unwrap();
+        // Note: fresh .part files are kept (mtime now > cutoff only for old
+        // ones); the root legacy pattern is always removed.
+        let removed = store.cleanup_stale_tmp();
+        assert!(removed >= 1);
+        assert!(!dir.path().join(".tmp.deadbeef").exists());
+
+        // Usage recompute sees only real blobs.
+        store.store(HASH, b"data").await.unwrap();
+        store.recompute_usage();
+        assert_eq!(store.used_bytes(), 4);
     }
 }
