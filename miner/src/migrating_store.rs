@@ -24,18 +24,34 @@
 //! themselves. Trashed flat blobs move to packed tombstones (the trash TTL
 //! clock lives in the inventory DB, so nothing about purge timing changes).
 //!
-//! Enumeration is paged by shard leaf directory (`ab/cd/`, ~1/65536 of the
-//! population each) plus a bounded page of the legacy flat root, so the
-//! mover never materializes the full blob list in memory. Throttle knobs:
-//! `PACKED_MIGRATE_BATCH` blobs per page (default 500) and
-//! `PACKED_MIGRATE_PAUSE_MS` between pages (default 250) — start slow on
-//! drowning nodes; the node gets lighter as the migration progresses.
-//! Emptied leaf directories are removed at the end of the pass.
+//! Enumeration never materializes a directory listing, and never
+//! `read_dir`s a root just to discover its shard subdirectories — the
+//! legacy flat root can still hold tens of millions of `.bin` entries
+//! (nodes where the 0.1.28 sharding migration never finished), and a
+//! listing of it blocks for the node's whole uptime before the first blob
+//! moves. Instead:
+//!
+//! - shard leaf directories (`ab/cd/`, ~1/65536 of the population each)
+//!   are discovered by probing the 256 possible names per level (one
+//!   `stat` each) and drained FIRST — progress is immediate and
+//!   measurable;
+//! - the legacy flat roots are drained LAST, streamed in bounded pages
+//!   from a single held readdir cursor, moving blobs as they are
+//!   enumerated;
+//! - progress is logged every 60 s (`migration: progress`), and each phase
+//!   announces itself when it starts.
+//!
+//! Throttle knobs: `PACKED_MIGRATE_BATCH` blobs per page (default 1000)
+//! and `PACKED_MIGRATE_PAUSE_MS` between pages (default 100). The defaults
+//! cap the mover at ~10k blobs/s; on I/O-bound ZFS nodes the filesystem is
+//! the real limiter and 0.5-3k blobs/s is typical, i.e. hours to a day for
+//! a 60-70M-blob node. Emptied leaf directories are removed at the end of
+//! the pass.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
@@ -161,30 +177,93 @@ impl BlobStore for MigratingStore {
     }
 }
 
-/// Counters published by the mover (for logs and the metrics endpoint).
+/// Counters published by the mover (for logs). `skipped` counts skip
+/// EVENTS (corrupt blob re-seen on a later pass, raced delete), not unique
+/// blobs.
 #[derive(Debug, Default)]
 pub struct MigrationProgress {
     pub migrated: AtomicU64,
     pub bytes: AtomicU64,
-    pub corrupt_left: AtomicU64,
+    pub skipped: AtomicU64,
     pub done: std::sync::atomic::AtomicBool,
 }
 
-/// One bounded page of `*.bin` names from a single directory (never
-/// recursive — leaf dirs are enumerated one at a time by the caller).
-fn page_of_bins(dir: &Path, batch: usize) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|e| {
-            let n = e.file_name().into_string().ok()?;
-            let h = n.strip_suffix(".bin")?;
-            e.file_type().ok()?.is_file().then(|| h.to_string())
-        })
-        .take(batch)
+/// How often the mover reports progress while it works.
+const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// All existing two-hex-digit subdirectories of `base`, found by PROBING
+/// the 256 possible names directly (one `stat` each). Never `read_dir`s
+/// `base`: filtering a giant flat root for its shard dirs is exactly the
+/// stall that kept the 0.1.29 mover from ever starting on nodes still
+/// mid-way through the 0.1.28 sharding migration.
+fn probe_hex_subdirs(base: &Path) -> Vec<PathBuf> {
+    (0u16..=255)
+        .map(|i| base.join(format!("{i:02x}")))
+        .filter(|p| p.is_dir())
         .collect()
+}
+
+/// Streaming pager over the `*.bin` entries of one directory. Holds the
+/// readdir cursor across pages so a directory of any size is enumerated at
+/// most once per pass, in bounded chunks, off the async runtime — the full
+/// listing is never collected.
+struct BinPager {
+    dir: PathBuf,
+    cursor: Option<std::fs::ReadDir>,
+    exhausted: bool,
+}
+
+impl BinPager {
+    fn new(dir: &Path) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            cursor: None,
+            exhausted: false,
+        }
+    }
+
+    /// Next page of up to `batch` blob names. Empty page = directory
+    /// exhausted for this pass.
+    async fn next_page(&mut self, batch: usize) -> Vec<String> {
+        if self.exhausted {
+            return Vec::new();
+        }
+        let cursor = self.cursor.take();
+        let dir = self.dir.clone();
+        let (cursor, page) = tokio::task::spawn_blocking(move || {
+            let mut cursor = match cursor {
+                Some(c) => c,
+                None => match std::fs::read_dir(&dir) {
+                    Ok(c) => c,
+                    Err(_) => return (None, Vec::new()),
+                },
+            };
+            let mut page = Vec::with_capacity(batch.min(4096));
+            for e in cursor.by_ref().flatten() {
+                let Ok(name) = e.file_name().into_string() else {
+                    continue;
+                };
+                let Some(h) = name.strip_suffix(".bin") else {
+                    continue;
+                };
+                if !e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                page.push(h.to_string());
+                if page.len() >= batch {
+                    // Cursor survives to the next call: the next page
+                    // resumes here instead of re-reading from the start.
+                    return (Some(cursor), page);
+                }
+            }
+            (None, page)
+        })
+        .await
+        .unwrap_or((None, Vec::new()));
+        self.cursor = cursor;
+        self.exhausted = self.cursor.is_none();
+        page
+    }
 }
 
 /// Move one live flat blob into the packed store. Returns payload size, or
@@ -219,6 +298,163 @@ async fn move_one(flat: &FlatBlobStore, packed: &PackedStore, hash: &str) -> Opt
     Some(data.len() as u64)
 }
 
+/// Which space a directory being drained belongs to.
+#[derive(Clone, Copy, PartialEq)]
+enum Space {
+    Live,
+    Trash,
+}
+
+/// The mover's working state: stores, throttle, counters, progress log.
+struct Mover {
+    flat: Arc<FlatBlobStore>,
+    packed: Arc<PackedStore>,
+    progress: Arc<MigrationProgress>,
+    limit: Option<u64>,
+    batch: usize,
+    pause: Duration,
+    moved_total: u64,
+    phase: &'static str,
+    dirs_left: usize,
+    last_log: Instant,
+    last_logged_moved: u64,
+}
+
+impl Mover {
+    fn limit_hit(&self) -> bool {
+        self.limit.is_some_and(|l| self.moved_total >= l)
+    }
+
+    /// Periodic INFO so an operator can see the drain is alive — the
+    /// 0.1.29 startup stall was invisible precisely because the mover
+    /// logged nothing between its init line and its completion line.
+    fn maybe_log(&mut self) {
+        let elapsed = self.last_log.elapsed();
+        if elapsed < PROGRESS_LOG_INTERVAL {
+            return;
+        }
+        let moved = self.progress.migrated.load(Ordering::Relaxed);
+        let rate = (moved.saturating_sub(self.last_logged_moved)) / elapsed.as_secs().max(1);
+        tracing::info!(
+            phase = self.phase,
+            moved,
+            bytes = self.progress.bytes.load(Ordering::Relaxed),
+            skipped = self.progress.skipped.load(Ordering::Relaxed),
+            dirs_left = self.dirs_left,
+            blobs_per_s = rate,
+            "migration: progress"
+        );
+        self.last_log = Instant::now();
+        self.last_logged_moved = moved;
+    }
+
+    /// Trashed blobs: restore → pack → tombstone → drop the flat copy. The
+    /// trash TTL clock lives in the inventory DB and is untouched.
+    async fn move_trashed(&self, hash: &str) -> Option<u64> {
+        if !self.flat.restore(hash).await.unwrap_or(false) {
+            return None; // purged/restored since enumeration
+        }
+        match move_one(&self.flat, &self.packed, hash).await {
+            Some(n) => {
+                self.packed.delete(hash).await.ok(); // back to (packed) trash
+                Some(n)
+            }
+            None => {
+                // Could not pack it: put it back in the flat trash so the
+                // TTL semantics stay intact.
+                self.flat.delete(hash).await.ok();
+                None
+            }
+        }
+    }
+
+    async fn move_blob(&mut self, hash: &str, space: Space) {
+        let res = match space {
+            Space::Live => move_one(&self.flat, &self.packed, hash).await,
+            Space::Trash => self.move_trashed(hash).await,
+        };
+        match res {
+            Some(bytes) => {
+                self.moved_total += 1;
+                self.progress.migrated.fetch_add(1, Ordering::Relaxed);
+                self.progress.bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
+            None => {
+                self.progress.skipped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.maybe_log();
+    }
+
+    /// Drain every `*.bin` in `dir`: streamed, paged, throttled. Repeats
+    /// until a full pass moves nothing — unlinking entries mid-readdir
+    /// makes it unspecified whether later entries are surfaced, so the
+    /// final (near-empty, cheap) pass is the proof of completion. Entries
+    /// that can only be skipped (corrupt, raced) never trigger another
+    /// pass, so the mover cannot spin.
+    async fn drain_dir(&mut self, dir: &Path, space: Space) {
+        loop {
+            if self.limit_hit() {
+                return;
+            }
+            let moved_before = self.moved_total;
+            let mut pager = BinPager::new(dir);
+            loop {
+                let page = pager.next_page(self.batch).await;
+                if page.is_empty() {
+                    break;
+                }
+                for hash in &page {
+                    if self.limit_hit() {
+                        return;
+                    }
+                    self.move_blob(hash, space).await;
+                }
+                tokio::time::sleep(self.pause).await;
+            }
+            if self.moved_total == moved_before {
+                return;
+            }
+        }
+    }
+
+    /// Drain the sharded tree under `base`: leaf dirs are discovered by
+    /// name probing, never by listing `base`.
+    async fn drain_sharded_tree(&mut self, base: &Path, space: Space) {
+        let l1_dirs = {
+            let b = base.to_path_buf();
+            tokio::task::spawn_blocking(move || probe_hex_subdirs(&b))
+                .await
+                .unwrap_or_default()
+        };
+        tracing::info!(
+            phase = self.phase,
+            base = %base.display(),
+            l1_dirs = l1_dirs.len(),
+            "migration: draining sharded leaf directories"
+        );
+        self.dirs_left = l1_dirs.len();
+        for l1 in l1_dirs {
+            if self.limit_hit() {
+                return;
+            }
+            let leaves = {
+                let l1 = l1.clone();
+                tokio::task::spawn_blocking(move || probe_hex_subdirs(&l1))
+                    .await
+                    .unwrap_or_default()
+            };
+            for leaf in leaves {
+                if self.limit_hit() {
+                    return;
+                }
+                self.drain_dir(&leaf, space).await;
+            }
+            self.dirs_left = self.dirs_left.saturating_sub(1);
+        }
+    }
+}
+
 /// Drain the flat layout (live + trash, both the sharded tree and the
 /// legacy flat root) into the packed store. Resumable and idempotent; safe
 /// to run while the node serves traffic through a [`MigratingStore`].
@@ -231,151 +467,109 @@ pub async fn run_migration(
     progress: Arc<MigrationProgress>,
     limit: Option<u64>,
 ) -> u64 {
-    let batch = env_u64("PACKED_MIGRATE_BATCH", 500).clamp(1, 100_000) as usize;
-    let pause = Duration::from_millis(env_u64("PACKED_MIGRATE_PAUSE_MS", 250));
+    let batch = env_u64("PACKED_MIGRATE_BATCH", 1000).clamp(1, 100_000) as usize;
+    let pause = Duration::from_millis(env_u64("PACKED_MIGRATE_PAUSE_MS", 100));
     let trash_dir = data_dir.join("trash");
-    let mut moved_total = 0u64;
+    tracing::info!(
+        batch,
+        pause_ms = pause.as_millis() as u64,
+        "migration: mover starting"
+    );
 
-    // Live blobs: legacy flat root first (bounded pages), then each shard
-    // leaf directory in turn.
-    let mut roots: Vec<PathBuf> = vec![data_dir.clone()];
-    for l1 in list_two_hex_dirs(&data_dir) {
-        for l2 in list_two_hex_dirs(&l1) {
-            roots.push(l2);
-        }
-    }
-    for root in roots {
-        loop {
-            if let Some(l) = limit
-                && moved_total >= l
-            {
-                return moved_total;
-            }
-            let page = page_of_bins(&root, batch);
-            if page.is_empty() {
-                break;
-            }
-            let mut all_skipped = true;
-            for hash in &page {
-                if let Some(l) = limit
-                    && moved_total >= l
-                {
-                    return moved_total;
-                }
-                if let Some(bytes) = move_one(&flat, &packed, hash).await {
-                    moved_total += 1;
-                    progress.migrated.fetch_add(1, Ordering::Relaxed);
-                    progress.bytes.fetch_add(bytes, Ordering::Relaxed);
-                    all_skipped = false;
-                } else {
-                    progress.corrupt_left.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            if all_skipped {
-                // Every entry in this page is unmovable (corrupt or raced):
-                // stop paging this dir or we would spin on it forever.
-                break;
-            }
-            tokio::time::sleep(pause).await;
-        }
-    }
+    let mut mover = Mover {
+        flat,
+        packed,
+        progress: Arc::clone(&progress),
+        limit,
+        batch,
+        pause,
+        moved_total: 0,
+        phase: "",
+        dirs_left: 0,
+        last_log: Instant::now(),
+        last_logged_moved: 0,
+    };
 
-    // Trashed blobs: restore → pack → tombstone → drop the flat copy. The
-    // trash TTL clock lives in the inventory DB and is untouched.
-    for hash in flat.list_trashed_hashes() {
-        if let Some(l) = limit
-            && moved_total >= l
-        {
-            return moved_total;
-        }
-        if !flat.restore(&hash).await.unwrap_or(false) {
-            continue;
-        }
-        match move_one(&flat, &packed, &hash).await {
-            Some(_) => {
-                packed.delete(&hash).await.ok(); // back to (packed) trash
-                moved_total += 1;
-                progress.migrated.fetch_add(1, Ordering::Relaxed);
-            }
-            None => {
-                // Could not pack it: put it back in the flat trash so the
-                // TTL semantics stay intact.
-                flat.delete(&hash).await.ok();
-                progress.corrupt_left.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    // Sharded leaf dirs first (small, immediate measurable progress), the
+    // giant legacy roots last.
+    mover.phase = "sharded-live";
+    mover.drain_sharded_tree(&data_dir, Space::Live).await;
+    mover.phase = "sharded-trash";
+    mover.drain_sharded_tree(&trash_dir, Space::Trash).await;
+
+    mover.phase = "legacy-root-live";
+    mover.dirs_left = 0;
+    tracing::info!("migration: draining legacy flat root");
+    mover.drain_dir(&data_dir, Space::Live).await;
+    mover.phase = "legacy-root-trash";
+    mover.drain_dir(&trash_dir, Space::Trash).await;
+
+    if mover.limit_hit() {
+        return mover.moved_total; // partial run: no sweep, not done
     }
+    let moved_total = mover.moved_total;
 
     // Sweep now-empty shard leaf directories (their dnodes are the point).
-    let mut removed_dirs = 0usize;
-    for base in [&data_dir, &trash_dir] {
-        for l1 in list_two_hex_dirs(base) {
-            for l2 in list_two_hex_dirs(&l1) {
-                if std::fs::remove_dir(&l2).is_ok() {
-                    removed_dirs += 1;
+    let removed_dirs = {
+        let data = data_dir.clone();
+        let trash = trash_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut removed = 0usize;
+            for base in [&data, &trash] {
+                for l1 in probe_hex_subdirs(base) {
+                    for l2 in probe_hex_subdirs(&l1) {
+                        if std::fs::remove_dir(&l2).is_ok() {
+                            removed += 1;
+                        }
+                    }
+                    if std::fs::remove_dir(&l1).is_ok() {
+                        removed += 1;
+                    }
                 }
             }
-            if std::fs::remove_dir(&l1).is_ok() {
-                removed_dirs += 1;
-            }
-        }
-    }
+            removed
+        })
+        .await
+        .unwrap_or(0)
+    };
 
     progress.done.store(true, Ordering::Relaxed);
     tracing::info!(
         moved = moved_total,
         bytes = progress.bytes.load(Ordering::Relaxed),
-        left_in_place = progress.corrupt_left.load(Ordering::Relaxed),
+        left_in_place = progress.skipped.load(Ordering::Relaxed),
         removed_dirs,
         "migration: flat layout drained into packed volumes"
     );
     moved_total
 }
 
-fn list_two_hex_dirs(base: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(base) else {
-        return Vec::new();
+/// First `*.bin` found in `dir`, lazily — stops at the first hit.
+fn has_any_bin(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
     };
-    let mut out: Vec<PathBuf> = entries
-        .flatten()
-        .filter_map(|e| {
-            let n = e.file_name().into_string().ok()?;
-            (n.len() == 2
-                && n != "trash"
-                && n.bytes().all(|b| b.is_ascii_hexdigit())
-                && e.file_type().ok()?.is_dir())
-            .then(|| e.path())
-        })
-        .collect();
-    out.sort();
-    out
+    entries.flatten().any(|e| {
+        e.file_name().to_string_lossy().ends_with(".bin")
+            && e.file_type().map(|t| t.is_file()).unwrap_or(false)
+    })
 }
 
 /// Whether a data dir still holds flat-layout blobs (live or trashed) that
-/// need migrating. Bounded probe: one readdir page per level, no full walk.
+/// need migrating. Bounded probe: shard dirs are found by name probing
+/// (never by listing the roots), and each directory scan stops at the
+/// first `.bin`.
 pub fn flat_data_present(data_dir: &Path) -> bool {
-    fn has_any_bin(dir: &Path) -> bool {
-        !page_of_bins(dir, 1).is_empty()
-    }
-    if has_any_bin(data_dir) {
-        return true;
-    }
-    for l1 in list_two_hex_dirs(data_dir) {
-        for l2 in list_two_hex_dirs(&l1) {
-            if has_any_bin(&l2) {
-                return true;
-            }
-        }
-    }
     let trash = data_dir.join("trash");
-    if has_any_bin(&trash) {
-        return true;
-    }
-    for l1 in list_two_hex_dirs(&trash) {
-        for l2 in list_two_hex_dirs(&l1) {
-            if has_any_bin(&l2) {
-                return true;
+    for base in [data_dir, trash.as_path()] {
+        if has_any_bin(base) {
+            return true;
+        }
+        for l1 in probe_hex_subdirs(base) {
+            for l2 in probe_hex_subdirs(&l1) {
+                if has_any_bin(&l2) {
+                    return true;
+                }
             }
         }
     }
@@ -512,7 +706,7 @@ mod tests {
         // but preserved as evidence / for repair to overwrite.
         assert!(!packed.has(&rotten_name));
         assert!(flat.has(&rotten_name));
-        assert_eq!(progress.corrupt_left.load(Ordering::Relaxed), 1);
+        assert_eq!(progress.skipped.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -535,5 +729,105 @@ mod tests {
         .await;
         assert!(!flat.has(&h(&data)));
         assert_eq!(packed.read(&h(&data)).await.unwrap().as_ref(), &data[..]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sharded_leaves_drain_before_legacy_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let (flat, packed) = setup(dir.path()).await;
+        // One blob in a shard leaf dir, one at the legacy flat root.
+        let leaf_blob = b"sharded-first".to_vec();
+        flat.store(&h(&leaf_blob), &leaf_blob).await.unwrap();
+        let root_blob = b"legacy-later".to_vec();
+        let root_path = dir.path().join(format!("{}.bin", h(&root_blob)));
+        std::fs::write(&root_path, &root_blob).unwrap();
+
+        let progress = Arc::new(MigrationProgress::default());
+        let moved = run_migration(
+            Arc::clone(&flat),
+            Arc::clone(&packed),
+            dir.path().to_path_buf(),
+            Arc::clone(&progress),
+            Some(1),
+        )
+        .await;
+        assert_eq!(moved, 1);
+        // The leaf blob moved; the legacy root was not touched yet.
+        assert!(packed.has(&h(&leaf_blob)));
+        assert!(!packed.has(&h(&root_blob)));
+        assert!(root_path.exists());
+    }
+
+    /// Regression test for the 0.1.29 startup stall: the mover must land
+    /// its first blob without enumerating (let alone materializing) a
+    /// legacy root holding a huge number of entries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn first_blob_moves_without_enumerating_a_huge_root() {
+        const ROOT_ENTRIES: usize = 30_000;
+        let dir = tempfile::tempdir().unwrap();
+        let (flat, packed) = setup(dir.path()).await;
+        // A root crowded with flat entries (contents never read: the run
+        // is bounded to one move, which must come from the leaf dir).
+        for i in 0..ROOT_ENTRIES {
+            std::fs::write(dir.path().join(format!("{i:064x}.bin")), b"x").unwrap();
+        }
+        let leaf_blob = b"must-move-first".to_vec();
+        flat.store(&h(&leaf_blob), &leaf_blob).await.unwrap();
+
+        let progress = Arc::new(MigrationProgress::default());
+        let started = Instant::now();
+        let moved = run_migration(
+            Arc::clone(&flat),
+            Arc::clone(&packed),
+            dir.path().to_path_buf(),
+            Arc::clone(&progress),
+            Some(1),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(moved, 1);
+        assert!(packed.has(&h(&leaf_blob)));
+        // Generous CI bound: probing 512 names + one leaf page is
+        // milliseconds; a root enumeration at this scale would already
+        // push past it on a slow runner, and on the real nodes (tens of
+        // millions of entries) it never returned at all.
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "first move took {elapsed:?}"
+        );
+        // Every root entry is still in place: none were needed.
+        let root_bins = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".bin"))
+            .count();
+        assert_eq!(root_bins, ROOT_ENTRIES);
+    }
+
+    /// Leaf discovery must not depend on listing the root at all: with the
+    /// root's read permission removed (execute kept), probing still finds
+    /// and drains the shard dirs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn leaf_drain_needs_no_root_readdir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (flat, packed) = setup(dir.path()).await;
+        let leaf_blob = b"reachable-by-probe".to_vec();
+        flat.store(&h(&leaf_blob), &leaf_blob).await.unwrap();
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o311)).unwrap();
+        let progress = Arc::new(MigrationProgress::default());
+        let moved = run_migration(
+            Arc::clone(&flat),
+            Arc::clone(&packed),
+            dir.path().to_path_buf(),
+            Arc::clone(&progress),
+            Some(1),
+        )
+        .await;
+        // Restore before asserting so the tempdir can always be cleaned.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(moved, 1);
+        assert!(packed.has(&h(&leaf_blob)));
     }
 }
