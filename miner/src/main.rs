@@ -10,10 +10,13 @@ mod flat_store;
 mod gateway_keepalive;
 mod helpers;
 mod inventory;
+mod migrating_store;
 mod p2p;
+mod packed_store;
 mod rebalance;
 mod state;
 mod state_sync;
+mod store;
 mod version_check;
 
 use anyhow::Result;
@@ -29,6 +32,7 @@ use state::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
+use store::BlobStore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -246,7 +250,7 @@ struct MinerContext {
     /// STUN-detected public IP, used as fallback when hostname resolves to
     /// a non-routable address (e.g. `--hostname 0.0.0.0`).
     stun_public_ip: Option<std::net::IpAddr>,
-    store: Arc<flat_store::FlatBlobStore>,
+    store: Arc<dyn store::BlobStore>,
 }
 
 impl MinerContext {
@@ -420,7 +424,8 @@ async fn run_miner(cli: Cli) -> Result<()> {
     transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
     let transport_config = Arc::new(transport_config);
 
-    let endpoint = common::transport::create_endpoint(bind_addr, &signing_key, Some(transport_config)).await?;
+    let endpoint =
+        common::transport::create_endpoint(bind_addr, &signing_key, Some(transport_config)).await?;
 
     info!(node_id = %truncate_for_log(&node_id, 16), bind = %bind_addr, "Quinn endpoint bound");
 
@@ -466,11 +471,54 @@ async fn run_miner(cli: Cli) -> Result<()> {
     } else {
         data_dir.join("blobs")
     };
-    let store = Arc::new(
-        FlatBlobStore::new(&blobs_dir)
-            .map_err(|e| anyhow::anyhow!("Failed to initialize blob store: {}", e))?,
-    );
-    info!(path = %blobs_dir.display(), "Initialized flat-file blob storage");
+    // Backend selection. `flat` is the default and the only mode that reads
+    // pre-existing per-file blobs; `packed` (append-only volumes + in-RAM
+    // index) is for empty data dirs until the flat->packed migrator lands —
+    // rollback is asymmetric (an older binary cannot read packed volumes),
+    // which is why this ships dormant behind the flag.
+    let backend = std::env::var("STORE_BACKEND")
+        .ok()
+        .unwrap_or_else(|| config.storage.backend.clone());
+    let store: Arc<dyn BlobStore> = match backend.as_str() {
+        "packed" => {
+            let packed = packed_store::PackedStore::open(blobs_dir.join("packed"))
+                .map_err(|e| anyhow::anyhow!("Failed to open packed blob store: {}", e))?;
+            if migrating_store::flat_data_present(&blobs_dir) {
+                // Existing per-file blobs: serve through the hybrid (packed
+                // first, flat fallback) and drain the flat layout in the
+                // background. Resumable across restarts — the cursor is the
+                // existence of the flat files themselves.
+                let flat =
+                    Arc::new(FlatBlobStore::new(&blobs_dir).map_err(|e| {
+                        anyhow::anyhow!("Failed to initialize flat blob store: {}", e)
+                    })?);
+                let progress = Arc::new(migrating_store::MigrationProgress::default());
+                tokio::spawn(migrating_store::run_migration(
+                    Arc::clone(&flat),
+                    Arc::clone(&packed),
+                    blobs_dir.clone(),
+                    Arc::clone(&progress),
+                    None,
+                ));
+                info!(path = %blobs_dir.display(), "Initialized packed storage with flat->packed migration");
+                Arc::new(migrating_store::MigratingStore { flat, packed })
+            } else {
+                info!(path = %blobs_dir.join("packed").display(), "Initialized packed blob storage");
+                packed
+            }
+        }
+        "flat" => {
+            let s = Arc::new(
+                FlatBlobStore::new(&blobs_dir)
+                    .map_err(|e| anyhow::anyhow!("Failed to initialize blob store: {}", e))?,
+            );
+            info!(path = %blobs_dir.display(), "Initialized flat-file blob storage");
+            s
+        }
+        other => {
+            anyhow::bail!("Unknown STORE_BACKEND '{other}' (expected 'flat' or 'packed')");
+        }
+    };
 
     // Store blobs_dir globally
     {
@@ -492,7 +540,8 @@ async fn run_miner(cli: Cli) -> Result<()> {
         tokio::spawn(async move {
             let started = std::time::Instant::now();
             let rebuild_dir = blobs_bg.clone();
-            match tokio::task::spawn_blocking(move || inventory::rebuild_from_fs(&rebuild_dir)).await
+            match tokio::task::spawn_blocking(move || inventory::rebuild_from_fs(&rebuild_dir))
+                .await
             {
                 Ok(Ok(rebuilt)) if rebuilt > 0 => {
                     info!(count = rebuilt, "inventory: rebuilt from filesystem")
@@ -520,7 +569,8 @@ async fn run_miner(cli: Cli) -> Result<()> {
 
             // Usage counters last: one stat per blob, pure reporting data.
             let sizing_store = Arc::clone(&store_bg);
-            if let Err(e) = tokio::task::spawn_blocking(move || sizing_store.recompute_usage()).await
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || sizing_store.recompute_usage()).await
             {
                 warn!(error = %e, "storage: usage recompute task panicked");
             }
@@ -703,11 +753,12 @@ async fn run_miner(cli: Cli) -> Result<()> {
     // Note: iroh-docs still needs an iroh::Endpoint for gossip. We create a
     // lightweight one just for doc sync. This is temporary until #151 removes iroh-docs.
     if let Ok(ticket) = std::env::var("DOC_TICKET")
-        && !ticket.is_empty() {
-            info!("DOC_TICKET provided — iroh-docs requires iroh::Endpoint (not yet migrated)");
-            // doc_replica::join_doc needs an iroh::Endpoint — skip for now.
-            // This feature will be removed in #151.
-        }
+        && !ticket.is_empty()
+    {
+        info!("DOC_TICKET provided — iroh-docs requires iroh::Endpoint (not yet migrated)");
+        // doc_replica::join_doc needs an iroh::Endpoint — skip for now.
+        // This feature will be removed in #151.
+    }
 
     // 6. Start P2P Heartbeat Loop (reuse registration connection)
     let shutdown_token = CancellationToken::new();
@@ -846,19 +897,20 @@ fn check_network_health() {
         ),
     ] {
         if let Ok(val) = std::fs::read_to_string(path)
-            && let Ok(timeout) = val.trim().parse::<u64>() {
-                if timeout < 120 {
-                    warn!(
-                        param = label,
-                        current_timeout = timeout,
-                        required = 120,
-                        "LOW CONNTRACK UDP TIMEOUT — QUIC connections may drop after {timeout}s. \
+            && let Ok(timeout) = val.trim().parse::<u64>()
+        {
+            if timeout < 120 {
+                warn!(
+                    param = label,
+                    current_timeout = timeout,
+                    required = 120,
+                    "LOW CONNTRACK UDP TIMEOUT — QUIC connections may drop after {timeout}s. \
                          Run: sudo sysctl -w {label}=120"
-                    );
-                } else {
-                    info!(param = label, timeout, "Conntrack UDP timeout OK");
-                }
+                );
+            } else {
+                info!(param = label, timeout, "Conntrack UDP timeout OK");
             }
+        }
     }
 }
 
@@ -997,32 +1049,34 @@ fn spawn_heartbeat_loop(
             heartbeat_count = heartbeat_count.wrapping_add(1);
             if heartbeat_count.is_multiple_of(constants::VALIDATOR_ADDR_REFRESH_INTERVAL_CYCLES)
                 && let Ok(new_validator_id) = std::env::var("VALIDATOR_NODE_ID")
-                    && new_validator_id != current_validator_node_id {
-                        debug!(
-                            old = %truncate_for_log(&current_validator_node_id, 16),
-                            new = %truncate_for_log(&new_validator_id, 16),
-                            "Validator node ID refreshed from environment"
-                        );
-                        current_validator_node_id = new_validator_id;
-                        {
-                            let mut val_id = state::get_validator_node_id_global().write().await;
-                            *val_id = current_validator_node_id.clone();
-                        }
+                && new_validator_id != current_validator_node_id
+            {
+                debug!(
+                    old = %truncate_for_log(&current_validator_node_id, 16),
+                    new = %truncate_for_log(&new_validator_id, 16),
+                    "Validator node ID refreshed from environment"
+                );
+                current_validator_node_id = new_validator_id;
+                {
+                    let mut val_id = state::get_validator_node_id_global().write().await;
+                    *val_id = current_validator_node_id.clone();
+                }
 
-                        // Also check for VALIDATOR_ADDR update
-                        if let Ok(new_addr_str) = std::env::var("VALIDATOR_ADDR")
-                            && let Ok(new_addr) = new_addr_str.parse::<SocketAddr>() {
-                                current_validator_addr = new_addr;
-                                let mut val_addr = state::get_validator_addr().write().await;
-                                *val_addr = Some(current_validator_addr);
-                            }
+                // Also check for VALIDATOR_ADDR update
+                if let Ok(new_addr_str) = std::env::var("VALIDATOR_ADDR")
+                    && let Ok(new_addr) = new_addr_str.parse::<SocketAddr>()
+                {
+                    current_validator_addr = new_addr;
+                    let mut val_addr = state::get_validator_addr().write().await;
+                    *val_addr = Some(current_validator_addr);
+                }
 
-                        if let Some(old) = cached_conn.take() {
-                            old.close(0u32.into(), b"stale");
-                        }
-                        get_needs_reregistration().store(true, std::sync::atomic::Ordering::SeqCst);
-                        continue;
-                    }
+                if let Some(old) = cached_conn.take() {
+                    old.close(0u32.into(), b"stale");
+                }
+                get_needs_reregistration().store(true, std::sync::atomic::Ordering::SeqCst);
+                continue;
+            }
 
             let timestamp = now_secs();
 
@@ -1063,7 +1117,8 @@ fn spawn_heartbeat_loop(
                     signature: signature.to_bytes().to_vec(),
                     endpoint_addr: Some(cached_endpoint_addr.clone()),
                     version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                    is_historical_seeder: state::get_is_historical_seeder().load(std::sync::atomic::Ordering::Relaxed),
+                    is_historical_seeder: state::get_is_historical_seeder()
+                        .load(std::sync::atomic::Ordering::Relaxed),
                 }
             };
 

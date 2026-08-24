@@ -290,7 +290,7 @@ pub fn rebuild_from_fs(blobs_dir: &Path) -> Result<usize> {
 /// Background purge of the trash: enforces the retention TTL, then the
 /// size cap (oldest first). One pass every 5 minutes.
 pub async fn trash_purge_loop(
-    store: std::sync::Arc<crate::flat_store::FlatBlobStore>,
+    store: std::sync::Arc<dyn crate::store::BlobStore>,
     ttl_secs: u64,
     max_bytes: u64,
 ) {
@@ -379,7 +379,7 @@ pub async fn trash_purge_loop(
 /// early purge), and a trashed row whose file is gone is dropped. A hash
 /// that is live on disk AND has a leftover trash copy keeps the live row;
 /// the duplicate trash file is removed.
-pub async fn reconcile_trash(store: &crate::flat_store::FlatBlobStore) -> Result<usize> {
+pub async fn reconcile_trash(store: &dyn crate::store::BlobStore) -> Result<usize> {
     let trashed_files = store.list_trashed_hashes();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

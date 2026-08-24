@@ -35,12 +35,12 @@ use crate::constants::{
     MAX_MESSAGE_SIZE, MAX_PEER_CACHE_ENTRIES, MAX_V2_DATA_SIZE, PEER_BLOB_DOWNLOAD_TIMEOUT_SECS,
     PEER_DATA_RECEPTION_TIMEOUT_SECS, PULL_PERMIT_TIMEOUT_SECS, STORE_PERMIT_TIMEOUT_SECS,
 };
-use crate::flat_store::FlatBlobStore;
 use crate::helpers::{truncate_for_log, verify_signature};
 use crate::state::{
     get_blob_cache, get_cluster_map, get_current_epoch, get_gateway_endpoints,
     get_last_epoch_change, get_peer_cache, get_warden_node_ids,
 };
+use crate::store::BlobStore;
 use anyhow::Result;
 use pos_circuits::commitment::CommitmentWithTree;
 use pos_circuits::prover::generate_proof;
@@ -125,7 +125,7 @@ async fn acquire_permit_with_timeout(
 /// cloned per-connection without data duplication.
 #[derive(Debug, Clone)]
 pub struct MinerControlHandler {
-    pub store: Arc<FlatBlobStore>,
+    pub store: Arc<dyn BlobStore>,
     pub endpoint: quinn::Endpoint,
     pub store_sem: Arc<tokio::sync::Semaphore>,
     pub pull_sem: Arc<tokio::sync::Semaphore>,
@@ -534,7 +534,7 @@ async fn handle_delete(
     remote_node_id: &str,
     validator_node_id: Option<&str>,
     send: &mut quinn::SendStream,
-    store: &FlatBlobStore,
+    store: &dyn BlobStore,
     trash_enabled: bool,
     hash: String,
     validator_signature: Vec<u8>,
@@ -629,7 +629,7 @@ async fn handle_restore_blob(
     remote_node_id: &str,
     validator_node_id: Option<&str>,
     send: &mut quinn::SendStream,
-    store: &FlatBlobStore,
+    store: &dyn BlobStore,
     hash: String,
     validator_signature: Vec<u8>,
 ) -> Result<()> {
@@ -684,7 +684,7 @@ async fn handle_restore_blob(
 
 async fn handle_check_blob(
     send: &mut quinn::SendStream,
-    store: &FlatBlobStore,
+    store: &dyn BlobStore,
     hash: String,
 ) -> Result<()> {
     trace!(hash = %truncate_for_log(&hash, 32), "CheckBlob request");
@@ -735,7 +735,7 @@ async fn handle_list_blobs_page(
 ///   1. JSON header: `{"count":<N>}\n`
 ///   2. One hash per line (lowercase hex BLAKE3), terminated with `\n`
 ///   3. Stream finished (EOF)
-async fn handle_list_all_blobs(send: &mut quinn::SendStream, store: &FlatBlobStore) -> Result<()> {
+async fn handle_list_all_blobs(send: &mut quinn::SendStream, store: &dyn BlobStore) -> Result<()> {
     if !crate::inventory::is_ready() {
         return send_response(send, b"WARMING_UP").await;
     }
@@ -780,7 +780,7 @@ async fn handle_list_all_blobs(send: &mut quinn::SendStream, store: &FlatBlobSto
 
 async fn handle_fetch_blob(
     send: &mut quinn::SendStream,
-    store: &FlatBlobStore,
+    store: &dyn BlobStore,
     fetch_sem: &Arc<tokio::sync::Semaphore>,
     hash: String,
 ) -> Result<()> {
@@ -1079,7 +1079,7 @@ async fn handle_pull_from_peer(
 /// Pull blob from peer using endpoint address.
 /// Extracts SocketAddr from the EndpointAddr and connects via quinn.
 pub async fn pull_blob_from_peer(
-    store: Arc<FlatBlobStore>,
+    store: Arc<dyn BlobStore>,
     endpoint: quinn::Endpoint,
     peer_addr: iroh::EndpointAddr,
     hash: String,
@@ -1205,7 +1205,7 @@ pub async fn pull_blob_from_peer(
 /// Generates a ZK proof demonstrating possession of the challenged chunks.
 async fn handle_pos_challenge(
     send: &mut quinn::SendStream,
-    store: &FlatBlobStore,
+    store: &dyn BlobStore,
     shard_hash: String,
     chunk_indices: Vec<u32>,
     nonce: [u8; 32],

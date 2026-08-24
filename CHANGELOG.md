@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.29] - 2026-08-24
+
+### Miner
+
+- **Packed blob store (opt-in, dormant by default)**: new `STORE_BACKEND=packed`
+  backend storing blobs in large append-only volume files instead of one file
+  per blob. Reed-Solomon striping makes the shard population dominated by tiny
+  shards (bench measurements: median ~100 bytes, >90% under 4 KiB), so nodes
+  holding tens of millions of shards drown in filesystem metadata — the packed
+  layout reduces the store to a few thousand inodes: one sequential append per
+  write, one `pread` per read.
+  - A store is acknowledged only after `fdatasync` of its volume (group
+    commit): an acked shard is durable.
+  - Records are self-describing (name + CRC in the header): volumes are the
+    sole source of truth and the in-RAM index is a rebuildable cache. Torn
+    tails from crashes are detected and truncated on open.
+  - Two-phase deletes (trash / restore / purge) are preserved via a small
+    fsync'd op journal; per-volume dead-byte counters are maintained for a
+    future compaction pass.
+- **Flat → packed background migration**: selecting the packed backend on a
+  data dir with existing per-file blobs serves reads through a hybrid (packed
+  first, flat fallback) while a throttled background task drains the flat
+  layout — 100% local (read local, append local, unlink local), resumable,
+  idempotent, with a `blake3(payload) == name` integrity check before every
+  move (corrupt files are left in place and logged, never carried forward).
+  Emptied shard directories are removed. Throttle via `PACKED_MIGRATE_BATCH` /
+  `PACKED_MIGRATE_PAUSE_MS`.
+- **`BlobStore` trait**: consumers no longer name the storage backend;
+  `FlatBlobStore` (default, unchanged behavior) and `PackedStore` both
+  implement it. Rollback note: volumes written by the packed backend cannot be
+  read by older binaries — keep `STORE_BACKEND=flat` (the default) unless
+  opting a node in deliberately.
+
 ## [0.1.28] - 2026-08-15
 
 ### Miner

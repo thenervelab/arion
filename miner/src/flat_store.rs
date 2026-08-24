@@ -267,7 +267,10 @@ impl FlatBlobStore {
         let Some(path) = self.locate(hash_hex) else {
             return Ok(());
         };
-        let size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+        let size = tokio::fs::metadata(&path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
         let target = self.trash_path(hash_hex);
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -288,7 +291,10 @@ impl FlatBlobStore {
         let Some(path) = self.locate(hash_hex) else {
             return Ok(());
         };
-        let size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+        let size = tokio::fs::metadata(&path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
         match tokio::fs::remove_file(path).await {
             Ok(()) => {
                 self.used_bytes.fetch_sub(size, Ordering::Relaxed);
@@ -304,7 +310,10 @@ impl FlatBlobStore {
         let Some(trashed) = self.locate_trashed(hash_hex) else {
             return Ok(false);
         };
-        let size = tokio::fs::metadata(&trashed).await.map(|m| m.len()).unwrap_or(0);
+        let size = tokio::fs::metadata(&trashed)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
         let target = self.blob_path(hash_hex);
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -325,7 +334,10 @@ impl FlatBlobStore {
         let Some(path) = self.locate_trashed(hash_hex) else {
             return Ok(());
         };
-        let size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+        let size = tokio::fs::metadata(&path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
         match tokio::fs::remove_file(path).await {
             Ok(()) => {
                 self.trash_bytes.fetch_sub(size, Ordering::Relaxed);
@@ -354,12 +366,6 @@ impl FlatBlobStore {
     /// List all stored blob hashes (both layouts).
     pub fn list_hashes(&self) -> Vec<String> {
         walk_bin_names(&self.data_dir)
-    }
-
-    /// Return the data directory path.
-    #[allow(dead_code)]
-    pub fn data_dir(&self) -> &Path {
-        &self.data_dir
     }
 
     /// Return the total size of all stored blobs in bytes.
@@ -467,6 +473,71 @@ impl FlatBlobStore {
     }
 }
 
+/// [`BlobStore`](crate::store::BlobStore) implementation: pure delegation to
+/// the inherent methods above.
+#[async_trait::async_trait]
+impl crate::store::BlobStore for FlatBlobStore {
+    async fn store(&self, hash_hex: &str, data: &[u8]) -> std::io::Result<()> {
+        FlatBlobStore::store(self, hash_hex, data).await
+    }
+
+    async fn read(&self, hash_hex: &str) -> std::io::Result<Bytes> {
+        FlatBlobStore::read(self, hash_hex).await
+    }
+
+    fn has(&self, hash_hex: &str) -> bool {
+        FlatBlobStore::has(self, hash_hex)
+    }
+
+    async fn delete(&self, hash_hex: &str) -> std::io::Result<()> {
+        FlatBlobStore::delete(self, hash_hex).await
+    }
+
+    async fn remove(&self, hash_hex: &str) -> std::io::Result<()> {
+        FlatBlobStore::remove(self, hash_hex).await
+    }
+
+    async fn restore(&self, hash_hex: &str) -> std::io::Result<bool> {
+        FlatBlobStore::restore(self, hash_hex).await
+    }
+
+    async fn purge_trashed(&self, hash_hex: &str) -> std::io::Result<()> {
+        FlatBlobStore::purge_trashed(self, hash_hex).await
+    }
+
+    fn list_hashes(&self) -> Vec<String> {
+        FlatBlobStore::list_hashes(self)
+    }
+
+    fn list_trashed_hashes(&self) -> Vec<String> {
+        FlatBlobStore::list_trashed_hashes(self)
+    }
+
+    fn has_trashed(&self, hash_hex: &str) -> bool {
+        FlatBlobStore::has_trashed(self, hash_hex)
+    }
+
+    fn used_bytes(&self) -> u64 {
+        FlatBlobStore::used_bytes(self)
+    }
+
+    fn trash_bytes(&self) -> u64 {
+        FlatBlobStore::trash_bytes(self)
+    }
+
+    fn recompute_usage(&self) {
+        FlatBlobStore::recompute_usage(self)
+    }
+
+    fn cleanup_stale_tmp(&self) -> usize {
+        FlatBlobStore::cleanup_stale_tmp(self)
+    }
+
+    async fn migrate_legacy_layout(&self, batch: usize, pause: std::time::Duration) -> u64 {
+        FlatBlobStore::migrate_legacy_layout(self, batch, pause).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,7 +550,12 @@ mod tests {
         let store = FlatBlobStore::new(dir.path()).unwrap();
 
         store.store(HASH, b"hello").await.unwrap();
-        assert!(dir.path().join("aa/11").join(format!("{HASH}.bin")).exists());
+        assert!(
+            dir.path()
+                .join("aa/11")
+                .join(format!("{HASH}.bin"))
+                .exists()
+        );
         assert_eq!(store.used_bytes(), 5);
         assert!(store.has(HASH));
 
@@ -518,7 +594,12 @@ mod tests {
             .await;
         assert_eq!(moved, 1);
         assert!(!dir.path().join(format!("{HASH}.bin")).exists());
-        assert!(dir.path().join("aa/11").join(format!("{HASH}.bin")).exists());
+        assert!(
+            dir.path()
+                .join("aa/11")
+                .join(format!("{HASH}.bin"))
+                .exists()
+        );
         assert_eq!(store.read(HASH).await.unwrap().as_ref(), b"legacy");
 
         // Trash a legacy-placed blob: it lands in the sharded trash.

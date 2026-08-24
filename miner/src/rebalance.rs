@@ -28,10 +28,10 @@ use crate::constants::{
     REBALANCE_FETCH_MIN_CONCURRENCY, REBALANCE_FETCH_SCALEUP_THRESHOLD,
     REBALANCE_MAX_FILES_PER_CYCLE,
 };
-use crate::flat_store::FlatBlobStore;
 use crate::state::{
     get_cluster_map, get_validator_addr, get_validator_node_id_global, get_validator_reachable,
 };
+use crate::store::BlobStore;
 use anyhow::Result;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -178,7 +178,9 @@ async fn get_or_fetch_cluster_map(
     // Secondary path: check local epoch_archive on disk.
     let mut fetched = None;
     if let Some(data_dir) = crate::state::get_data_dir() {
-        let path = data_dir.join("epoch_archive").join(format!("epoch_{}.json", epoch));
+        let path = data_dir
+            .join("epoch_archive")
+            .join(format!("epoch_{}.json", epoch));
         if let Ok(bytes) = tokio::fs::read(&path).await {
             if let Ok(map) = serde_json::from_slice::<common::ClusterMap>(&bytes) {
                 fetched = Some(map);
@@ -221,7 +223,7 @@ async fn get_or_fetch_cluster_map(
 /// Uses validator P2P as primary source. Falls back to local iroh-doc replica
 /// when validator is unreachable, enabling fully offline self-healing.
 pub async fn self_rebalance_pg(
-    store: Arc<FlatBlobStore>,
+    store: Arc<dyn BlobStore>,
     endpoint: quinn::Endpoint,
     signing_key: Arc<ed25519_dalek::SigningKey>,
 ) -> Result<()> {
@@ -526,7 +528,8 @@ pub async fn self_rebalance_pg(
                             // Lazily fetch the placement-epoch cluster map if
                             // we haven't seen this epoch before.
                             let pe = manifest.placement_epoch;
-                            if !placement_epoch_maps.contains_key(&pe) && pe != cluster_map.epoch
+                            if !placement_epoch_maps.contains_key(&pe)
+                                && pe != cluster_map.epoch
                                 && let Some(pe_map) = get_or_fetch_cluster_map(
                                     &endpoint,
                                     &signing_key,
@@ -535,9 +538,9 @@ pub async fn self_rebalance_pg(
                                     pe,
                                 )
                                 .await
-                                {
-                                    placement_epoch_maps.insert(pe, pe_map);
-                                }
+                            {
+                                placement_epoch_maps.insert(pe, pe_map);
+                            }
                             tally_manifest_shards(
                                 &file_hash,
                                 &manifest,
@@ -605,19 +608,20 @@ pub async fn self_rebalance_pg(
                             // (doc fallback path — validator may still be
                             // reachable for epoch map queries).
                             let pe = manifest.placement_epoch;
-                            if !placement_epoch_maps.contains_key(&pe) && pe != cluster_map.epoch
+                            if !placement_epoch_maps.contains_key(&pe)
+                                && pe != cluster_map.epoch
                                 && let Some(val_addr) = validator_addr
-                                    && let Some(pe_map) = get_or_fetch_cluster_map(
-                                        &endpoint,
-                                        &signing_key,
-                                        &validator_node_id,
-                                        val_addr,
-                                        pe,
-                                    )
-                                    .await
-                                    {
-                                        placement_epoch_maps.insert(pe, pe_map);
-                                    }
+                                && let Some(pe_map) = get_or_fetch_cluster_map(
+                                    &endpoint,
+                                    &signing_key,
+                                    &validator_node_id,
+                                    val_addr,
+                                    pe,
+                                )
+                                .await
+                            {
+                                placement_epoch_maps.insert(pe, pe_map);
+                            }
                             tally_manifest_shards(
                                 file_hash,
                                 &manifest,
@@ -728,7 +732,7 @@ async fn tally_manifest_shards(
     cluster_map: &common::ClusterMap,
     history_maps: &[Arc<common::ClusterMap>],
     placement_epoch_maps: &std::collections::HashMap<u64, Arc<common::ClusterMap>>,
-    store: &FlatBlobStore,
+    store: &dyn BlobStore,
     local_hashes: &std::collections::HashSet<iroh_blobs::Hash>,
     expected_shards: &mut std::collections::HashSet<iroh_blobs::Hash>,
     missing_shards: &mut usize,
@@ -736,8 +740,7 @@ async fn tally_manifest_shards(
 ) {
     let shards_per_stripe = manifest.stripe_config.k + manifest.stripe_config.m;
     let num_stripes = manifest.shards.len().div_ceil(shards_per_stripe);
-    let placement_versions_to_try =
-        repair_placement_versions_to_try(manifest.placement_version);
+    let placement_versions_to_try = repair_placement_versions_to_try(manifest.placement_version);
 
     for stripe_idx in 0..num_stripes {
         let stripe_miners = match common::calculate_stripe_placement(
@@ -857,12 +860,13 @@ async fn tally_manifest_shards(
                         // Also try all other stripe miners as FetchBlob sources
                         // (they may have the blob from a previous assignment).
                         for (i, m) in stripe_miners.iter().enumerate() {
-                            if i != local_idx && m.uid != my_uid
+                            if i != local_idx
+                                && m.uid != my_uid
                                 && let Some(addr) =
                                     crate::state::socket_addr_from_endpoint(&m.endpoint)
-                                {
-                                    peers.push((m.endpoint.id.to_string(), addr));
-                                }
+                            {
+                                peers.push((m.endpoint.id.to_string(), addr));
+                            }
                         }
                         // Deduplicate by node_id
                         peers.dedup_by(|a, b| a.0 == b.0);
@@ -873,7 +877,8 @@ async fn tally_manifest_shards(
                             let mut stripe_shard_hashes = vec![None; shards_per_stripe];
                             for shard in &manifest.shards {
                                 if shard.index >= start_global_idx && shard.index < end_global_idx {
-                                    stripe_shard_hashes[shard.index - start_global_idx] = Some(shard.blob_hash.clone());
+                                    stripe_shard_hashes[shard.index - start_global_idx] =
+                                        Some(shard.blob_hash.clone());
                                 }
                             }
 
@@ -914,7 +919,7 @@ async fn tally_manifest_shards(
 /// Returns the number of shards successfully fetched.
 async fn fetch_missing_shards(
     missing: Vec<MissingShard>,
-    store: &Arc<FlatBlobStore>,
+    store: &Arc<dyn BlobStore>,
     endpoint: &quinn::Endpoint,
 ) -> usize {
     if missing.is_empty() {
@@ -1056,12 +1061,8 @@ async fn fetch_missing_shards(
                         file_hash = %ctx.file_hash,
                         "Peer fetch failed, attempting local erasure coding recovery"
                     );
-                    if perform_erasure_recovery(
-                        &shard.blob_hash_str,
-                        ctx,
-                        &store,
-                        &endpoint,
-                    ).await {
+                    if perform_erasure_recovery(&shard.blob_hash_str, ctx, &store, &endpoint).await
+                    {
                         success = true;
                     }
                 }
@@ -1313,7 +1314,7 @@ pub async fn reconstruct_shard(
     shard_index: usize,
     stripe_index: u64,
     manifest: &common::FileManifest,
-    store: &FlatBlobStore,
+    store: &dyn BlobStore,
     endpoint: &quinn::Endpoint,
     fetch_sem: &Arc<Semaphore>,
 ) -> Result<bool> {
@@ -1380,7 +1381,10 @@ pub async fn reconstruct_shard(
             &cluster_map,
             &placement_versions_to_try,
         );
-        if stripe_candidates.iter().all(|candidates| candidates.is_empty()) {
+        if stripe_candidates
+            .iter()
+            .all(|candidates| candidates.is_empty())
+        {
             warn!("[REBALANCE] Failed to calculate stripe placement for reconstruction");
             return Ok(false);
         }
@@ -1526,7 +1530,7 @@ pub async fn reconstruct_shard(
 async fn perform_erasure_recovery(
     missing_blob_hash: &str,
     ctx: &ErasureRecoveryCtx,
-    store: &Arc<FlatBlobStore>,
+    store: &Arc<dyn BlobStore>,
     endpoint: &quinn::Endpoint,
 ) -> bool {
     let k = ctx.stripe_config.k;
@@ -1622,7 +1626,7 @@ async fn perform_erasure_recovery(
         if let Ok((idx, Some(data))) = res {
             shards[idx] = Some(data);
             fetched_count += 1;
-            
+
             // Fast-path: if we have enough shards, abort remaining tasks
             if fetched_count >= k {
                 fetch_tasks.abort_all();
@@ -1634,9 +1638,7 @@ async fn perform_erasure_recovery(
     if fetched_count < k {
         debug!(
             missing_blob_hash,
-            fetched_count,
-            k,
-            "[REBALANCE] Erasure recovery failed: not enough shards fetched"
+            fetched_count, k, "[REBALANCE] Erasure recovery failed: not enough shards fetched"
         );
         return false;
     }

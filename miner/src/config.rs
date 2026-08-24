@@ -159,6 +159,14 @@ pub struct StorageConfig {
     #[serde(default = "default_storage_path")]
     pub path: String,
 
+    /// Storage backend: "flat" (one file per blob, the default) or
+    /// "packed" (append-only volumes + in-RAM index). Overridable via the
+    /// STORE_BACKEND env var. "packed" only serves blobs written while in
+    /// packed mode — keep "flat" on nodes with existing per-file data until
+    /// the migrator ships.
+    #[serde(default = "default_store_backend")]
+    pub backend: String,
+
     /// Maximum storage to use in GB (0 = unlimited)
     #[serde(default)]
     pub max_storage_gb: u64,
@@ -195,6 +203,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             path: default_storage_path(),
+            backend: default_store_backend(),
             max_storage_gb: 0,
             data_dir: default_data_dir(),
             trash_enabled: default_trash_enabled(),
@@ -202,6 +211,10 @@ impl Default for StorageConfig {
             trash_max_bytes: 0,
         }
     }
+}
+
+fn default_store_backend() -> String {
+    "flat".to_string()
 }
 
 fn default_storage_path() -> String {
