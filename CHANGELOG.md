@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.30] - 2026-08-24
+
+### Miner
+
+- **Fix auto-update on split-volume installs**: the updater staged the
+  downloaded binary in the service working directory, then `rename(2)`d it
+  over the installed executable. When the data directory and the executable
+  live on different filesystems the rename fails with `EXDEV` (os error 18)
+  and the node retries forever — downloading and discarding the full binary
+  every cycle without ever updating. The download is now staged in the
+  executable's own directory (same-filesystem, atomic rename), with a
+  durable copy + fsync + rename fallback if the rename still crosses
+  filesystems. Version verification before the swap and backup/restore on
+  failure are unchanged; staging files are removed on any failure instead of
+  being left behind.
+
 ## [0.1.29] - 2026-08-24
 
 ### Miner
