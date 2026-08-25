@@ -17,6 +17,18 @@ All notable changes to this project will be documented in this file.
   filesystems. Version verification before the swap and backup/restore on
   failure are unchanged; staging files are removed on any failure instead of
   being left behind.
+- **Flat memory profile on nodes holding tens of millions of blobs**: every
+  walk over a blob space now streams entries through a visitor instead of
+  materializing the full name list (a collected listing cost gigabytes of
+  permanent heap on bench nodes at 70M blobs), the packed store's live index
+  is disk-backed via a paged mmap table instead of a heap map, and the
+  inventory rebuild streams inserts in bounded batches.
+- **Packed writer admission control**: `store()` now takes byte-permits
+  before enqueueing, bounding bytes in flight to the volume writer — a burst
+  of stores backpressures the sender instead of growing an unbounded queue.
+- **Packed reads survive volume relocation**: stale volume file descriptors
+  are detected and reopened, so reads keep working when a volume file is
+  moved within a union filesystem.
 - **Fix flat→packed mover stall on giant flat roots**: the mover listed the
   data root to discover the shard directories before moving anything. On
   nodes still mid-way through the 0.1.28 flat→sharded migration that root

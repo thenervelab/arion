@@ -48,6 +48,20 @@
 //!   digest; the full name in the record header is compared to the request
 //!   before returning payload, and the payload CRC is checked, so an index
 //!   collision or bit rot yields NotFound / InvalidData, never wrong bytes.
+//! - **Writer admission is bounded by BYTES in flight.** Every queued
+//!   `StoreReq` owns a full payload copy, so an unbounded queue turns any
+//!   producer that outruns the fsync-bound writer into unbounded heap
+//!   growth (measured in production as multi-GB RSS whose per-blob cost
+//!   tracked the producer's lead over the writer, not the index size).
+//!   `store()` takes byte-permits before enqueueing and the permits are
+//!   released only when the writer retires the request, so producers stall
+//!   on a full budget instead of accumulating — backpressure end to end.
+//!   The budget is in bytes, not messages: payloads span ~100 B to
+//!   ~840 KB, so a message cap is either too loose for big blobs (512 x
+//!   840 KB is still 430 MB) or starves tiny ones for nothing. Peak heap
+//!   for pending writes is ~2x the budget (queued payloads + the writer's
+//!   batch buffer). `PACKED_INFLIGHT_MAX_BYTES` overrides the 128 MiB
+//!   default.
 //!
 //! Trashed and overwritten payloads remain in their volumes as dead bytes
 //! until a future compaction pass; per-volume dead-byte counters are already
@@ -79,12 +93,31 @@ const DEFAULT_VOLUME_TARGET: u64 = 1 << 30;
 /// Snapshot is rewritten after this many index mutations since the last one.
 const SNAPSHOT_EVERY_OPS: u64 = 500_000;
 
+/// Default byte budget for writes queued to the writer (see module docs).
+const DEFAULT_INFLIGHT_BUDGET: u64 = 128 << 20;
+
+/// Fixed per-request admission overhead on top of the payload: the queued
+/// `StoreReq` itself, its name String, channel node and oneshot. Also the
+/// floor cost of a tiny blob, which bounds the message COUNT a budget can
+/// admit (128 MiB / 512 B = ~260k tiny messages, ~tens of MB of overhead).
+const REQ_OVERHEAD_BYTES: u64 = 512;
+
 fn volume_target_bytes() -> u64 {
     std::env::var("PACKED_VOLUME_TARGET_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|v: &u64| *v >= 1 << 20)
         .unwrap_or(DEFAULT_VOLUME_TARGET)
+}
+
+/// In-flight write budget in bytes. Clamped so `acquire_many(u32)` and the
+/// semaphore permit ceiling can never be exceeded.
+fn inflight_budget_bytes() -> u64 {
+    std::env::var("PACKED_INFLIGHT_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_INFLIGHT_BUDGET)
+        .clamp(8 << 20, 2 << 30)
 }
 
 /// Truncated 16-byte digest of a blob name — the in-RAM index key. The full
@@ -103,15 +136,7 @@ fn record_len(name_len: usize, payload_len: usize) -> u64 {
     pad_to_align((REC_HEADER_LEN + name_len + payload_len) as u64)
 }
 
-/// Location of a live payload inside a volume.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Loc {
-    vol: u32,
-    /// Offset of the record header inside the volume file.
-    off: u64,
-    name_len: u16,
-    payload_len: u32,
-}
+use crate::mmap_index::{Loc, MmapLiveIndex};
 
 #[derive(Clone, Debug)]
 struct TrashEntry {
@@ -119,18 +144,40 @@ struct TrashEntry {
     name: String,
 }
 
-#[derive(Debug, Default)]
+/// Index state. The live map is DISK-BACKED (mmap, ~40 B of file-backed
+/// pages per blob, ~0 anonymous bytes): at tens of millions of blobs an
+/// in-RAM HashMap is gigabytes of unevictable anon memory on nodes that
+/// need that RAM for serving. Trash stays a HashMap — it holds full names
+/// and is orders of magnitude smaller (bounded by the 14-day trash TTL).
+#[derive(Debug)]
 struct IndexState {
-    live: HashMap<u128, Loc>,
+    live: MmapLiveIndex,
     trash: HashMap<u128, TrashEntry>,
     /// Bytes made dead per volume (overwrites + purges) — compaction input.
     dead_bytes: HashMap<u32, u64>,
+}
+
+/// Byte-permits held by a queued write. Dropping it (writer retired the
+/// request, or the request was lost) returns the budget and the gauge.
+struct Admission {
+    bytes: u64,
+    gauge: Arc<AtomicU64>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.gauge.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
 }
 
 struct StoreReq {
     name: String,
     data: Bytes,
     ack: tokio::sync::oneshot::Sender<std::io::Result<()>>,
+    /// Held until the writer drops the request after ACK: releasing earlier
+    /// would let producers refill the queue while payloads still sit in it.
+    _admission: Admission,
 }
 
 /// Append-only packed blob store. See module docs.
@@ -147,6 +194,12 @@ pub struct PackedStore {
     /// Index mutations since the last snapshot (snapshot trigger).
     ops_since_snapshot: AtomicU64,
     writer_tx: tokio::sync::mpsc::UnboundedSender<StoreReq>,
+    /// Byte-permits gating writer admission (see module docs). The mpsc
+    /// stays unbounded because this semaphore IS the bound.
+    admission: Arc<tokio::sync::Semaphore>,
+    inflight_budget: u64,
+    /// Bytes currently admitted (gauge; exact upper bound = budget).
+    inflight_bytes: Arc<AtomicU64>,
     /// Serializes journal appends and snapshot writes.
     journal: Mutex<std::fs::File>,
     /// Read-side FD cache, one handle per volume.
@@ -216,13 +269,24 @@ impl PackedStore {
     /// if present, scans volume tails from their watermarks, replays the op
     /// journal, truncates any torn tail, and spawns the writer task.
     pub fn open(root: impl AsRef<Path>) -> std::io::Result<Arc<Self>> {
-        Self::open_with_target(root, volume_target_bytes())
+        Self::open_with_limits(root, volume_target_bytes(), inflight_budget_bytes())
     }
 
     /// [`open`](Self::open) with an explicit volume-roll threshold (tests).
+    #[cfg(test)]
     pub(crate) fn open_with_target(
         root: impl AsRef<Path>,
         volume_target: u64,
+    ) -> std::io::Result<Arc<Self>> {
+        Self::open_with_limits(root, volume_target, inflight_budget_bytes())
+    }
+
+    /// [`open`](Self::open) with explicit volume-roll and in-flight-byte
+    /// limits (tests exercise backpressure with tiny budgets).
+    pub(crate) fn open_with_limits(
+        root: impl AsRef<Path>,
+        volume_target: u64,
+        inflight_budget: u64,
     ) -> std::io::Result<Arc<Self>> {
         let root = root.as_ref().to_path_buf();
         let volumes_dir = root.join("volumes");
@@ -230,15 +294,27 @@ impl PackedStore {
         std::fs::create_dir_all(&volumes_dir)?;
         std::fs::create_dir_all(&index_dir)?;
 
-        let mut idx = IndexState::default();
+        let (live, sweep) = MmapLiveIndex::open(&index_dir.join("live.idx"))?;
+        let mut idx = IndexState {
+            live,
+            trash: HashMap::new(),
+            dead_bytes: HashMap::new(),
+        };
         let mut watermarks: HashMap<u32, u64> = HashMap::new();
         let mut journal_covered = 0u64;
-        load_snapshot(
-            &index_dir.join("snapshot.bin"),
-            &mut idx,
-            &mut watermarks,
-            &mut journal_covered,
-        );
+        if sweep.torn {
+            // The live table cannot be trusted: ignore the snapshot too and
+            // rebuild everything from the volumes plus the full journal
+            // (which is never truncated), exactly like a missing snapshot.
+            tracing::warn!("packed store: live index rebuilt from volumes (full scan)");
+        } else {
+            load_snapshot(
+                &index_dir.join("snapshot.bin"),
+                &mut idx,
+                &mut watermarks,
+                &mut journal_covered,
+            );
+        }
 
         // Enumerate volumes, scan each from its watermark, truncate torn
         // tails. Records override snapshot state (they are the truth).
@@ -275,7 +351,7 @@ impl PackedStore {
                     name_len,
                     payload_len,
                 };
-                if let Some(old) = idx.live.insert(key, loc) {
+                if let Some(old) = idx.live.insert(key, loc)? {
                     *idx.dead_bytes.entry(old.vol).or_default() += old.payload_len as u64;
                 }
                 if let Some(t) = idx.trash.remove(&key) {
@@ -311,9 +387,10 @@ impl PackedStore {
         }
         replay_journal(&mut journal, journal_covered, &mut idx);
 
-        for loc in idx.live.values() {
-            used += loc.payload_len as u64;
-        }
+        // Seal the rebuilt/updated table now: a clean boot from here on
+        // trusts it and only scans volume tails.
+        idx.live.flush()?;
+        idx.live.for_each(|_, loc| used += loc.payload_len as u64);
         for t in idx.trash.values() {
             trashed += t.loc.payload_len as u64;
         }
@@ -329,6 +406,9 @@ impl PackedStore {
             volume_bytes: AtomicU64::new(volume_bytes),
             ops_since_snapshot: AtomicU64::new(0),
             writer_tx,
+            admission: Arc::new(tokio::sync::Semaphore::new(inflight_budget as usize)),
+            inflight_budget,
+            inflight_bytes: Arc::new(AtomicU64::new(0)),
             journal: Mutex::new(journal),
             fds: RwLock::new(HashMap::new()),
             watermarks: Mutex::new(watermarks),
@@ -408,35 +488,43 @@ impl PackedStore {
                     buf.extend_from_slice(&rec);
                 }
 
-                let write_res = file.write_all(&buf).and_then(|_| file.sync_data());
-                match write_res {
-                    Ok(()) => {
-                        vol_len += buf.len() as u64;
-                        store
-                            .volume_bytes
-                            .fetch_add(buf.len() as u64, Ordering::Relaxed);
-                        {
-                            let mut idx = store.idx.write().unwrap();
-                            for (key, loc, _) in &placed {
-                                if let Some(old) = idx.live.insert(*key, *loc) {
-                                    *idx.dead_bytes.entry(old.vol).or_default() +=
-                                        old.payload_len as u64;
-                                    store
-                                        .used_bytes
-                                        .fetch_sub(old.payload_len as u64, Ordering::Relaxed);
-                                }
-                                if let Some(t) = idx.trash.remove(key) {
-                                    *idx.dead_bytes.entry(t.loc.vol).or_default() +=
-                                        t.loc.payload_len as u64;
-                                    store
-                                        .trash_bytes
-                                        .fetch_sub(t.loc.payload_len as u64, Ordering::Relaxed);
-                                }
-                                store
-                                    .used_bytes
-                                    .fetch_add(loc.payload_len as u64, Ordering::Relaxed);
-                            }
+                let append_res = file.write_all(&buf).and_then(|_| file.sync_data());
+                let publish_res = append_res.and_then(|()| {
+                    // The append is durable: account it regardless of what
+                    // the index says next, so later offsets stay correct.
+                    vol_len += buf.len() as u64;
+                    store
+                        .volume_bytes
+                        .fetch_add(buf.len() as u64, Ordering::Relaxed);
+                    // An index insert can itself fail (mmap grow hits an
+                    // I/O error). The records are then durable but
+                    // unindexed — they sit past the snapshot watermark, so
+                    // the next open re-scans and re-indexes them; callers
+                    // get an error and keep their source copy (re-store is
+                    // idempotent).
+                    let mut idx = store.idx.write().unwrap();
+                    for (key, loc, _) in &placed {
+                        if let Some(old) = idx.live.insert(*key, *loc)? {
+                            *idx.dead_bytes.entry(old.vol).or_default() += old.payload_len as u64;
+                            store
+                                .used_bytes
+                                .fetch_sub(old.payload_len as u64, Ordering::Relaxed);
                         }
+                        if let Some(t) = idx.trash.remove(key) {
+                            *idx.dead_bytes.entry(t.loc.vol).or_default() +=
+                                t.loc.payload_len as u64;
+                            store
+                                .trash_bytes
+                                .fetch_sub(t.loc.payload_len as u64, Ordering::Relaxed);
+                        }
+                        store
+                            .used_bytes
+                            .fetch_add(loc.payload_len as u64, Ordering::Relaxed);
+                    }
+                    Ok(())
+                });
+                match publish_res {
+                    Ok(()) => {
                         store
                             .ops_since_snapshot
                             .fetch_add(placed.len() as u64, Ordering::Relaxed);
@@ -445,9 +533,11 @@ impl PackedStore {
                         }
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "packed store: batch append failed");
-                        // Nothing was published; the file may hold a torn
-                        // batch which the next open truncates away.
+                        tracing::error!(error = %e, "packed store: batch append/publish failed");
+                        // Either nothing was appended (torn batch truncated
+                        // at next open) or it was appended but not fully
+                        // indexed (re-scanned at next open): every caller
+                        // must treat this store as not having happened.
                         for req in batch {
                             let _ = req
                                 .ack
@@ -498,8 +588,7 @@ impl PackedStore {
         Ok(f)
     }
 
-    fn read_at(&self, loc: Loc, want_name: &str) -> std::io::Result<Bytes> {
-        let f = self.fd(loc.vol)?;
+    fn read_at_with(f: &std::fs::File, loc: Loc, want_name: &str) -> std::io::Result<Bytes> {
         let name_len = loc.name_len as usize;
         let mut buf = vec![0u8; REC_HEADER_LEN + name_len + loc.payload_len as usize];
         f.read_exact_at(&mut buf, loc.off)?;
@@ -517,6 +606,25 @@ impl PackedStore {
             ));
         }
         Ok(Bytes::from(payload))
+    }
+
+    fn read_at(&self, loc: Loc, want_name: &str) -> std::io::Result<Bytes> {
+        match Self::read_at_with(self.fd(loc.vol)?.as_ref(), loc, want_name) {
+            Ok(b) => Ok(b),
+            // NotFound is a truncated-key collision — authoritative, no
+            // point retrying.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(e),
+            Err(_) => {
+                // A cached FD can go stale when the volume file is
+                // relocated underneath us — mergerfs `moveonenospc=true`
+                // moves a volume to another branch when its branch fills,
+                // and the old inode our FD points at is truncated/gone
+                // (reads hit EOF). Evict, reopen by path (resolves to the
+                // relocated file), retry once.
+                self.fds.write().unwrap().remove(&loc.vol);
+                Self::read_at_with(self.fd(loc.vol)?.as_ref(), loc, want_name)
+            }
+        }
     }
 
     /// Append one op to the journal and fsync it. Op rate is a handful per
@@ -559,23 +667,22 @@ impl PackedStore {
             v
         };
         {
-            let idx = self.idx.read().unwrap();
+            // Write lock: msync of the live table must not interleave with
+            // concurrent inserts, and the trash serialization below must be
+            // consistent with it. Snapshots are rare (every 500k ops).
+            let mut idx = self.idx.write().unwrap();
+            // Order matters: the live table is stamped+synced BEFORE the
+            // watermarks that declare what it covers. A crash in between
+            // only makes the next open re-scan a longer volume tail.
+            idx.live.flush()?;
             let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
             w.write_all(&SNAP_MAGIC.to_le_bytes())?;
-            w.write_all(&1u32.to_le_bytes())?; // version
+            w.write_all(&2u32.to_le_bytes())?; // version 2: no live section
             w.write_all(&jlen.to_le_bytes())?;
             w.write_all(&(watermarks.len() as u32).to_le_bytes())?;
             for (vol, len) in &watermarks {
                 w.write_all(&vol.to_le_bytes())?;
                 w.write_all(&len.to_le_bytes())?;
-            }
-            w.write_all(&(idx.live.len() as u64).to_le_bytes())?;
-            for (key, loc) in &idx.live {
-                w.write_all(&key.to_le_bytes())?;
-                w.write_all(&loc.vol.to_le_bytes())?;
-                w.write_all(&loc.off.to_le_bytes())?;
-                w.write_all(&loc.name_len.to_le_bytes())?;
-                w.write_all(&loc.payload_len.to_le_bytes())?;
             }
             w.write_all(&(idx.trash.len() as u64).to_le_bytes())?;
             for t in idx.trash.values() {
@@ -620,7 +727,11 @@ fn load_snapshot(
         if u32::from_le_bytes(b4) != SNAP_MAGIC {
             return Err(std::io::ErrorKind::InvalidData.into());
         }
-        f.read_exact(&mut b4)?; // version
+        f.read_exact(&mut b4)?;
+        let version = u32::from_le_bytes(b4);
+        if version != 1 && version != 2 {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
         f.read_exact(&mut b8)?;
         *journal_covered = u64::from_le_bytes(b8);
         f.read_exact(&mut b4)?;
@@ -631,28 +742,32 @@ fn load_snapshot(
             f.read_exact(&mut b8)?;
             watermarks.insert(vol, u64::from_le_bytes(b8));
         }
-        f.read_exact(&mut b8)?;
-        let n_live = u64::from_le_bytes(b8);
-        for _ in 0..n_live {
-            f.read_exact(&mut b16)?;
-            let key = u128::from_le_bytes(b16);
-            f.read_exact(&mut b4)?;
-            let vol = u32::from_le_bytes(b4);
+        if version == 1 {
+            // v1 carried the whole live index in the snapshot; import it
+            // into the mmap table (one-time upgrade on first boot).
             f.read_exact(&mut b8)?;
-            let off = u64::from_le_bytes(b8);
-            f.read_exact(&mut b2)?;
-            let name_len = u16::from_le_bytes(b2);
-            f.read_exact(&mut b4)?;
-            let payload_len = u32::from_le_bytes(b4);
-            idx.live.insert(
-                key,
-                Loc {
-                    vol,
-                    off,
-                    name_len,
-                    payload_len,
-                },
-            );
+            let n_live = u64::from_le_bytes(b8);
+            for _ in 0..n_live {
+                f.read_exact(&mut b16)?;
+                let key = u128::from_le_bytes(b16);
+                f.read_exact(&mut b4)?;
+                let vol = u32::from_le_bytes(b4);
+                f.read_exact(&mut b8)?;
+                let off = u64::from_le_bytes(b8);
+                f.read_exact(&mut b2)?;
+                let name_len = u16::from_le_bytes(b2);
+                f.read_exact(&mut b4)?;
+                let payload_len = u32::from_le_bytes(b4);
+                idx.live.insert(
+                    key,
+                    Loc {
+                        vol,
+                        off,
+                        name_len,
+                        payload_len,
+                    },
+                )?;
+            }
         }
         f.read_exact(&mut b8)?;
         let n_trash = u64::from_le_bytes(b8);
@@ -689,7 +804,9 @@ fn load_snapshot(
     };
     if let Err(e) = parse() {
         tracing::warn!(error = %e, "packed store: snapshot unreadable, falling back to full scan");
-        idx.live.clear();
+        if let Err(e) = idx.live.wipe() {
+            tracing::error!(error = %e, "packed store: live index wipe failed");
+        }
         idx.trash.clear();
         watermarks.clear();
         *journal_covered = 0;
@@ -732,7 +849,7 @@ fn replay_journal(journal: &mut std::fs::File, from: u64, idx: &mut IndexState) 
             let key = name_key(name);
             match op {
                 OP_DELETE => {
-                    if let Some(loc) = idx.live.remove(&key) {
+                    if let Some(loc) = idx.live.remove(key) {
                         idx.trash.insert(
                             key,
                             TrashEntry {
@@ -744,7 +861,9 @@ fn replay_journal(journal: &mut std::fs::File, from: u64, idx: &mut IndexState) 
                 }
                 OP_RESTORE => {
                     if let Some(t) = idx.trash.remove(&key) {
-                        idx.live.insert(key, t.loc);
+                        if let Err(e) = idx.live.insert(key, t.loc) {
+                            tracing::error!(error = %e, "packed store: replay insert failed");
+                        }
                     }
                 }
                 OP_PURGE => {
@@ -762,12 +881,29 @@ fn replay_journal(journal: &mut std::fs::File, from: u64, idx: &mut IndexState) 
 #[async_trait::async_trait]
 impl crate::store::BlobStore for PackedStore {
     async fn store(&self, hash_hex: &str, data: &[u8]) -> std::io::Result<()> {
+        // Admission before the payload copy: while the writer is behind,
+        // producers wait here holding only their caller-owned slice, not a
+        // queued duplicate. Cost is capped at the budget so one oversized
+        // blob can still be admitted (alone) instead of deadlocking.
+        let cost = (data.len() as u64 + REQ_OVERHEAD_BYTES).min(self.inflight_budget) as u32;
+        let permit = Arc::clone(&self.admission)
+            .acquire_many_owned(cost)
+            .await
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+        self.inflight_bytes
+            .fetch_add(cost as u64, Ordering::Relaxed);
+        let admission = Admission {
+            bytes: cost as u64,
+            gauge: Arc::clone(&self.inflight_bytes),
+            _permit: permit,
+        };
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.writer_tx
             .send(StoreReq {
                 name: hash_hex.to_string(),
                 data: Bytes::copy_from_slice(data),
                 ack: tx,
+                _admission: admission,
             })
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
         rx.await
@@ -778,8 +914,7 @@ impl crate::store::BlobStore for PackedStore {
         let loc = {
             let idx = self.idx.read().unwrap();
             idx.live
-                .get(&name_key(hash_hex))
-                .copied()
+                .get(name_key(hash_hex))
                 .ok_or(std::io::ErrorKind::NotFound)?
         };
         // Payloads are small (median ~100B, p99 < 1 MiB): a blocking pread
@@ -792,17 +927,17 @@ impl crate::store::BlobStore for PackedStore {
             .read()
             .unwrap()
             .live
-            .contains_key(&name_key(hash_hex))
+            .contains_key(name_key(hash_hex))
     }
 
     async fn delete(&self, hash_hex: &str) -> std::io::Result<()> {
         let key = name_key(hash_hex);
-        if !self.idx.read().unwrap().live.contains_key(&key) {
+        if !self.idx.read().unwrap().live.contains_key(key) {
             return Ok(());
         }
         self.journal_op(OP_DELETE, hash_hex)?;
         let mut idx = self.idx.write().unwrap();
-        if let Some(loc) = idx.live.remove(&key) {
+        if let Some(loc) = idx.live.remove(key) {
             self.used_bytes
                 .fetch_sub(loc.payload_len as u64, Ordering::Relaxed);
             self.trash_bytes
@@ -837,7 +972,7 @@ impl crate::store::BlobStore for PackedStore {
                 .fetch_sub(t.loc.payload_len as u64, Ordering::Relaxed);
             self.used_bytes
                 .fetch_add(t.loc.payload_len as u64, Ordering::Relaxed);
-            idx.live.insert(key, t.loc);
+            idx.live.insert(key, t.loc)?;
             self.ops_since_snapshot.fetch_add(1, Ordering::Relaxed);
             return Ok(true);
         }
@@ -867,7 +1002,7 @@ impl crate::store::BlobStore for PackedStore {
         let mut out = Vec::new();
         let trash_keys: std::collections::HashSet<u128> = {
             let idx = self.idx.read().unwrap();
-            out.reserve(idx.live.len());
+            out.reserve(idx.live.len() as usize);
             idx.trash.keys().copied().collect()
         };
         let mut seen: std::collections::HashSet<u128> = std::collections::HashSet::new();
@@ -894,7 +1029,7 @@ impl crate::store::BlobStore for PackedStore {
                     // Later records supersede earlier ones for the same key,
                     // but the payload location is irrelevant for a listing —
                     // only liveness matters, and live-ness is keyed.
-                    if self.idx.read().unwrap().live.contains_key(&key) {
+                    if self.idx.read().unwrap().live.contains_key(key) {
                         out.push(name.clone());
                     }
                 }
@@ -934,9 +1069,7 @@ impl crate::store::BlobStore for PackedStore {
         let (mut used, mut trashed) = (0u64, 0u64);
         {
             let idx = self.idx.read().unwrap();
-            for loc in idx.live.values() {
-                used += loc.payload_len as u64;
-            }
+            idx.live.for_each(|_, loc| used += loc.payload_len as u64);
             for t in idx.trash.values() {
                 trashed += t.loc.payload_len as u64;
             }
@@ -982,6 +1115,70 @@ mod tests {
         PackedStore::open_with_target(dir, 1 << 20).unwrap()
     }
 
+    /// Regression test for the production RSS blow-up: producers flooding
+    /// `store()` faster than the fsync-bound writer must be held at the
+    /// byte budget, never queue unboundedly. The semaphore enforces the
+    /// bound; the gauge witnesses it while the flood is in flight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn writer_admission_is_bounded_by_bytes_in_flight() {
+        const BUDGET: u64 = 1 << 20; // 1 MiB
+        const BLOB: usize = 128 << 10; // 128 KiB => ~8 admitted at once
+        const WRITERS: usize = 32;
+        const PER_WRITER: usize = 4;
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackedStore::open_with_limits(dir.path(), 1 << 30, BUDGET).unwrap();
+
+        let peak = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sampler = {
+            let store = Arc::clone(&store);
+            let peak = Arc::clone(&peak);
+            let done = Arc::clone(&done);
+            tokio::spawn(async move {
+                while !done.load(Ordering::Relaxed) {
+                    peak.fetch_max(
+                        store.inflight_bytes.load(Ordering::Relaxed),
+                        Ordering::Relaxed,
+                    );
+                    tokio::time::sleep(Duration::from_micros(200)).await;
+                }
+            })
+        };
+
+        let mut tasks = Vec::new();
+        for w in 0..WRITERS {
+            let store = Arc::clone(&store);
+            tasks.push(tokio::spawn(async move {
+                for i in 0..PER_WRITER {
+                    let mut data = vec![0u8; BLOB];
+                    data[..8].copy_from_slice(&((w * PER_WRITER + i) as u64).to_le_bytes());
+                    let name = blake3::hash(&data).to_hex().to_string();
+                    store.store(&name, &data).await.unwrap();
+                    assert_eq!(store.read(&name).await.unwrap().as_ref(), &data[..]);
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        sampler.await.unwrap();
+
+        // The budget is a hard ceiling on admitted bytes at every instant.
+        assert!(
+            peak.load(Ordering::Relaxed) <= BUDGET,
+            "admitted bytes exceeded the budget: {} > {}",
+            peak.load(Ordering::Relaxed),
+            BUDGET
+        );
+        // Sanity: the flood really did contend (several blobs' worth).
+        assert!(peak.load(Ordering::Relaxed) >= BLOB as u64);
+        assert_eq!(store.list_hashes().len(), WRITERS * PER_WRITER);
+        // Everything settled: all permits returned, gauge back to zero.
+        assert_eq!(store.inflight_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(store.admission.available_permits(), BUDGET as usize);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn roundtrip_store_read_delete_restore_purge() {
         let dir = tempfile::tempdir().unwrap();
@@ -1022,6 +1219,103 @@ mod tests {
         assert_eq!(store.used_bytes(), 9);
         let listed = store.list_hashes();
         assert_eq!(listed, vec![H1.to_string()]);
+    }
+
+    /// A cached volume FD can go stale when the file is relocated under
+    /// the store — mergerfs `moveonenospc=true` moves a volume to another
+    /// branch when its branch fills (new inode; the old one truncated or
+    /// unlinked). Reads must recover by reopening the path, not fail until
+    /// restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_volume_fd_is_reopened_on_read_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_small(dir.path());
+        store.store(H1, b"survives-relocation").await.unwrap();
+        // Populate the read FD cache.
+        assert_eq!(
+            store.read(H1).await.unwrap().as_ref(),
+            b"survives-relocation"
+        );
+        // Simulate the union-fs relocation: copy the volume to a new inode,
+        // truncate the old one THROUGH the cached FD's inode, and swap the
+        // copy into place.
+        let vol = volume_path(&dir.path().join("volumes"), 1);
+        let moved = vol.with_extension("moved");
+        std::fs::copy(&vol, &moved).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&vol)
+            .unwrap()
+            .set_len(0)
+            .unwrap(); // cached FD now reads EOF
+        std::fs::rename(&moved, &vol).unwrap(); // path resolves to the copy
+        // Read must heal via evict + reopen, not error.
+        assert_eq!(
+            store.read(H1).await.unwrap().as_ref(),
+            b"survives-relocation"
+        );
+    }
+
+    /// Upgrade path: nodes already running packed have a VERSION 1 snapshot
+    /// (live entries inline) and no `live.idx`. First boot with the mmap
+    /// index must import those entries — not silently drop them — and
+    /// preserve the trash.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v1_snapshot_is_imported_into_mmap_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let (live_payload, trash_payload) = (b"live-one".as_slice(), b"gone".as_slice());
+        {
+            let store = open_small(dir.path());
+            store.store(H1, live_payload).await.unwrap();
+            store.store(H2, trash_payload).await.unwrap();
+            store.delete(H2).await.unwrap();
+        }
+        // Forge the pre-mmap on-disk state: v1 snapshot with the live
+        // entry inline, and no live.idx.
+        let index_dir = dir.path().join("index");
+        std::fs::remove_file(index_dir.join("live.idx")).unwrap();
+        let jlen = std::fs::metadata(index_dir.join("journal.log"))
+            .unwrap()
+            .len();
+        let vol_len = std::fs::metadata(volume_path(&dir.path().join("volumes"), 1))
+            .unwrap()
+            .len();
+        let h2_loc_off = record_len(H1.len(), live_payload.len());
+        let mut snap: Vec<u8> = Vec::new();
+        snap.extend_from_slice(&SNAP_MAGIC.to_le_bytes());
+        snap.extend_from_slice(&1u32.to_le_bytes()); // version 1
+        snap.extend_from_slice(&jlen.to_le_bytes());
+        snap.extend_from_slice(&1u32.to_le_bytes()); // 1 watermark
+        snap.extend_from_slice(&1u32.to_le_bytes()); // vol 1
+        snap.extend_from_slice(&vol_len.to_le_bytes()); // fully covered
+        snap.extend_from_slice(&1u64.to_le_bytes()); // 1 live entry
+        snap.extend_from_slice(&name_key(H1).to_le_bytes());
+        snap.extend_from_slice(&1u32.to_le_bytes()); // vol
+        snap.extend_from_slice(&0u64.to_le_bytes()); // off
+        snap.extend_from_slice(&(H1.len() as u16).to_le_bytes());
+        snap.extend_from_slice(&(live_payload.len() as u32).to_le_bytes());
+        snap.extend_from_slice(&1u64.to_le_bytes()); // 1 trash entry
+        snap.extend_from_slice(&(H2.len() as u16).to_le_bytes());
+        snap.extend_from_slice(H2.as_bytes());
+        snap.extend_from_slice(&1u32.to_le_bytes()); // vol
+        snap.extend_from_slice(&h2_loc_off.to_le_bytes()); // off
+        snap.extend_from_slice(&(H2.len() as u16).to_le_bytes());
+        snap.extend_from_slice(&(trash_payload.len() as u32).to_le_bytes());
+        std::fs::write(index_dir.join("snapshot.bin"), &snap).unwrap();
+
+        let store = open_small(dir.path());
+        assert_eq!(store.read(H1).await.unwrap().as_ref(), live_payload);
+        assert!(!store.has(H2));
+        assert!(store.has_trashed(H2));
+        assert!(store.restore(H2).await.unwrap());
+        assert_eq!(store.read(H2).await.unwrap().as_ref(), trash_payload);
+        // And the next snapshot is v2: reopen once more to prove the
+        // upgraded state round-trips.
+        store.write_snapshot().unwrap();
+        drop(store);
+        let store = open_small(dir.path());
+        assert_eq!(store.read(H1).await.unwrap().as_ref(), live_payload);
+        assert_eq!(store.read(H2).await.unwrap().as_ref(), trash_payload);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

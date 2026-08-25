@@ -50,13 +50,18 @@ fn sharded_rel(hash_hex: &str) -> Option<PathBuf> {
     )
 }
 
-/// Collect `*.bin` hash names under a store root: the flat legacy level plus
-/// the two-level sharded tree. Never descends anywhere else, so live, trash
-/// and tmp spaces stay disjoint.
-pub(crate) fn walk_bin_names(root: &Path) -> Vec<String> {
-    let mut out = Vec::new();
+/// Stream every `*.bin` blob under a store root — the flat legacy level
+/// plus the two-level sharded tree — to `visit(hash, entry)`. Never
+/// descends anywhere else, so live, trash and tmp spaces stay disjoint.
+///
+/// STREAMING IS NOT OPTIONAL: a node can hold tens of millions of blobs,
+/// and collecting their names is gigabytes of anonymous heap (~104 B per
+/// name once String and allocator overhead are counted) that glibc never
+/// returns to the kernel — measured 7+ GB of permanent RSS plus swap on
+/// 31 GB nodes. Any walk over a blob space must go through a visitor.
+pub(crate) fn for_each_bin(root: &Path, visit: &mut dyn FnMut(&str, &std::fs::DirEntry)) {
     let Ok(top) = std::fs::read_dir(root) else {
-        return out;
+        return;
     };
     for entry in top.flatten() {
         let name = match entry.file_name().into_string() {
@@ -69,7 +74,7 @@ pub(crate) fn walk_bin_names(root: &Path) -> Vec<String> {
         };
         if ft.is_file() {
             if let Some(h) = name.strip_suffix(".bin") {
-                out.push(h.to_string());
+                visit(h, &entry);
             }
         } else if ft.is_dir() && name.len() == 2 && name != TRASH_DIR {
             let Ok(mid) = std::fs::read_dir(entry.path()) else {
@@ -86,36 +91,32 @@ pub(crate) fn walk_bin_names(root: &Path) -> Vec<String> {
                     if let Ok(n) = leaf.file_name().into_string()
                         && let Some(h) = n.strip_suffix(".bin")
                     {
-                        out.push(h.to_string());
+                        visit(h, &leaf);
                     }
                 }
             }
         }
     }
+}
+
+/// Materialized listing — ONLY for spaces known to be small (trash) or
+/// explicit rebuild paths. Steady-state code must use [`for_each_bin`].
+pub(crate) fn walk_bin_names(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for_each_bin(root, &mut |h, _| out.push(h.to_string()));
     out
 }
 
 /// Sum file sizes under a store root (flat level + sharded tree).
-/// One `stat` per file — background use only.
+/// One `stat` per file, zero allocation per blob — background use only.
 fn walk_usage(root: &Path) -> (u64, u64) {
     let (mut bytes, mut files) = (0u64, 0u64);
-    for h in walk_bin_names(root) {
-        let p = match sharded_rel(&h) {
-            Some(rel) => {
-                let sp = root.join(rel);
-                if sp.exists() {
-                    sp
-                } else {
-                    root.join(format!("{h}.bin"))
-                }
-            }
-            None => root.join(format!("{h}.bin")),
-        };
-        if let Ok(m) = std::fs::metadata(&p) {
+    for_each_bin(root, &mut |_, entry| {
+        if let Ok(m) = entry.metadata() {
             bytes += m.len();
             files += 1;
         }
-    }
+    });
     (bytes, files)
 }
 

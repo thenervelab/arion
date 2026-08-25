@@ -11,6 +11,7 @@ mod gateway_keepalive;
 mod helpers;
 mod inventory;
 mod migrating_store;
+mod mmap_index;
 mod p2p;
 mod packed_store;
 mod rebalance;

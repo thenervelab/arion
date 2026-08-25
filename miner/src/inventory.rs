@@ -209,14 +209,18 @@ pub fn rebuild_from_fs(blobs_dir: &Path) -> Result<usize> {
         return Ok(0);
     }
 
-    // Collect FS entries before acquiring the lock (I/O can be slow).
-    // Walks the flat legacy level AND the sharded ab/cd tree; a fresh DB on
-    // a sharded-layout node must see every blob or ListAllBlobs would
-    // truthfully report an empty inventory as a successful scan.
-    let entries: Vec<String> = crate::flat_store::walk_bin_names(blobs_dir)
-        .into_iter()
-        .filter(|h| h.len() == 64)
-        .collect();
+    // Pass 1 — COUNT ONLY, streamed. Materializing tens of millions of
+    // names is gigabytes of heap that glibc never gives back (measured on
+    // 31 GB nodes: 7+ GB permanent RSS). Walks the flat legacy level AND
+    // the sharded ab/cd tree; a fresh DB on a sharded-layout node must see
+    // every blob or ListAllBlobs would truthfully report an empty
+    // inventory as a successful scan.
+    let mut fs_count = 0i64;
+    crate::flat_store::for_each_bin(blobs_dir, &mut |h, _| {
+        if h.len() == 64 {
+            fs_count += 1;
+        }
+    });
 
     let conn = db().lock().unwrap_or_else(|e| e.into_inner());
 
@@ -231,21 +235,18 @@ pub fn rebuild_from_fs(blobs_dir: &Path) -> Result<usize> {
         [],
         |r| r.get(0),
     )?;
-    let threshold = (entries.len() as f64 * 0.9) as i64;
+    let threshold = (fs_count as f64 * 0.9) as i64;
     if existing >= threshold && existing > 0 {
         info!(
             existing,
-            fs_count = entries.len(),
-            "inventory: DB is up to date, skipping FS rebuild"
+            fs_count, "inventory: DB is up to date, skipping FS rebuild"
         );
         return Ok(existing as usize);
     }
     if existing > 0 {
         info!(
             existing,
-            fs_count = entries.len(),
-            threshold,
-            "inventory: DB out of sync with FS, rebuilding"
+            fs_count, threshold, "inventory: DB out of sync with FS, rebuilding"
         );
         // Clear stale live entries before rebuilding
         conn.execute_batch("DELETE FROM shards WHERE trashed_at IS NULL")?;
@@ -256,9 +257,16 @@ pub fn rebuild_from_fs(blobs_dir: &Path) -> Result<usize> {
         .unwrap_or_default()
         .as_secs() as i64;
 
-    // Insert in batches of 10_000 for performance.
+    // Pass 2 — the rebuild itself (rare: first boot or DB loss), streamed
+    // straight into batched transactions. Only one 10k batch of names is
+    // ever alive.
     let mut inserted = 0usize;
-    for chunk in entries.chunks(10_000) {
+    let mut batch: Vec<String> = Vec::with_capacity(10_000);
+    let mut flush = |batch: &mut Vec<String>| -> Result<usize> {
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        let mut n = 0usize;
         let tx = conn.unchecked_transaction()?;
         {
             // A file in the live directory is live: clear any stale trash
@@ -267,19 +275,38 @@ pub fn rebuild_from_fs(blobs_dir: &Path) -> Result<usize> {
                 "INSERT INTO shards (hash, stored_at, trashed_at) VALUES (?1, ?2, NULL)
                  ON CONFLICT(hash) DO UPDATE SET trashed_at = NULL",
             )?;
-            for hash in chunk {
+            for hash in batch.iter() {
                 if stmt.execute(rusqlite::params![hash, now]).is_ok() {
-                    inserted += 1;
+                    n += 1;
                 }
             }
         }
         tx.commit()?;
+        batch.clear();
+        Ok(n)
+    };
+    let mut flush_err: Option<anyhow::Error> = None;
+    crate::flat_store::for_each_bin(blobs_dir, &mut |h, _| {
+        if flush_err.is_some() || h.len() != 64 {
+            return;
+        }
+        batch.push(h.to_string());
+        if batch.len() >= 10_000 {
+            match flush(&mut batch) {
+                Ok(n) => inserted += n,
+                Err(e) => flush_err = Some(e),
+            }
+        }
+    });
+    if let Some(e) = flush_err {
+        return Err(e);
     }
+    inserted += flush(&mut batch)?;
 
     if inserted > 0 {
         warn!(
             inserted,
-            total = entries.len(),
+            total = fs_count,
             "inventory: rebuilt from filesystem"
         );
     }

@@ -41,12 +41,20 @@
 //! - progress is logged every 60 s (`migration: progress`), and each phase
 //!   announces itself when it starts.
 //!
+//! Within a page, up to `PACKED_MIGRATE_CONCURRENCY` blobs (default 16)
+//! are moved concurrently. This matters more than any throttle: the packed
+//! writer group-commits — it drains every pending store into one append +
+//! one `fdatasync` — so N concurrent movers share a single flush where a
+//! sequential mover pays cold-read latency plus a full fsync **per blob**
+//! (measured ~15-25 blobs/s on a latency-bound spindle pool, i.e. weeks
+//! for a 70M-blob node, with the disks mostly idle). Concurrent moves also
+//! overlap the cold flat-store reads, which is where the remaining time
+//! goes.
+//!
 //! Throttle knobs: `PACKED_MIGRATE_BATCH` blobs per page (default 1000)
-//! and `PACKED_MIGRATE_PAUSE_MS` between pages (default 100). The defaults
-//! cap the mover at ~10k blobs/s; on I/O-bound ZFS nodes the filesystem is
-//! the real limiter and 0.5-3k blobs/s is typical, i.e. hours to a day for
-//! a 60-70M-blob node. Emptied leaf directories are removed at the end of
-//! the pass.
+//! and `PACKED_MIGRATE_PAUSE_MS` between pages (default 100), capping the
+//! mover at ~10k blobs/s; the filesystem is the real limiter on I/O-bound
+//! nodes. Emptied leaf directories are removed at the end of the pass.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -313,6 +321,7 @@ struct Mover {
     limit: Option<u64>,
     batch: usize,
     pause: Duration,
+    concurrency: usize,
     moved_total: u64,
     phase: &'static str,
     dirs_left: usize,
@@ -368,19 +377,42 @@ impl Mover {
         }
     }
 
-    async fn move_blob(&mut self, hash: &str, space: Space) {
-        let res = match space {
-            Space::Live => move_one(&self.flat, &self.packed, hash).await,
-            Space::Trash => self.move_trashed(hash).await,
+    /// Move one page of blobs with bounded concurrency. Sequential moves
+    /// pay cold-read latency plus one full `fdatasync` per blob; with N in
+    /// flight the packed writer group-commits them into shared flushes and
+    /// the cold reads overlap. Blobs within a page are independent (moves
+    /// are per-hash and idempotent), so ordering inside the page does not
+    /// matter. Counters are applied after the page so `limit` stays exact
+    /// at page granularity — callers truncate the page to the remaining
+    /// budget first.
+    async fn move_page(&mut self, page: Vec<String>, space: Space) {
+        use futures::StreamExt;
+        let take = match self.limit {
+            Some(l) => (l.saturating_sub(self.moved_total) as usize).min(page.len()),
+            None => page.len(),
         };
-        match res {
-            Some(bytes) => {
-                self.moved_total += 1;
-                self.progress.migrated.fetch_add(1, Ordering::Relaxed);
-                self.progress.bytes.fetch_add(bytes, Ordering::Relaxed);
-            }
-            None => {
-                self.progress.skipped.fetch_add(1, Ordering::Relaxed);
+        let results: Vec<Option<u64>> = {
+            let this: &Mover = self;
+            futures::stream::iter(page.into_iter().take(take).map(|hash| async move {
+                match space {
+                    Space::Live => move_one(&this.flat, &this.packed, &hash).await,
+                    Space::Trash => this.move_trashed(&hash).await,
+                }
+            }))
+            .buffer_unordered(this.concurrency)
+            .collect()
+            .await
+        };
+        for res in results {
+            match res {
+                Some(bytes) => {
+                    self.moved_total += 1;
+                    self.progress.migrated.fetch_add(1, Ordering::Relaxed);
+                    self.progress.bytes.fetch_add(bytes, Ordering::Relaxed);
+                }
+                None => {
+                    self.progress.skipped.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         self.maybe_log();
@@ -404,13 +436,20 @@ impl Mover {
                 if page.is_empty() {
                     break;
                 }
-                for hash in &page {
-                    if self.limit_hit() {
-                        return;
-                    }
-                    self.move_blob(hash, space).await;
+                let full_page = page.len() >= self.batch;
+                self.move_page(page, space).await;
+                if self.limit_hit() {
+                    return;
                 }
-                tokio::time::sleep(self.pause).await;
+                // Throttle only under sustained flow. A partial page means
+                // the directory is exhausted — sleeping there turns sparse
+                // leaf dirs (a couple of blobs each) into one pause per
+                // handful of blobs and caps the whole drain at ~10-20
+                // blobs/s (measured: 65 536 near-empty leaves x 100 ms
+                // ≈ 90 min of pure sleep for 100k blobs).
+                if full_page {
+                    tokio::time::sleep(self.pause).await;
+                }
             }
             if self.moved_total == moved_before {
                 return;
@@ -469,10 +508,12 @@ pub async fn run_migration(
 ) -> u64 {
     let batch = env_u64("PACKED_MIGRATE_BATCH", 1000).clamp(1, 100_000) as usize;
     let pause = Duration::from_millis(env_u64("PACKED_MIGRATE_PAUSE_MS", 100));
+    let concurrency = env_u64("PACKED_MIGRATE_CONCURRENCY", 16).clamp(1, 256) as usize;
     let trash_dir = data_dir.join("trash");
     tracing::info!(
         batch,
         pause_ms = pause.as_millis() as u64,
+        concurrency,
         "migration: mover starting"
     );
 
@@ -483,6 +524,7 @@ pub async fn run_migration(
         limit,
         batch,
         pause,
+        concurrency,
         moved_total: 0,
         phase: "",
         dirs_left: 0,
@@ -681,6 +723,50 @@ mod tests {
         assert!(!flat_data_present(dir.path()));
     }
 
+    /// Exercises the concurrent path (default concurrency 16, several full
+    /// pages of parallel moves, live + trash mixed): every blob must land
+    /// exactly once and the counters must add up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_migration_moves_every_blob_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (flat, packed) = setup(dir.path()).await;
+        let mut live = Vec::new();
+        let mut trashed = Vec::new();
+        for i in 0..300u32 {
+            let p = i.to_le_bytes().repeat(1 + (i as usize % 7)).to_vec();
+            flat.store(&h(&p), &p).await.unwrap();
+            if i % 5 == 0 {
+                FlatBlobStore::delete(&flat, &h(&p)).await.unwrap();
+                trashed.push(p);
+            } else {
+                live.push(p);
+            }
+        }
+
+        let progress = Arc::new(MigrationProgress::default());
+        let moved = run_migration(
+            Arc::clone(&flat),
+            Arc::clone(&packed),
+            dir.path().to_path_buf(),
+            Arc::clone(&progress),
+            None,
+        )
+        .await;
+        assert_eq!(moved, 300);
+        assert_eq!(progress.migrated.load(Ordering::Relaxed), 300);
+        assert_eq!(progress.skipped.load(Ordering::Relaxed), 0);
+        for p in &live {
+            assert_eq!(packed.read(&h(p)).await.unwrap().as_ref(), &p[..]);
+        }
+        for p in &trashed {
+            assert!(packed.has_trashed(&h(p)));
+        }
+        assert!(!flat_data_present(dir.path()));
+        // Exactly once: the packed index lists each hash a single time.
+        assert_eq!(packed.list_hashes().len(), live.len());
+        assert_eq!(packed.list_trashed_hashes().len(), trashed.len());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn corrupt_flat_blob_is_left_in_place() {
         let dir = tempfile::tempdir().unwrap();
@@ -802,6 +888,86 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".bin"))
             .count();
         assert_eq!(root_bins, ROOT_ENTRIES);
+    }
+
+    /// Heap probe (not a pass/fail test — run with `--ignored --nocapture`):
+    /// reproduces the mover on a synthetic population with the production
+    /// size mix (90% tiny, 10% ~90 KB) and reports the REAL marginal
+    /// RssAnon per migrated blob, straight from /proc. Knobs:
+    /// `RSS_PROBE_BLOBS` (default 100k), `PACKED_MIGRATE_CONCURRENCY`,
+    /// `MALLOC_ARENA_MAX` (set on the test process).
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn rss_probe_migration_marginal_heap() {
+        fn rss_anon_kb() -> u64 {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("RssAnon:"))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|v| v.parse().ok())
+                })
+                .unwrap_or(0)
+        }
+        let n: usize = std::env::var("RSS_PROBE_BLOBS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+        let dir = tempfile::tempdir().unwrap();
+        let (flat, packed) = setup(dir.path()).await;
+
+        let mut total_bytes = 0u64;
+        for i in 0..n {
+            // Production mix: median ~100 B, ~10% around 90 KB.
+            let size = if i % 10 == 0 {
+                90_000 + i % 4096
+            } else {
+                100 + i % 64
+            };
+            let mut p = vec![0u8; size];
+            p[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            total_bytes += size as u64;
+            flat.store(&h(&p), &p).await.unwrap();
+        }
+        let rss_before = rss_anon_kb();
+        println!(
+            "probe: {} blobs ({} MB) staged, RssAnon before migration = {} MB",
+            n,
+            total_bytes >> 20,
+            rss_before >> 10
+        );
+
+        let progress = Arc::new(MigrationProgress::default());
+        let t0 = Instant::now();
+        let moved = run_migration(
+            Arc::clone(&flat),
+            Arc::clone(&packed),
+            dir.path().to_path_buf(),
+            Arc::clone(&progress),
+            None,
+        )
+        .await;
+        let secs = t0.elapsed().as_secs_f64();
+        let rss_after = rss_anon_kb();
+        assert_eq!(moved as usize, n);
+        let marginal = (rss_after.saturating_sub(rss_before) * 1024) / n as u64;
+        println!(
+            "probe: migrated {} blobs in {:.1}s ({:.0} blobs/s), RssAnon after = {} MB, marginal = {} B/blob",
+            moved,
+            secs,
+            moved as f64 / secs,
+            rss_after >> 10,
+            marginal
+        );
+        // Give the allocator a chance to return freed memory, then re-read.
+        drop(packed);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        unsafe { libc::malloc_trim(0) };
+        println!(
+            "probe: RssAnon after malloc_trim = {} MB",
+            rss_anon_kb() >> 10
+        );
     }
 
     /// Leaf discovery must not depend on listing the root at all: with the
