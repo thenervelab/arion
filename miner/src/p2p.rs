@@ -575,41 +575,42 @@ async fn handle_delete(
     // Two-phase by default: move to trash (restorable until the retention
     // window elapses) and keep the inventory row with its trash mark so the
     // purge loop has a clock. Hard delete only when the trash is disabled.
+    // A failed store operation must NOT be acknowledged as success: the
+    // old code logged the error and answered OK anyway, so the validator
+    // counted the shard as deleted while it kept serving. Deleting an
+    // absent blob is Ok(()) on every backend (idempotent), so any Err here
+    // is a real failure. The inventory row is only updated on success —
+    // marking it trashed for a blob still live would desync the purge
+    // clock from reality.
     if trash_enabled {
-        match store.delete(&hash).await {
-            Ok(()) => {
-                trace!(
-                    hash = %truncate_for_log(&hash, 32),
-                    "Delete complete: blob moved to trash"
-                );
-            }
-            Err(e) => {
-                error!(
-                    hash = %truncate_for_log(&hash, 32),
-                    error = %e,
-                    "Delete: failed to move blob to trash"
-                );
-            }
+        if let Err(e) = store.delete(&hash).await {
+            error!(
+                hash = %truncate_for_log(&hash, 32),
+                error = %e,
+                "Delete: failed to move blob to trash"
+            );
+            return send_response(send, b"ERROR: DELETE_FAILED").await;
         }
+        trace!(
+            hash = %truncate_for_log(&hash, 32),
+            "Delete complete: blob moved to trash"
+        );
         if let Err(e) = crate::inventory::trash_shard(&hash) {
             warn!(hash = %hash, error = %e, "inventory: failed to mark shard trashed");
         }
     } else {
-        match store.remove(&hash).await {
-            Ok(()) => {
-                trace!(
-                    hash = %truncate_for_log(&hash, 32),
-                    "Delete complete: removed blob file"
-                );
-            }
-            Err(e) => {
-                error!(
-                    hash = %truncate_for_log(&hash, 32),
-                    error = %e,
-                    "Delete: failed to remove file"
-                );
-            }
+        if let Err(e) = store.remove(&hash).await {
+            error!(
+                hash = %truncate_for_log(&hash, 32),
+                error = %e,
+                "Delete: failed to remove file"
+            );
+            return send_response(send, b"ERROR: DELETE_FAILED").await;
         }
+        trace!(
+            hash = %truncate_for_log(&hash, 32),
+            "Delete complete: removed blob file"
+        );
         if let Err(e) = crate::inventory::delete_shard(&hash) {
             warn!(hash = %hash, error = %e, "inventory: failed to delete shard");
         }
