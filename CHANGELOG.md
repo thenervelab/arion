@@ -2,6 +2,49 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.30] - 2026-08-24
+
+### Miner
+
+- **Fix auto-update on split-volume installs**: the updater staged the
+  downloaded binary in the service working directory, then `rename(2)`d it
+  over the installed executable. When the data directory and the executable
+  live on different filesystems the rename fails with `EXDEV` (os error 18)
+  and the node retries forever — downloading and discarding the full binary
+  every cycle without ever updating. The download is now staged in the
+  executable's own directory (same-filesystem, atomic rename), with a
+  durable copy + fsync + rename fallback if the rename still crosses
+  filesystems. Version verification before the swap and backup/restore on
+  failure are unchanged; staging files are removed on any failure instead of
+  being left behind.
+- **Flat memory profile on nodes holding tens of millions of blobs**: every
+  walk over a blob space now streams entries through a visitor instead of
+  materializing the full name list (a collected listing cost gigabytes of
+  permanent heap on bench nodes at 70M blobs), the packed store's live index
+  is disk-backed via a paged mmap table instead of a heap map, and the
+  inventory rebuild streams inserts in bounded batches.
+- **Packed writer admission control**: `store()` now takes byte-permits
+  before enqueueing, bounding bytes in flight to the volume writer — a burst
+  of stores backpressures the sender instead of growing an unbounded queue.
+- **Packed reads survive volume relocation**: stale volume file descriptors
+  are detected and reopened, so reads keep working when a volume file is
+  moved within a union filesystem.
+- **Fix flat→packed mover stall on giant flat roots**: the mover listed the
+  data root to discover the shard directories before moving anything. On
+  nodes still mid-way through the 0.1.28 flat→sharded migration that root
+  can hold tens of millions of flat `.bin` entries, so the mover blocked in
+  that enumeration indefinitely — zero blobs drained, and no log output to
+  show it. Shard directories are now discovered by probing the 256 possible
+  names per level (one `stat` each, no root listing) and the small `ab/cd`
+  leaf directories are drained first for immediate progress; the legacy
+  flat roots are drained last, streamed in bounded pages from a held
+  readdir cursor so the listing is never materialized. The mover logs its
+  progress every 60 s (phase, moved, bytes, skipped, blobs/s) and announces
+  each phase. Throttle defaults raised to `PACKED_MIGRATE_BATCH=1000` /
+  `PACKED_MIGRATE_PAUSE_MS=100` (~10k blobs/s ceiling; the filesystem is
+  the real limiter — a node holding tens of millions of blobs drains in
+  hours, not years).
+
 ## [0.1.29] - 2026-08-24
 
 ### Miner

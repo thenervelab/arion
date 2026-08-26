@@ -43,7 +43,7 @@ async fn run_update_cycle(data_dir: &Path) {
         return;
     }
 
-    match check_and_update(data_dir).await {
+    match check_and_update().await {
         Ok(updated) => {
             if updated {
                 info!("Update applied — restarting miner service");
@@ -71,9 +71,7 @@ fn is_auto_update_disabled(data_dir: &Path) -> bool {
 
 /// Check for a newer version and apply the update if available.
 /// Returns `Ok(true)` if an update was applied, `Ok(false)` if already up to date.
-async fn check_and_update(
-    data_dir: &Path,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+async fn check_and_update() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let current = Version::parse(CURRENT_VERSION)?;
 
     let client = reqwest::Client::builder()
@@ -110,21 +108,33 @@ async fn check_and_update(
     // Find the download URL for our asset.
     let download_url = find_asset_url(&body)?;
 
-    // Download the new binary to a temp file in the data directory.
-    let temp_path = data_dir.join(".miner-update-tmp");
-    download_binary(&client, &download_url, &temp_path).await?;
-
-    // Make executable.
-    set_executable(&temp_path).await?;
-
-    // Verify the downloaded binary by running --version.
-    verify_binary(&temp_path, tag_clean).await?;
-
-    // Replace the current binary: back up old, rename new into place.
+    // Stage the download next to the executable it will replace so the final
+    // rename(2) stays on a single filesystem. The service working directory
+    // may live on a different volume than the installed binary, and a
+    // cross-device rename fails with EXDEV (os error 18).
     let current_exe = std::env::current_exe()?;
+    let exe_dir = current_exe
+        .parent()
+        .ok_or("current executable has no parent directory")?;
+    let temp_path = exe_dir.join(".miner-update-tmp");
     let backup_path = current_exe.with_extension("bak");
 
-    replace_binary(&current_exe, &backup_path, &temp_path).await?;
+    let staged = stage_and_install(
+        &client,
+        &download_url,
+        tag_clean,
+        &temp_path,
+        &current_exe,
+        &backup_path,
+    )
+    .await;
+
+    if staged.is_err() {
+        // Never leave a partial or unused download behind — at ~80 MB per
+        // 5-minute cycle these accumulate fast when updates fail repeatedly.
+        tokio::fs::remove_file(&temp_path).await.ok();
+    }
+    staged?;
 
     info!(
         new_version = %latest,
@@ -134,6 +144,29 @@ async fn check_and_update(
     );
 
     Ok(true)
+}
+
+/// Download, verify, and swap in the new binary. The staging file lives in
+/// the destination directory; the caller cleans it up on failure.
+async fn stage_and_install(
+    client: &reqwest::Client,
+    download_url: &str,
+    expected_version: &str,
+    temp_path: &Path,
+    current_exe: &Path,
+    backup_path: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    download_binary(client, download_url, temp_path).await?;
+
+    // Make executable.
+    set_executable(temp_path).await?;
+
+    // Verify the downloaded binary by running --version — this must pass
+    // before the running binary is touched.
+    verify_binary(temp_path, expected_version).await?;
+
+    // Replace the current binary: back up old, rename new into place.
+    replace_binary(current_exe, backup_path, temp_path).await
 }
 
 /// Find the browser_download_url for the miner asset in the release JSON.
@@ -248,8 +281,8 @@ async fn replace_binary(
         .into());
     }
 
-    // Rename temp to current binary path.
-    if let Err(e) = tokio::fs::rename(temp, current).await {
+    // Move temp into the current binary path.
+    if let Err(e) = install_new_binary(temp, current).await {
         // Try to restore from backup.
         error!(error = %e, "Failed to move new binary into place, restoring backup");
         if let Err(restore_err) = tokio::fs::rename(backup, current).await {
@@ -258,6 +291,74 @@ async fn replace_binary(
         return Err(format!("Failed to install new binary: {}", e).into());
     }
 
+    Ok(())
+}
+
+/// `rename(2)` cannot cross filesystems.
+const EXDEV: i32 = 18;
+
+#[cfg(test)]
+static FORCE_EXDEV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Rename wrapper; tests can force an EXDEV failure to exercise the fallback.
+async fn rename_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FORCE_EXDEV.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(std::io::Error::from_raw_os_error(EXDEV));
+    }
+    tokio::fs::rename(from, to).await
+}
+
+/// Install the staged binary at `current`. Prefers an atomic rename — staging
+/// happens in the destination directory, so this is the normal path. If the
+/// rename still crosses filesystems (EXDEV), falls back to a durable
+/// copy + fsync + rename entirely inside the destination directory.
+async fn install_new_binary(temp: &Path, current: &Path) -> std::io::Result<()> {
+    match rename_file(temp, current).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(EXDEV) => {
+            info!("Staging file is on a different filesystem — installing via copy + fsync");
+            copy_install(temp, current).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Copy-based install: copy the staged binary to a scratch file in the
+/// destination directory, fsync the file and the directory, then rename
+/// within that directory. Never leaves a torn destination binary.
+async fn copy_install(temp: &Path, current: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dest_dir = current
+        .parent()
+        .ok_or_else(|| std::io::Error::other("destination binary has no parent directory"))?;
+    let stage = dest_dir.join(".miner-update-stage");
+
+    let result: std::io::Result<()> = async {
+        tokio::fs::copy(temp, &stage).await?;
+        tokio::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o755)).await?;
+
+        // fsync the file contents before the rename makes it visible.
+        let staged = tokio::fs::File::open(&stage).await?;
+        staged.sync_all().await?;
+
+        tokio::fs::rename(&stage, current).await?;
+
+        // fsync the directory so the rename itself is durable.
+        let dir = std::fs::File::open(dest_dir)?;
+        dir.sync_all()?;
+        Ok(())
+    }
+    .await;
+
+    if result.is_err() {
+        tokio::fs::remove_file(&stage).await.ok();
+        return result;
+    }
+
+    // The rename did not consume the cross-device staging file.
+    tokio::fs::remove_file(temp).await.ok();
     Ok(())
 }
 
@@ -273,4 +374,59 @@ fn restart_service() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .spawn()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::Ordering;
+
+    /// FORCE_EXDEV is process-global; serialize the tests that install binaries.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[tokio::test]
+    async fn replace_binary_renames_within_same_fs() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        FORCE_EXDEV.store(false, Ordering::Relaxed);
+
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("miner");
+        let backup = current.with_extension("bak");
+        let temp = dir.path().join(".miner-update-tmp");
+        std::fs::write(&current, b"old-binary").unwrap();
+        std::fs::write(&temp, b"new-binary").unwrap();
+
+        replace_binary(&current, &backup, &temp).await.unwrap();
+
+        assert_eq!(std::fs::read(&current).unwrap(), b"new-binary");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old-binary");
+        assert!(!temp.exists());
+    }
+
+    #[tokio::test]
+    async fn exdev_rename_falls_back_to_durable_copy() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        FORCE_EXDEV.store(true, Ordering::Relaxed);
+
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("miner");
+        let backup = current.with_extension("bak");
+        let temp = dir.path().join(".miner-update-tmp");
+        std::fs::write(&current, b"old-binary").unwrap();
+        std::fs::write(&temp, b"new-binary-contents").unwrap();
+
+        let result = replace_binary(&current, &backup, &temp).await;
+        FORCE_EXDEV.store(false, Ordering::Relaxed);
+        result.unwrap();
+
+        // Complete, correct, and executable.
+        assert_eq!(std::fs::read(&current).unwrap(), b"new-binary-contents");
+        let mode = std::fs::metadata(&current).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        // Old binary preserved as backup; no staging debris left behind.
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old-binary");
+        assert!(!temp.exists());
+        assert!(!dir.path().join(".miner-update-stage").exists());
+    }
 }
