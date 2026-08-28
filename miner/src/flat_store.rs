@@ -273,9 +273,31 @@ impl FlatBlobStore {
             .map(|m| m.len())
             .unwrap_or(0);
         let target = self.trash_path(hash_hex);
+
+        // A full disk traps the node: parking a blob in the trash needs a new
+        // directory entry, which needs the space that only a delete can free.
+        // Every delete then fails, nothing is ever reclaimed, and the node can
+        // never recover on its own. When -- and only when -- the filesystem is
+        // out of room, give up the restore window rather than the ability to
+        // delete at all: an unlink needs no extra space.
+        //
+        // Both steps can hit ENOSPC, so both feed the same fallback. Any other
+        // error still propagates: silently destroying a blob because of a
+        // permission or I/O fault would throw away recoverable data.
+        // Both steps can hit ENOSPC, so both must be able to fall back. They are
+        // kept separate because only a missing blob at `rename` time means "already
+        // gone": an ENOENT while creating the trash directory (renamed ancestor,
+        // dangling symlink, concurrent unmount) leaves the blob very much alive and
+        // must not be reported as a successful delete.
         if let Some(parent) = target.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                if !is_out_of_space(&e) {
+                    return Err(e);
+                }
+                return self.remove_for_lack_of_space(hash_hex).await;
+            }
         }
+
         match tokio::fs::rename(&path, &target).await {
             Ok(()) => {
                 self.used_bytes.fetch_sub(size, Ordering::Relaxed);
@@ -283,8 +305,24 @@ impl FlatBlobStore {
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) if is_out_of_space(&e) => self.remove_for_lack_of_space(hash_hex).await,
             Err(e) => Err(e),
         }
+    }
+
+    /// Permanently drop a blob because the filesystem has no room to park it.
+    ///
+    /// A full disk traps the node: parking a blob in the trash needs a new directory
+    /// entry, which needs the space that only a delete can free. Every delete then
+    /// fails, nothing is ever reclaimed, and the node cannot recover on its own. We
+    /// give up the restore window rather than the ability to delete at all -- an
+    /// unlink needs no extra space.
+    async fn remove_for_lack_of_space(&self, hash_hex: &str) -> std::io::Result<()> {
+        tracing::warn!(
+            hash = %&hash_hex[..hash_hex.len().min(32)],
+            "Delete: no space to move blob to trash, removing permanently"
+        );
+        self.remove(hash_hex).await
     }
 
     /// Permanently delete a live blob, bypassing the trash.
@@ -539,9 +577,77 @@ impl crate::store::BlobStore for FlatBlobStore {
     }
 }
 
+/// True when an I/O error means the filesystem is out of room.
+///
+/// `ENOSPC` is the disk-full case; `EDQUOT` is the same situation under a user
+/// quota. In both, creating the trash entry is impossible while unlinking still
+/// works, so the caller falls back to a permanent removal.
+fn is_out_of_space(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENOSPC) | Some(libc::EDQUOT))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn out_of_space_matches_enospc_and_edquot_only() {
+        let enospc = std::io::Error::from_raw_os_error(libc::ENOSPC);
+        let edquot = std::io::Error::from_raw_os_error(libc::EDQUOT);
+        assert!(is_out_of_space(&enospc));
+        assert!(is_out_of_space(&edquot));
+        // Everything else must keep bubbling up. Unlinking a blob because of a
+        // permission, I/O or layout fault would destroy recoverable data.
+        for code in [libc::EACCES, libc::EIO, libc::ENOTDIR, libc::EPERM] {
+            assert!(
+                !is_out_of_space(&std::io::Error::from_raw_os_error(code)),
+                "errno {code} must not be treated as a full disk"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_keeps_the_blob_when_the_failure_is_not_a_full_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FlatBlobStore::new(dir.path().to_path_buf()).unwrap();
+        store.store(HASH, b"payload").await.unwrap();
+
+        // A file where the trash tree must go: create_dir_all fails with
+        // ENOTDIR, which is NOT an out-of-space condition.
+        let trash = dir.path().join("trash");
+        std::fs::remove_dir_all(&trash).ok();
+        std::fs::write(&trash, b"not a directory").unwrap();
+
+        let err = store.delete(HASH).await.expect_err("delete should fail");
+        assert!(!is_out_of_space(&err));
+        assert!(
+            store.locate(HASH).is_some(),
+            "a non-space failure must leave the blob in place, not destroy it"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_reclaims_space_without_touching_the_trash() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FlatBlobStore::new(dir.path().to_path_buf()).unwrap();
+        store.store(HASH, b"payload").await.unwrap();
+        let before = store.used_bytes.load(Ordering::Relaxed);
+        assert!(before > 0);
+
+        // This is the path the ENOSPC fallback takes: a plain unlink, needing no
+        // new directory entry and therefore no free space.
+        store.remove(HASH).await.unwrap();
+
+        assert!(store.locate(HASH).is_none(), "blob must be gone");
+        assert!(
+            store.used_bytes.load(Ordering::Relaxed) < before,
+            "used_bytes must drop so the node reports reclaimed space"
+        );
+        let trash_entries = std::fs::read_dir(dir.path().join("trash"))
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert_eq!(trash_entries, 0, "fallback must not park anything in trash");
+    }
 
     const HASH: &str = "aa11bb22cc33";
 
