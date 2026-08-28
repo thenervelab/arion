@@ -40,10 +40,10 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 ed25519-dalek = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 memmap2 = "0.9"
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-libc = { workspace = true }
 
 [[bin]]
 name = "generate_keypair"
