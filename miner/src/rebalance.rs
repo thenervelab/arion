@@ -642,10 +642,56 @@ pub async fn self_rebalance_pg(
                 .take(file_budget)
                 .collect();
 
-            // Fetch manifests concurrently (16 parallel QUIC streams on one connection)
+            // Fetch manifests concurrently (16 parallel QUIC streams on one
+            // connection). One backoff+reconnect retry on abort: the validator
+            // sheds connections under load (same behaviour as the batch
+            // phase), and a dead connection otherwise fails every remaining
+            // manifest fast and silently kills the cycle.
             {
                 use futures::stream::StreamExt;
-                let mut manifest_stream = futures::stream::iter(file_entries.into_iter())
+                let mut pending: Vec<String> = file_entries;
+                for attempt in 0..2u32 {
+                    if pending.is_empty() {
+                        break;
+                    }
+                    if attempt > 0 {
+                        let wait =
+                            std::time::Duration::from_secs(BATCH_RECONNECT_BACKOFF_SECS);
+                        warn!(
+                            remaining = pending.len(),
+                            backoff_secs = wait.as_secs(),
+                            "Backing off before validator reconnect for manifest fetches"
+                        );
+                        tokio::time::sleep(wait).await;
+                        match common::transport::connect_with_alpn(
+                            &endpoint,
+                            validator_addr,
+                            &validator_node_id,
+                            &signing_key,
+                            &[common::VALIDATOR_CONTROL_ALPN],
+                        )
+                        .await
+                        {
+                            Ok(conn) => {
+                                warn!("Reconnected to validator for manifest fetches");
+                                validator_conn = conn;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    "Validator reconnect for manifest fetches failed"
+                                );
+                                aborted = true;
+                                break;
+                            }
+                        }
+                    }
+                    aborted = false;
+                    let batch_all: Vec<String> = std::mem::take(&mut pending);
+                    let mut emitted: std::collections::HashSet<String> =
+                        std::collections::HashSet::with_capacity(batch_all.len());
+                    let mut failed_this_attempt: Vec<String> = Vec::new();
+                let mut manifest_stream = futures::stream::iter(batch_all.clone().into_iter())
                     .map(|file_hash| {
                         let conn = validator_conn.clone();
                         async move {
@@ -658,6 +704,7 @@ pub async fn self_rebalance_pg(
                 let mut consecutive_failures: u32 = 0;
 
                 while let Some((file_hash, result)) = manifest_stream.next().await {
+                    emitted.insert(file_hash.clone());
                     match result {
                         Ok(Some(manifest)) => {
                             consecutive_failures = 0;
@@ -695,14 +742,34 @@ pub async fn self_rebalance_pg(
                         Ok(None) => {
                             consecutive_failures = 0;
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            if consecutive_failures == 0 {
+                                warn!(
+                                    error = %e,
+                                    file = %&file_hash[..12.min(file_hash.len())],
+                                    "Manifest fetch failed (start of a failure streak)"
+                                );
+                            }
                             total_manifest_failures += 1;
                             consecutive_failures += 1;
+                            failed_this_attempt.push(file_hash);
                             if consecutive_failures >= MAX_CONSECUTIVE_MANIFEST_FAILURES {
                                 aborted = true;
                                 break;
                             }
                         }
+                    }
+                }
+                    if aborted {
+                        // Retry what failed plus what the dropped stream never
+                        // emitted; successes are already tallied and must not
+                        // be re-processed (their shards would double-count).
+                        pending = failed_this_attempt;
+                        pending.extend(
+                            batch_all.into_iter().filter(|h| !emitted.contains(h)),
+                        );
+                    } else {
+                        break;
                     }
                 }
             }
@@ -825,6 +892,14 @@ pub async fn self_rebalance_pg(
             expected_shards.len(),
             pct,
             missing_shards,
+        );
+    } else if aborted || batch_aborted {
+        warn!(
+            checked_shards = expected_shards.len(),
+            manifest_aborted = aborted,
+            batch_aborted = batch_aborted,
+            used_doc_fallback = used_doc_fallback,
+            "[REBALANCE] Cycle aborted early — partial check only, not a clean pass"
         );
     } else {
         info!(
