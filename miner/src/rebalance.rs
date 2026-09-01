@@ -24,9 +24,9 @@
 //! migration via `PullFromPeer` commands as a fallback.
 
 use crate::constants::{
-    BATCH_RESPONSE_TIMEOUT_SECS, CONCURRENT_MANIFEST_FETCH_STREAMS, EPOCH_LOOKBACK,
+    BATCH_RECONNECT_BACKOFF_SECS, BATCH_RESPONSE_TIMEOUT_SECS, CONCURRENT_MANIFEST_FETCH_STREAMS, EPOCH_LOOKBACK,
     MANIFEST_READ_TIMEOUT_SECS, MANIFEST_RESPONSE_MAX_SIZE, MANIFEST_STREAM_OPEN_TIMEOUT_SECS,
-    MAX_BATCH_PG_RESPONSE_SIZE, MAX_CONSECUTIVE_BATCH_FAILURES,
+    MAX_BATCH_PG_RESPONSE_SIZE, MAX_BATCH_RECONNECTS, MAX_CONSECUTIVE_BATCH_FAILURES,
     MAX_CONSECUTIVE_MANIFEST_FAILURES, MAX_PG_BATCH_FILE_ENTRIES, PG_BATCH_CHUNK_SIZE,
     REBALANCE_FETCH_CONCURRENCY, REBALANCE_FETCH_MAX_CONCURRENCY,
     REBALANCE_FETCH_MIN_CONCURRENCY, REBALANCE_FETCH_SCALEUP_THRESHOLD,
@@ -420,6 +420,10 @@ pub async fn self_rebalance_pg(
     let mut missing_shard_list: Vec<MissingShard> = Vec::new();
     let mut total_manifest_failures: u32 = 0;
     let mut aborted = false;
+    // Set when the validator batch-query loop gives up; routes the cycle to
+    // the doc fallback (if joined) and to an honest WARN instead of a
+    // "Complete - all 0 shards verified" line.
+    let mut batch_aborted = false;
 
     // Cache of cluster maps keyed by placement epoch.  Populated lazily as
     // manifests are processed — prevents premature deletion for files uploaded more
@@ -486,7 +490,7 @@ pub async fn self_rebalance_pg(
             let mut idx = 0usize; // next PG in `rotated` to query
             let mut total_files = 0usize;
             let mut batch_failures = 0u32;
-            let mut reconnected = false;
+            let mut reconnects = 0u32;
 
             while idx < rotated.len() && total_files < file_budget {
                 let end = (idx + chunk_size).min(rotated.len());
@@ -560,10 +564,23 @@ pub async fn self_rebalance_pg(
                         error!(error = %e, "Batch PG chunk query failed");
                         batch_failures += 1;
                         // All chunks share one QUIC connection; a validator-side
-                        // close would otherwise doom every remaining chunk.
-                        // Reconnect once per cycle and retry the same window.
-                        if !reconnected {
-                            reconnected = true;
+                        // close would otherwise doom every remaining chunk. The
+                        // validator answers an *immediate* reconnect with
+                        // `server busy` (code 1), so back off before each of up
+                        // to MAX_BATCH_RECONNECTS reconnects and retry the SAME
+                        // window (idx unchanged).
+                        if reconnects < MAX_BATCH_RECONNECTS {
+                            reconnects += 1;
+                            let wait = std::time::Duration::from_secs(
+                                BATCH_RECONNECT_BACKOFF_SECS * u64::from(reconnects),
+                            );
+                            warn!(
+                                attempt = reconnects,
+                                max_attempts = MAX_BATCH_RECONNECTS,
+                                backoff_secs = wait.as_secs(),
+                                "Backing off before validator reconnect for batch queries"
+                            );
+                            tokio::time::sleep(wait).await;
                             match common::transport::connect_with_alpn(
                                 &endpoint,
                                 validator_addr,
@@ -574,7 +591,10 @@ pub async fn self_rebalance_pg(
                             .await
                             {
                                 Ok(conn) => {
-                                    warn!("Reconnected to validator for batch queries");
+                                    warn!(
+                                        attempt = reconnects,
+                                        "Reconnected to validator for batch queries"
+                                    );
                                     validator_conn = conn;
                                     continue;
                                 }
@@ -583,6 +603,7 @@ pub async fn self_rebalance_pg(
                                         error = %e2,
                                         "Validator reconnect failed — aborting batch queries this cycle"
                                     );
+                                    batch_aborted = true;
                                     break;
                                 }
                             }
@@ -592,6 +613,7 @@ pub async fn self_rebalance_pg(
                                 failures = batch_failures,
                                 "Too many consecutive batch failures — aborting batch queries this cycle"
                             );
+                            batch_aborted = true;
                             break;
                         }
                         idx = end;
@@ -684,8 +706,9 @@ pub async fn self_rebalance_pg(
                 }
             }
 
-            // If too many failures, try doc fallback for remaining work
-            aborted && doc_available
+            // If too many failures (manifest phase OR batch-query phase),
+            // try doc fallback for remaining work
+            (aborted || batch_aborted) && doc_available
         } else {
             // Connection failed, try doc fallback
             doc_available
@@ -781,6 +804,14 @@ pub async fn self_rebalance_pg(
     missing_shards = missing_shards.saturating_sub(shards_fetched);
 
     let verified = expected_shards.len().saturating_sub(missing_shards);
+    if batch_aborted && expected_shards.is_empty() {
+        // Nothing was queried, so nothing was verified: say so instead of
+        // reporting a vacuous "Complete".
+        warn!(
+            "[REBALANCE] Cycle aborted — validator batch queries failed, nothing was checked this tick"
+        );
+        return Ok(());
+    }
     if missing_shards > 0 {
         let pct = if expected_shards.is_empty() {
             0

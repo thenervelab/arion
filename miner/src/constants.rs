@@ -344,6 +344,19 @@ pub const MAX_PG_BATCH_FILE_ENTRIES: usize = 400_000;
 /// with dozens of doomed chunk requests every tick).
 pub const MAX_CONSECUTIVE_BATCH_FAILURES: u32 = 5;
 
+/// Maximum validator reconnects per rebalance cycle after a batch PG chunk
+/// query fails. Each reconnect is preceded by a backoff (see
+/// `BATCH_RECONNECT_BACKOFF_SECS`) and retries the SAME chunk window.
+/// Rationale: a loaded validator closes the batch connection ~30-45 s
+/// in and answers an *immediate* reconnect with `server busy` (code 1); the
+/// old single instant reconnect therefore always failed and roughly half of
+/// observed cycles aborted having checked nothing.
+pub const MAX_BATCH_RECONNECTS: u32 = 3;
+
+/// Base backoff before a batch-query reconnect; attempt `n` waits `n x base`
+/// (20 s, 40 s, 60 s -> at most 120 s per cycle, well under the 300 s tick).
+pub const BATCH_RECONNECT_BACKOFF_SECS: u64 = 20;
+
 /// Number of concurrent QUIC streams for manifest fetches during rebalance
 pub const CONCURRENT_MANIFEST_FETCH_STREAMS: usize = 16;
 
