@@ -700,6 +700,12 @@ struct ErasureRecoveryCtx {
     stripe_config: common::StripeConfig,
     stripe_miners: Vec<common::MinerNode>,
     stripe_shard_hashes: Vec<Option<String>>,
+    /// Upload-era stripe assignees: for files placed before the lookback
+    /// window the current holders are usually empty; these nodes are the
+    /// plausible source of surviving siblings. Endpoints already re-resolved
+    /// against the current map. None when the placement-epoch map is
+    /// unavailable or the file is current-epoch.
+    upload_era_stripe_miners: Option<Vec<common::MinerNode>>,
 }
 
 /// Info about a shard that is missing locally and should be fetched from a peer.
@@ -932,6 +938,34 @@ async fn tally_manifest_shards(
                                 }
                             }
 
+                            // Upload-era stripe assignees for erasure
+                            // recovery, endpoints re-resolved against the
+                            // current map (stable node key, possibly moved
+                            // address).
+                            let upload_era_stripe_miners = placement_epoch_maps
+                                .get(&manifest.placement_epoch)
+                                .and_then(|pe_map| {
+                                    common::calculate_stripe_placement(
+                                        file_hash,
+                                        stripe_idx as u64,
+                                        shards_per_stripe,
+                                        pe_map,
+                                        manifest.placement_version,
+                                    )
+                                    .ok()
+                                })
+                                .map(|mut era| {
+                                    for m in era.iter_mut() {
+                                        if let Some(cur) = cluster_map
+                                            .miners
+                                            .iter()
+                                            .find(|cm| cm.public_key == m.public_key)
+                                        {
+                                            m.endpoint = cur.endpoint.clone();
+                                        }
+                                    }
+                                    era
+                                });
                             Some(ErasureRecoveryCtx {
                                 file_hash: file_hash.to_string(),
                                 file_size: manifest.size,
@@ -940,6 +974,7 @@ async fn tally_manifest_shards(
                                 stripe_config: manifest.stripe_config.clone(),
                                 stripe_miners: stripe_miners.clone(),
                                 stripe_shard_hashes,
+                                upload_era_stripe_miners,
                             })
                         } else {
                             None
@@ -1601,8 +1636,29 @@ async fn perform_erasure_recovery(
         std::time::Duration::from_secs(crate::constants::REBALANCE_PEER_CONNECT_TIMEOUT_SECS);
     let read_timeout = std::time::Duration::from_secs(crate::constants::DEFAULT_READ_TIMEOUT_SECS);
 
+    // Merge current-map assignees with upload-era assignees. For files
+    // placed before the lookback window the current holders are usually
+    // empty; the upload-era nodes are the plausible source of surviving
+    // siblings. Deduped per position by node key; upload-era endpoints were
+    // re-resolved against the current map at ctx construction.
+    let mut candidates: Vec<(usize, common::MinerNode)> = Vec::new();
     for (idx, miner) in ctx.stripe_miners.iter().enumerate() {
-        if idx == ctx.local_idx {
+        candidates.push((idx, miner.clone()));
+    }
+    if let Some(era) = &ctx.upload_era_stripe_miners {
+        for (idx, miner) in era.iter().enumerate() {
+            let dup = ctx
+                .stripe_miners
+                .get(idx)
+                .map(|cur| cur.public_key == miner.public_key)
+                .unwrap_or(false);
+            if !dup {
+                candidates.push((idx, miner.clone()));
+            }
+        }
+    }
+    for (idx, miner) in candidates {
+        if idx == ctx.local_idx || idx >= total_shards {
             continue;
         }
 
@@ -1674,6 +1730,11 @@ async fn perform_erasure_recovery(
 
     while let Some(res) = fetch_tasks.join_next().await {
         if let Ok((idx, Some(data))) = res {
+            if shards[idx].is_some() {
+                // Both the current-map and the upload-era holder answered
+                // for this position; count it once toward k.
+                continue;
+            }
             shards[idx] = Some(data);
             fetched_count += 1;
 
