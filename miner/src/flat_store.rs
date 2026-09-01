@@ -172,6 +172,11 @@ impl FlatBlobStore {
     }
 
     /// Where the blob actually lives right now, if anywhere.
+    ///
+    /// Re-checks the sharded path after a flat miss for the same reason `read`
+    /// does: a concurrent `migrate_legacy_layout` rename between the two
+    /// `exists` calls would otherwise report a present blob as absent, and
+    /// `has()` feeds "do you hold this shard?" answers.
     fn locate(&self, hash_hex: &str) -> Option<PathBuf> {
         let sharded = self.blob_path(hash_hex);
         if sharded.exists() {
@@ -180,6 +185,9 @@ impl FlatBlobStore {
         let flat = self.blob_path_flat(hash_hex);
         if flat != sharded && flat.exists() {
             return Some(flat);
+        }
+        if sharded.exists() {
+            return Some(sharded);
         }
         None
     }
@@ -204,6 +212,10 @@ impl FlatBlobStore {
         let flat = self.trash_path_flat(hash_hex);
         if flat != sharded && flat.exists() {
             return Some(flat);
+        }
+        // `migrate_legacy_layout` walks the trash root too — same race as `locate`.
+        if sharded.exists() {
+            return Some(sharded);
         }
         None
     }
@@ -246,12 +258,26 @@ impl FlatBlobStore {
     }
 
     /// Read blob data (sharded first, legacy flat fallback).
+    ///
+    /// The flat miss is retried against the sharded path once. Without that,
+    /// `migrate_legacy_layout` renaming this very blob in the window between the
+    /// two lookups makes a permanently-present blob read as absent — which on the
+    /// PoS challenge path (`p2p.rs`) answers "Shard not found" and costs a
+    /// reputation penalty that never decays. A blob that moved mid-check is by
+    /// then definitively sharded, so one retry closes the race completely.
     pub async fn read(&self, hash_hex: &str) -> std::io::Result<Bytes> {
         match tokio::fs::read(self.blob_path(hash_hex)).await {
             Ok(data) => Ok(Bytes::from(data)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let data = tokio::fs::read(self.blob_path_flat(hash_hex)).await?;
-                Ok(Bytes::from(data))
+                match tokio::fs::read(self.blob_path_flat(hash_hex)).await {
+                    Ok(data) => Ok(Bytes::from(data)),
+                    Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => {
+                        // Migrated out from under us between the two lookups.
+                        let data = tokio::fs::read(self.blob_path(hash_hex)).await?;
+                        Ok(Bytes::from(data))
+                    }
+                    Err(e2) => Err(e2),
+                }
             }
             Err(e) => Err(e),
         }
