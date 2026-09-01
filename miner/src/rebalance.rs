@@ -1007,6 +1007,15 @@ async fn fetch_missing_shards(
                         if computed_hex.as_str() == shard.blob_hash_str {
                             match store.store(&shard.blob_hash_str, &data).await {
                                 Ok(()) => {
+                                    if let Err(e) = crate::inventory::insert_shard(
+                                        &shard.blob_hash_str,
+                                    ) {
+                                        warn!(
+                                            shard = hash_short,
+                                            error = %e,
+                                            "inventory: failed to insert rebalance-fetched shard"
+                                        );
+                                    }
                                     success = true;
                                     debug!(
                                         shard = hash_short,
@@ -1515,6 +1524,14 @@ pub async fn reconstruct_shard(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to store reconstructed shard: {}", e))?;
 
+    if let Err(e) = crate::inventory::insert_shard(&shard_hash_hex) {
+        warn!(
+            shard = %&shard_hash_hex[..12],
+            error = %e,
+            "inventory: failed to insert reconstructed shard"
+        );
+    }
+
     // 6. Return Ok(true) if successful
     warn!(
         shard = %&shard_hash.to_string()[..12],
@@ -1660,6 +1677,13 @@ async fn perform_erasure_recovery(
                     if let Err(e) = store.store(missing_blob_hash, &recovered_bytes).await {
                         error!(error = %e, "[REBALANCE] Failed to store reconstructed shard");
                         return false;
+                    }
+                    if let Err(e) = crate::inventory::insert_shard(missing_blob_hash) {
+                        warn!(
+                            shard = %&missing_blob_hash[..12.min(missing_blob_hash.len())],
+                            error = %e,
+                            "inventory: failed to insert EC-recovered shard"
+                        );
                     }
                     warn!(
                         missing_blob_hash,
