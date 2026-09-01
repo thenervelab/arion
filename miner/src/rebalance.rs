@@ -642,21 +642,23 @@ pub async fn self_rebalance_pg(
                 .take(file_budget)
                 .collect();
 
-            // Fetch manifests concurrently (16 parallel QUIC streams on one
-            // connection). One backoff+reconnect retry on abort: the validator
-            // sheds connections under load (same behaviour as the batch
-            // phase), and a dead connection otherwise fails every remaining
-            // manifest fast and silently kills the cycle.
+            // Fetch manifests concurrently (CONCURRENT_MANIFEST_FETCH_STREAMS
+            // parallel QUIC streams on one connection). Up to
+            // MAX_BATCH_RECONNECTS escalating backoff+reconnect retries on
+            // abort, mirroring the batch phase: one 20 s retry never converted
+            // (28/28 second-streak failures overnight 08-30/31) because the
+            // validator accepts the fresh connection and then serves nothing.
             {
                 use futures::stream::StreamExt;
                 let mut pending: Vec<String> = file_entries;
-                for attempt in 0..2u32 {
+                for attempt in 0..(MAX_BATCH_RECONNECTS + 1) {
                     if pending.is_empty() {
                         break;
                     }
                     if attempt > 0 {
-                        let wait =
-                            std::time::Duration::from_secs(BATCH_RECONNECT_BACKOFF_SECS);
+                        let wait = std::time::Duration::from_secs(
+                            BATCH_RECONNECT_BACKOFF_SECS * u64::from(attempt),
+                        );
                         warn!(
                             remaining = pending.len(),
                             backoff_secs = wait.as_secs(),

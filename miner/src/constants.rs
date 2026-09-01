@@ -371,7 +371,13 @@ pub const MAX_BATCH_RECONNECTS: u32 = 3;
 pub const BATCH_RECONNECT_BACKOFF_SECS: u64 = 20;
 
 /// Number of concurrent QUIC streams for manifest fetches during rebalance
-pub const CONCURRENT_MANIFEST_FETCH_STREAMS: usize = 16;
+// 16 -> 8: with 16 parallel streams one connection stall made
+// all in-flight fetches time out together, so the 10-consecutive-failures
+// abort tripped on a single wave (observed in production: 10 failures
+// within 4 ms). At 8, an abort requires sustained failure across two
+// waves, and the load
+// on the struggling validator is halved.
+pub const CONCURRENT_MANIFEST_FETCH_STREAMS: usize = 8;
 
 /// Maximum consecutive manifest fetch failures before aborting rebalance
 pub const MAX_CONSECUTIVE_MANIFEST_FAILURES: u32 = 10;
