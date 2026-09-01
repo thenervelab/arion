@@ -440,9 +440,15 @@ async fn run_miner(cli: Cli) -> Result<()> {
     // Load cached cluster map from disk (survives restarts)
     if let Some(map) = rebalance::load_cluster_map_cache(&data_dir).await {
         let epoch = map.epoch;
-        let pgs = tokio::task::spawn_blocking({
-            let map_clone = map.clone();
-            move || common::calculate_my_pgs(miner_uid, &map_clone)
+        // CRUSH wants a filtered view (draining miners excluded); the
+        // unfiltered map stays in state to preserve the broadcast contract.
+        let filtered_for_crush = if map.miners.iter().any(|m| m.draining) {
+            common::filter_map_for_placement(&map)
+        } else {
+            map.clone()
+        };
+        let pgs = tokio::task::spawn_blocking(move || {
+            common::calculate_my_pgs(miner_uid, &filtered_for_crush)
         })
         .await
         .unwrap_or_default();

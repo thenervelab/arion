@@ -289,20 +289,37 @@ pub async fn self_rebalance_pg(
         nid.clone()
     };
 
+    // CRUSH must see a filtered map (draining miners excluded) so all paths
+    // -- upload, download, recovery, rebalance -- compute identical placements.
+    // The unfiltered map stays in `state::cluster_map` (broadcast contract).
+    let cluster_map: Arc<common::ClusterMap> = if cluster_map.miners.iter().any(|m| m.draining) {
+        Arc::new(common::filter_map_for_placement(&cluster_map))
+    } else {
+        cluster_map
+    };
+
     if validator_addr.is_none() && !doc_available {
         warn!("No validator address stored and no doc replica, skipping rebalance");
         return Ok(());
     }
 
     // Snapshot cluster map history for epoch lookback (prevents premature deletion).
-    // Only keep maps within the EPOCH_LOOKBACK window.
+    // Only keep maps within the EPOCH_LOOKBACK window. Each map is filtered
+    // for placement before use so CRUSH calls downstream don't trip the
+    // `filter_map_for_placement` precondition.
     let history_maps: Vec<Arc<common::ClusterMap>> = {
         let history = crate::state::get_cluster_map_history().read().await;
         let min_epoch = cluster_map.epoch.saturating_sub(EPOCH_LOOKBACK);
         history
             .iter()
             .filter(|m| m.epoch >= min_epoch)
-            .map(|m| m.clone())
+            .map(|m| {
+                if m.miners.iter().any(|x| x.draining) {
+                    Arc::new(common::filter_map_for_placement(m))
+                } else {
+                    m.clone()
+                }
+            })
             .collect()
     };
 
@@ -361,6 +378,12 @@ pub async fn self_rebalance_pg(
                     None => continue,
                 }
             };
+            let updated_map: Arc<common::ClusterMap> =
+                if updated_map.miners.iter().any(|m| m.draining) {
+                    Arc::new(common::filter_map_for_placement(&updated_map))
+                } else {
+                    updated_map
+                };
             let map_for_pgs = updated_map.clone();
             let pgs =
                 tokio::task::spawn_blocking(move || common::calculate_my_pgs(my_uid, &map_for_pgs))
@@ -539,6 +562,11 @@ pub async fn self_rebalance_pg(
                                 )
                                 .await
                             {
+                                let pe_map = if pe_map.miners.iter().any(|m| m.draining) {
+                                    Arc::new(common::filter_map_for_placement(&pe_map))
+                                } else {
+                                    pe_map
+                                };
                                 placement_epoch_maps.insert(pe, pe_map);
                             }
                             tally_manifest_shards(
@@ -620,6 +648,11 @@ pub async fn self_rebalance_pg(
                                 )
                                 .await
                             {
+                                let pe_map = if pe_map.miners.iter().any(|m| m.draining) {
+                                    Arc::new(common::filter_map_for_placement(&pe_map))
+                                } else {
+                                    pe_map
+                                };
                                 placement_epoch_maps.insert(pe, pe_map);
                             }
                             tally_manifest_shards(
@@ -1456,6 +1489,12 @@ pub async fn reconstruct_shard(
                 None => return Ok(false),
             }
         };
+        let cluster_map: Arc<common::ClusterMap> =
+            if cluster_map.miners.iter().any(|m| m.draining) {
+                Arc::new(common::filter_map_for_placement(&cluster_map))
+            } else {
+                cluster_map
+            };
         let placement_versions_to_try =
             repair_placement_versions_to_try(manifest.placement_version);
 
