@@ -5,8 +5,11 @@
 //!
 //! 1. **PG calculation**: Compute which Placement Groups this miner is
 //!    responsible for using CRUSH over the current cluster map (cached by epoch).
-//! 2. **Manifest fetch**: Query the validator for all files in those PGs
-//!    via chunked `QueryPgFilesBatch` requests (500 PGs per chunk).
+//! 2. **Manifest fetch**: Query the validator for files in those PGs via
+//!    chunked `QueryPgFilesBatch` requests, issued from a persistent rotating
+//!    cursor and only until the cycle's file budget
+//!    (`rebalance_max_files_per_cycle`) is covered. Chunk size halves
+//!    automatically when a response overflows the entry cap.
 //!    Falls back to local iroh-doc replica if validator is unreachable.
 //! 3. **Shard verification**: For each file, fetch the manifest and walk
 //!    stripes to identify shards this miner should hold (CRUSH placement
@@ -23,8 +26,9 @@
 use crate::constants::{
     BATCH_RESPONSE_TIMEOUT_SECS, CONCURRENT_MANIFEST_FETCH_STREAMS, EPOCH_LOOKBACK,
     MANIFEST_READ_TIMEOUT_SECS, MANIFEST_RESPONSE_MAX_SIZE, MANIFEST_STREAM_OPEN_TIMEOUT_SECS,
-    MAX_BATCH_PG_RESPONSE_SIZE, MAX_CONSECUTIVE_MANIFEST_FAILURES, MAX_PG_BATCH_FILE_ENTRIES,
-    PG_BATCH_CHUNK_SIZE, REBALANCE_FETCH_CONCURRENCY, REBALANCE_FETCH_MAX_CONCURRENCY,
+    MAX_BATCH_PG_RESPONSE_SIZE, MAX_CONSECUTIVE_BATCH_FAILURES,
+    MAX_CONSECUTIVE_MANIFEST_FAILURES, MAX_PG_BATCH_FILE_ENTRIES, PG_BATCH_CHUNK_SIZE,
+    REBALANCE_FETCH_CONCURRENCY, REBALANCE_FETCH_MAX_CONCURRENCY,
     REBALANCE_FETCH_MIN_CONCURRENCY, REBALANCE_FETCH_SCALEUP_THRESHOLD,
     REBALANCE_MAX_FILES_PER_CYCLE,
 };
@@ -53,6 +57,12 @@ const MAX_CACHED_CLUSTER_MAPS: usize = 256;
 static CLUSTER_MAP_CACHE: LazyLock<
     TokioRwLock<std::collections::HashMap<u64, Option<Arc<common::ClusterMap>>>>,
 > = LazyLock::new(|| TokioRwLock::new(std::collections::HashMap::new()));
+
+/// Persistent rotating cursor over the sorted PG assignment for
+/// budgeted validator batch queries. Advances by the number of PGs consumed
+/// each cycle so successive cycles sweep different slices of the assignment
+/// instead of re-querying the same prefix every tick.
+static PG_QUERY_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
 fn repair_placement_versions_to_try(tagged_version: u8) -> Vec<u8> {
     common::get_placement_probing_sequence(tagged_version)
@@ -438,17 +448,49 @@ pub async fn self_rebalance_pg(
         };
 
         if let Some(validator_conn) = validator_conn {
+            let mut validator_conn = validator_conn;
             // ---- Validator path: query PGs then fetch manifests ----
+            //
+            // Budget-aware rotating-cursor querying.
+            // Previously every cycle queried ALL assigned PGs (~22M file
+            // entries at 5k PGs × ~4.5k files/PG at observed densities) and then
+            // kept only `REBALANCE_MAX_FILES_PER_CYCLE` of them — >99% of the
+            // transferred JSON was discarded, saturating the WAN link every
+            // tick. Chunks are now issued only until the cycle's file budget
+            // is covered, and a persistent cursor rotates the starting PG so
+            // successive cycles sweep the whole assignment.
+            let file_budget = REBALANCE_MAX_FILES_PER_CYCLE.max(1);
+            let max_batch_entries = MAX_PG_BATCH_FILE_ENTRIES.max(1);
+
+            let mut pgs_sorted = my_pgs.clone();
+            pgs_sorted.sort_unstable();
+            let cursor_start = PG_QUERY_CURSOR.load(Ordering::Relaxed) % pgs_sorted.len();
+            let rotated: Vec<u32> = pgs_sorted[cursor_start..]
+                .iter()
+                .chain(pgs_sorted[..cursor_start].iter())
+                .copied()
+                .collect();
+
             let mut pg_files_map: std::collections::HashMap<u32, Vec<String>> =
-                std::collections::HashMap::with_capacity(my_pgs.len());
+                std::collections::HashMap::new();
             let read_timeout = std::time::Duration::from_secs(BATCH_RESPONSE_TIMEOUT_SECS);
 
             debug!(
-                pg_count = my_pgs.len(),
-                "Querying validator for files in assigned PGs (chunked batch)"
+                pg_count = rotated.len(),
+                cursor = cursor_start,
+                file_budget = file_budget,
+                "Querying validator for files in assigned PGs (budgeted rotating batch)"
             );
 
-            for chunk in my_pgs.chunks(PG_BATCH_CHUNK_SIZE) {
+            let mut chunk_size = PG_BATCH_CHUNK_SIZE.max(1);
+            let mut idx = 0usize; // next PG in `rotated` to query
+            let mut total_files = 0usize;
+            let mut batch_failures = 0u32;
+            let mut reconnected = false;
+
+            while idx < rotated.len() && total_files < file_budget {
+                let end = (idx + chunk_size).min(rotated.len());
+                let chunk = &rotated[idx..end];
                 let query_msg = common::ValidatorControlMessage::QueryPgFilesBatch {
                     pg_ids: chunk.to_vec(),
                 };
@@ -471,11 +513,11 @@ pub async fn self_rebalance_pg(
                         serde_json::from_slice(&response_bytes)?;
 
                     let total_entries: usize = files.values().map(|v| v.len()).sum();
-                    if total_entries > MAX_PG_BATCH_FILE_ENTRIES {
+                    if total_entries > max_batch_entries {
                         anyhow::bail!(
                             "PG batch response too large: {} file entries (max {})",
                             total_entries,
-                            MAX_PG_BATCH_FILE_ENTRIES,
+                            max_batch_entries,
                         );
                     }
 
@@ -485,25 +527,96 @@ pub async fn self_rebalance_pg(
 
                 match result {
                     Ok(f) => {
+                        batch_failures = 0;
+                        total_files += f.values().map(|v| v.len()).sum::<usize>();
                         for (k, v) in f {
                             pg_files_map.insert(k, v);
+                        }
+                        idx = end;
+                    }
+                    Err(e)
+                        if e.to_string().contains("too large")
+                            || e.to_string().contains("too long") =>
+                    {
+                        // Entry-cap overflow ("too large") or 20 MiB byte-cap
+                        // overflow (quinn "too long"): shrink the window and
+                        // retry the SAME PGs instead of discarding their data.
+                        if chunk_size > 1 {
+                            chunk_size = (chunk_size / 2).max(1);
+                            warn!(
+                                new_chunk_size = chunk_size,
+                                "PG batch response too large — halving chunk size and retrying"
+                            );
+                        } else {
+                            error!(
+                                pg = chunk[0],
+                                "Single-PG batch response exceeds entry cap — skipping PG"
+                            );
+                            idx = end;
+                            batch_failures += 1;
                         }
                     }
                     Err(e) => {
                         error!(error = %e, "Batch PG chunk query failed");
+                        batch_failures += 1;
+                        // All chunks share one QUIC connection; a validator-side
+                        // close would otherwise doom every remaining chunk.
+                        // Reconnect once per cycle and retry the same window.
+                        if !reconnected {
+                            reconnected = true;
+                            match common::transport::connect_with_alpn(
+                                &endpoint,
+                                validator_addr,
+                                &validator_node_id,
+                                &signing_key,
+                                &[common::VALIDATOR_CONTROL_ALPN],
+                            )
+                            .await
+                            {
+                                Ok(conn) => {
+                                    warn!("Reconnected to validator for batch queries");
+                                    validator_conn = conn;
+                                    continue;
+                                }
+                                Err(e2) => {
+                                    warn!(
+                                        error = %e2,
+                                        "Validator reconnect failed — aborting batch queries this cycle"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        if batch_failures >= MAX_CONSECUTIVE_BATCH_FAILURES {
+                            warn!(
+                                failures = batch_failures,
+                                "Too many consecutive batch failures — aborting batch queries this cycle"
+                            );
+                            break;
+                        }
+                        idx = end;
                     }
                 }
             }
 
+            // Advance the cursor past the PGs consumed this cycle so the next
+            // cycle continues the sweep instead of re-querying the same prefix.
+            PG_QUERY_CURSOR.store(
+                (cursor_start + idx) % pgs_sorted.len().max(1),
+                Ordering::Relaxed,
+            );
+
             debug!(
                 pgs_with_files = pg_files_map.len(),
-                "Received batch PG query response"
+                pgs_queried = idx,
+                total_files = total_files,
+                "Received batch PG query responses"
             );
 
             let file_entries: Vec<String> = pg_files_map
                 .values()
                 .flat_map(|files| files.iter().cloned())
-                .take(REBALANCE_MAX_FILES_PER_CYCLE)
+                .take(file_budget)
                 .collect();
 
             // Fetch manifests concurrently (16 parallel QUIC streams on one connection)
@@ -598,7 +711,7 @@ pub async fn self_rebalance_pg(
 
                 let file_hashes: Vec<String> = file_hashes
                     .into_iter()
-                    .take(REBALANCE_MAX_FILES_PER_CYCLE)
+                    .take(REBALANCE_MAX_FILES_PER_CYCLE.max(1))
                     .collect();
 
                 for file_hash in &file_hashes {

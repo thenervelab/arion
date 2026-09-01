@@ -323,11 +323,26 @@ pub const PEER_DATA_RECEPTION_TIMEOUT_SECS: u64 = 30;
 /// Timeout for reading batch PG query response from validator (seconds)
 pub const BATCH_RESPONSE_TIMEOUT_SECS: u64 = 60;
 
-/// Number of PGs to query per batch chunk
+/// Number of PGs to query per batch chunk. Only the starting point of a
+/// cycle: the query loop halves the chunk size automatically when a
+/// response overflows the entry cap, so growing per-PG file density
+/// degrades gracefully instead of erroring.
 pub const PG_BATCH_CHUNK_SIZE: usize = 50;
 
-/// Maximum total file entries accepted from a batch PG response
-pub const MAX_PG_BATCH_FILE_ENTRIES: usize = 100_000;
+/// Maximum total file entries accepted from a batch PG response.
+///
+/// Raised 100k → 400k: this check runs AFTER the response has
+/// been fully read (bounded by `MAX_BATCH_PG_RESPONSE_SIZE` = 20 MiB, the
+/// real memory guard) and JSON-parsed, so tripping it only discards data we
+/// already paid to transfer. 20 MiB of JSON cannot exceed ~290k hash entries,
+/// so at 400k this cap can never bind before the byte cap — it survives only
+/// as a sanity ceiling.
+pub const MAX_PG_BATCH_FILE_ENTRIES: usize = 400_000;
+
+/// Maximum consecutive failed batch PG chunk queries before the cycle's
+/// query loop aborts (prevents hammering a broken validator connection
+/// with dozens of doomed chunk requests every tick).
+pub const MAX_CONSECUTIVE_BATCH_FAILURES: u32 = 5;
 
 /// Number of concurrent QUIC streams for manifest fetches during rebalance
 pub const CONCURRENT_MANIFEST_FETCH_STREAMS: usize = 16;
