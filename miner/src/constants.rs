@@ -284,6 +284,19 @@ pub const REBALANCE_FETCH_MIN_CONCURRENCY: usize = 1;
 /// Number of consecutive successes before increasing rebalance fetch concurrency
 pub const REBALANCE_FETCH_SCALEUP_THRESHOLD: usize = 5;
 
+/// How often the fetch phase logs a progress line at info. Without it a
+/// failing fetch phase is indistinguishable from a hung one: every failure
+/// path in `fetch_missing_shards` logs at debug only (observed in production:
+/// 85 min of total journal silence mid-pass).
+pub const REBALANCE_FETCH_PROGRESS_SECS: u64 = 60;
+
+/// Hard deadline for one shard's entire fetch attempt (peer loop + erasure
+/// recovery). `open_bi()`/`write_all()` have no timeout of their own, so a
+/// half-dead pooled connection could stall the pass forever; this also caps
+/// the legitimate worst case (~30 candidate peers x 33 s reads).
+pub const REBALANCE_SHARD_FETCH_DEADLINE_SECS: u64 = 180;
+
+
 /// Epoch lookback depth for shard placement during rebalance.
 /// Shards placed on this miner under any cluster map within this window
 /// are considered expected, preventing premature orphan GC during transitions.

@@ -29,8 +29,9 @@ use crate::constants::{
     MAX_BATCH_PG_RESPONSE_SIZE, MAX_BATCH_RECONNECTS, MAX_CONSECUTIVE_BATCH_FAILURES,
     MAX_CONSECUTIVE_MANIFEST_FAILURES, MAX_PG_BATCH_FILE_ENTRIES, PG_BATCH_CHUNK_SIZE,
     REBALANCE_FETCH_CONCURRENCY, REBALANCE_FETCH_MAX_CONCURRENCY,
-    REBALANCE_FETCH_MIN_CONCURRENCY, REBALANCE_FETCH_SCALEUP_THRESHOLD,
-    REBALANCE_MAX_FILES_PER_CYCLE,
+    REBALANCE_FETCH_MIN_CONCURRENCY, REBALANCE_FETCH_PROGRESS_SECS,
+    REBALANCE_FETCH_SCALEUP_THRESHOLD, REBALANCE_MAX_FILES_PER_CYCLE,
+    REBALANCE_SHARD_FETCH_DEADLINE_SECS,
 };
 use crate::state::{
     get_cluster_map, get_validator_addr, get_validator_node_id_global, get_validator_reachable,
@@ -1074,6 +1075,10 @@ async fn fetch_missing_shards(
     let concurrency = Arc::new(AtomicUsize::new(REBALANCE_FETCH_CONCURRENCY));
     let consecutive_ok = Arc::new(AtomicUsize::new(0));
     let fetched = Arc::new(AtomicUsize::new(0));
+    let attempted = Arc::new(AtomicUsize::new(0));
+    let not_found_events = Arc::new(AtomicUsize::new(0));
+    let stream_error_events = Arc::new(AtomicUsize::new(0));
+    let deadline_shards = Arc::new(AtomicUsize::new(0));
 
     // Local semaphore — separate from the inbound fetch_sem
     let sem = Arc::new(Semaphore::new(REBALANCE_FETCH_CONCURRENCY));
@@ -1087,6 +1092,30 @@ async fn fetch_missing_shards(
         REBALANCE_FETCH_CONCURRENCY,
     );
 
+    let progress_ticker = {
+        let attempted = attempted.clone();
+        let fetched = fetched.clone();
+        let concurrency = concurrency.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let mut iv = tokio::time::interval(std::time::Duration::from_secs(
+                REBALANCE_FETCH_PROGRESS_SECS,
+            ));
+            iv.tick().await; // consume the immediate first tick
+            loop {
+                iv.tick().await;
+                info!(
+                    attempted = attempted.load(Ordering::Relaxed),
+                    total = total,
+                    fetched = fetched.load(Ordering::Relaxed),
+                    concurrency = concurrency.load(Ordering::Relaxed),
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "[REBALANCE] Fetch progress"
+                );
+            }
+        })
+    };
+
     let mut join_set = tokio::task::JoinSet::new();
 
     for shard in missing {
@@ -1094,6 +1123,10 @@ async fn fetch_missing_shards(
         let concurrency = concurrency.clone();
         let consecutive_ok = consecutive_ok.clone();
         let fetched = fetched.clone();
+        let attempted = attempted.clone();
+        let not_found_events = not_found_events.clone();
+        let stream_error_events = stream_error_events.clone();
+        let deadline_shards = deadline_shards.clone();
         let store = Arc::clone(store);
         let endpoint = endpoint.clone();
 
@@ -1103,6 +1136,12 @@ async fn fetch_missing_shards(
 
             let hash_short = &shard.shard_hash.to_string()[..12];
 
+            // Hard deadline for this shard's entire attempt (peer loop +
+            // erasure recovery): open_bi()/write_all() carry no timeout, so a
+            // half-dead connection could otherwise stall the pass forever.
+            // The permit wait above is deliberately OUTSIDE the deadline —
+            // queued tasks must not expire while waiting their turn.
+            let attempt = async {
             // Try each peer until one succeeds
             let mut success = false;
             for (peer_node_id, peer_addr) in &shard.peer_endpoints {
@@ -1175,10 +1214,12 @@ async fn fetch_missing_shards(
                     }
                     Ok(None) => {
                         // Peer doesn't have it, try next
+                        not_found_events.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                     Err(_) => {
                         // Timeout or error — adaptive: reduce concurrency
+                        stream_error_events.fetch_add(1, Ordering::Relaxed);
                         let cur = concurrency.load(Ordering::Relaxed);
                         if cur > REBALANCE_FETCH_MIN_CONCURRENCY {
                             let new = cur.saturating_sub(1).max(REBALANCE_FETCH_MIN_CONCURRENCY);
@@ -1186,11 +1227,13 @@ async fn fetch_missing_shards(
                             // Shrink the semaphore by forgetting a permit
                             if let Ok(p) = sem.try_acquire() {
                                 p.forget();
-                                debug!(
-                                    new_concurrency = new,
-                                    "[REBALANCE] Reduced fetch concurrency (timeout)"
-                                );
                             }
+                            // Log unconditionally: gating this behind
+                            // try_acquire hid every decrement in practice.
+                            debug!(
+                                new_concurrency = new,
+                                "[REBALANCE] Reduced fetch concurrency (timeout)"
+                            );
                         }
                         consecutive_ok.store(0, Ordering::Relaxed);
                         continue;
@@ -1211,6 +1254,22 @@ async fn fetch_missing_shards(
                     }
                 }
             }
+            success
+            };
+            let success = match tokio::time::timeout(
+                std::time::Duration::from_secs(REBALANCE_SHARD_FETCH_DEADLINE_SECS),
+                attempt,
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(_) => {
+                    deadline_shards.fetch_add(1, Ordering::Relaxed);
+                    consecutive_ok.store(0, Ordering::Relaxed);
+                    false
+                }
+            };
+            attempted.fetch_add(1, Ordering::Relaxed);
 
             if success {
                 fetched.fetch_add(1, Ordering::Relaxed);
@@ -1236,18 +1295,39 @@ async fn fetch_missing_shards(
         });
     }
 
-    // Await all tasks
+    // Await all tasks. Each shard's whole attempt (peer loop + erasure
+    // fallback) is bounded by REBALANCE_SHARD_FETCH_DEADLINE_SECS, so the
+    // phase cannot wedge on a single hung stream.
     while let Some(result) = join_set.join_next().await {
         if let Err(e) = result {
-            warn!(error = %e, "[REBALANCE] Fetch task panicked");
+            if !e.is_cancelled() {
+                warn!(error = %e, "[REBALANCE] Fetch task panicked");
+            }
         }
     }
+    progress_ticker.abort();
 
     let total_fetched = fetched.load(Ordering::Relaxed);
     let final_concurrency = concurrency.load(Ordering::Relaxed);
-    info!(
-        "[REBALANCE] Fetched {total_fetched}/{total} missing shards (final concurrency={final_concurrency})",
-    );
+    let nf = not_found_events.load(Ordering::Relaxed);
+    let se = stream_error_events.load(Ordering::Relaxed);
+    let dl = deadline_shards.load(Ordering::Relaxed);
+    if total_fetched == 0 && total >= 50 {
+        warn!(
+            not_found_events = nf,
+            stream_error_events = se,
+            deadline_shards = dl,
+            final_concurrency = final_concurrency,
+            "[REBALANCE] Fetched 0/{total} missing shards — no peer returned data",
+        );
+    } else {
+        info!(
+            not_found_events = nf,
+            stream_error_events = se,
+            deadline_shards = dl,
+            "[REBALANCE] Fetched {total_fetched}/{total} missing shards (final concurrency={final_concurrency})",
+        );
+    }
     total_fetched
 }
 
