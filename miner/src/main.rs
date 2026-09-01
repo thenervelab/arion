@@ -1396,7 +1396,7 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<quinn::Conne
 
     // Connect to validator via quinn
     let conn = tokio::time::timeout(
-        std::time::Duration::from_secs(constants::DEFAULT_CONNECT_TIMEOUT_SECS),
+        std::time::Duration::from_secs(constants::REGISTER_CONNECT_TIMEOUT_SECS),
         common::transport::connect_with_alpn(
             &ctx.endpoint,
             ctx.validator_socket_addr,

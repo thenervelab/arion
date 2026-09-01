@@ -164,6 +164,17 @@ pub const HEARTBEAT_ACK_BUFFER_SIZE: usize = 4096;
 /// Timeout for registration ACK from validator (seconds)
 pub const REGISTER_COMPLETION_TIMEOUT_SECS: u64 = 10;
 
+/// Timeout for opening the QUIC connection to the validator during registration.
+///
+/// Decoupled from `DEFAULT_CONNECT_TIMEOUT_SECS` (which governs peer-to-peer
+/// connects for rebalance/fetch) so the registration path can tolerate
+/// validator-side load spikes without forcing peer connects to wait longer
+/// than they need to. Observed in production: the validator QUIC accept queue
+/// can miss the 20s default during high-load windows, causing the
+/// heartbeat re-registration loop to fail repeatedly and eventually escalate
+/// to a fatal shutdown.
+pub const REGISTER_CONNECT_TIMEOUT_SECS: u64 = 60;
+
 /// Maximum buffer size for registration ACK response (bytes)
 pub const REGISTER_ACK_BUFFER_SIZE: usize = 4096;
 
