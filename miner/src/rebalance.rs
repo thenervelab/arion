@@ -391,8 +391,15 @@ pub async fn self_rebalance_pg(
     trace!(pgs = ?my_pgs.iter().take(10).collect::<Vec<_>>(), "My PG assignments (first 10)");
 
     // Pre-build set of locally present hashes from the flat file store.
+    // The directory walk is blocking IO that can take minutes on a large
+    // store with a cold dentry cache; run it on the blocking pool so the
+    // async workers (heartbeats included) keep flowing.
     let local_hashes: std::collections::HashSet<iroh_blobs::Hash> = {
-        let hash_strings = store.list_hashes();
+        let store_for_scan = Arc::clone(&store);
+        let hash_strings =
+            tokio::task::spawn_blocking(move || store_for_scan.list_hashes())
+                .await
+                .expect("list_hashes task panicked");
         let set: std::collections::HashSet<iroh_blobs::Hash> = hash_strings
             .iter()
             .filter_map(|h| iroh_blobs::Hash::from_str(h).ok())
