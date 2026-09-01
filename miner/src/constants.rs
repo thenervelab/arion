@@ -51,8 +51,19 @@ pub const CONNECTION_POOL_EVICTION_FRACTION: usize = 10;
 // Caching
 // ============================================================================
 
-/// Blob cache size (number of entries)
-pub const BLOB_CACHE_SIZE: usize = 10_000;
+/// Blob cache weight ceiling — bytes. Each cached blob counts its own
+/// length toward this ceiling via a custom Weighter (see `state.rs::BlobWeighter`).
+///
+/// Replaces the previous count-bounded `BLOB_CACHE_SIZE = 10_000` which,
+/// at shard sizes up to ~800 KiB, allowed the cache to grow to ~8 GiB
+/// in pathological cases and competed with the page cache + chain node
+/// for RAM on memory-constrained boxes.
+pub const BLOB_CACHE_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+
+/// Estimated entry count for the cache's internal hash table sizing.
+/// Approximately `BLOB_CACHE_BYTES / typical_shard_size`. Doesn't bound
+/// the actual entry count — that's enforced by byte weight.
+pub const BLOB_CACHE_ESTIMATED_ITEMS: usize = 5_000;
 
 /// Maximum peer cache entries (prevents unbounded memory growth)
 /// Based on typical cluster size: 10k miners should be more than enough

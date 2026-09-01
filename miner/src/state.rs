@@ -20,8 +20,7 @@
 #![allow(clippy::type_complexity)]
 
 use crate::constants::{
-    BLOB_CACHE_SIZE, CONNECTION_POOL_EVICTION_FRACTION, CONNECTION_TTL_SECS,
-    MAX_CONNECTION_POOL_SIZE,
+    CONNECTION_POOL_EVICTION_FRACTION, CONNECTION_TTL_SECS, MAX_CONNECTION_POOL_SIZE,
 };
 use anyhow::Result;
 use common::now_secs;
@@ -62,10 +61,26 @@ static BLOBS_DIR: OnceLock<Arc<RwLock<Option<std::path::PathBuf>>>> = OnceLock::
 static CONNECTION_POOL: OnceLock<Arc<RwLock<HashMap<String, (quinn::Connection, u64)>>>> =
     OnceLock::new();
 
-/// Blob cache for FetchBlob responses
+/// Blob cache for FetchBlob responses.
 /// Key: iroh_blobs::Hash (32 bytes, Copy — no heap alloc for key)
 /// Value: bytes::Bytes (refcounted — clone is just a refcount bump)
-static BLOB_CACHE: OnceLock<Arc<Cache<iroh_blobs::Hash, bytes::Bytes>>> = OnceLock::new();
+///
+/// Byte-weighted (see `BlobWeighter`): the cache evicts LRU entries until
+/// total byte weight is at or below `BLOB_CACHE_BYTES`. This gives
+/// a predictable memory ceiling regardless of variable shard sizes.
+#[derive(Clone, Copy, Default)]
+pub struct BlobWeighter;
+
+impl quick_cache::Weighter<iroh_blobs::Hash, bytes::Bytes> for BlobWeighter {
+    fn weight(&self, _key: &iroh_blobs::Hash, val: &bytes::Bytes) -> u64 {
+        // Each entry weighs its own byte length toward the cache ceiling.
+        // quick_cache treats 0-weight entries as never evicted, so clamp to >= 1.
+        (val.len() as u64).max(1)
+    }
+}
+
+static BLOB_CACHE: OnceLock<Arc<Cache<iroh_blobs::Hash, bytes::Bytes, BlobWeighter>>> =
+    OnceLock::new();
 
 /// Flag to signal that re-registration is needed (set when validator returns UNKNOWN)
 static NEEDS_REREGISTRATION: OnceLock<Arc<std::sync::atomic::AtomicBool>> = OnceLock::new();
@@ -149,8 +164,14 @@ pub fn get_connection_pool() -> &'static Arc<RwLock<HashMap<String, (quinn::Conn
     CONNECTION_POOL.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
 }
 
-pub fn get_blob_cache() -> &'static Arc<Cache<iroh_blobs::Hash, bytes::Bytes>> {
-    BLOB_CACHE.get_or_init(|| Arc::new(Cache::new(BLOB_CACHE_SIZE)))
+pub fn get_blob_cache() -> &'static Arc<Cache<iroh_blobs::Hash, bytes::Bytes, BlobWeighter>> {
+    BLOB_CACHE.get_or_init(|| {
+        Arc::new(Cache::with_weighter(
+            crate::constants::BLOB_CACHE_ESTIMATED_ITEMS,
+            crate::constants::BLOB_CACHE_BYTES,
+            BlobWeighter,
+        ))
+    })
 }
 
 pub fn get_needs_reregistration() -> &'static Arc<std::sync::atomic::AtomicBool> {
