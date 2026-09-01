@@ -1786,7 +1786,10 @@ async fn perform_erasure_recovery(
     }
 
     if fetched_count < k {
-        debug!(
+        // WARN, not debug: a systemic recovery outage (peers no longer
+        // holding siblings) is otherwise invisible at default log levels
+        // while the store silently loses redundancy.
+        warn!(
             missing_blob_hash,
             fetched_count, k, "[REBALANCE] Erasure recovery failed: not enough shards fetched"
         );
