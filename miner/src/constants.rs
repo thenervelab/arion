@@ -281,6 +281,11 @@ pub const EPOCH_LOOKBACK: u64 = 50;
 /// Maximum cluster map history entries retained for epoch lookback.
 pub const MAX_CLUSTER_MAP_HISTORY: usize = 10;
 
+/// Cap on fetch candidate peers per missing shard. The list merges upload-era,
+/// historical-window and current-stripe holders; without a cap one shard could
+/// spend the whole fetch-phase budget dialing peers.
+pub const REBALANCE_FETCH_MAX_PEERS_PER_SHARD: usize = 40;
+
 // ============================================================================
 // P2P Operations
 // ============================================================================

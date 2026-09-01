@@ -831,6 +831,49 @@ async fn tally_manifest_shards(
                         // and historical epochs (the previous holder likely
                         // still has it during the rebalancing window).
                         let mut peers: Vec<(String, std::net::SocketAddr)> = Vec::new();
+                        // Upload-era placement:
+                        // for files older than the EPOCH_LOOKBACK window, the
+                        // nodes assigned when the file was uploaded are the
+                        // most likely long-term holders -- the 50-epoch
+                        // history below cannot reach them. The map is already
+                        // in placement_epoch_maps (fetched for the retention
+                        // check), so this adds no validator load; when the
+                        // map is absent nothing is added. Addresses are
+                        // re-resolved against the current map (stable node
+                        // id, possibly moved endpoint), falling back to the
+                        // upload-era address. Pushed first so these are
+                        // dialed before the current siblings, which are
+                        // empirically almost always empty for old files.
+                        if let Some(pe_map) = placement_epoch_maps.get(&manifest.placement_epoch) {
+                            for m in stripe_candidates_for_versions(
+                                file_hash,
+                                stripe_idx as u64,
+                                shards_per_stripe,
+                                pe_map,
+                                &placement_versions_to_try,
+                            )
+                            .get(local_idx)
+                            .into_iter()
+                            .flatten()
+                            {
+                                if m.uid == my_uid {
+                                    continue;
+                                }
+                                let addr = cluster_map
+                                    .miners
+                                    .iter()
+                                    .find(|cm| cm.endpoint.id == m.endpoint.id)
+                                    .and_then(|cm| {
+                                        crate::state::socket_addr_from_endpoint(&cm.endpoint)
+                                    })
+                                    .or_else(|| {
+                                        crate::state::socket_addr_from_endpoint(&m.endpoint)
+                                    });
+                                if let Some(addr) = addr {
+                                    peers.push((m.endpoint.id.to_string(), addr));
+                                }
+                            }
+                        }
                         // Historical placements: the miner that held this
                         // position in a previous epoch likely still has it.
                         for hist_map in history_maps {
@@ -868,8 +911,15 @@ async fn tally_manifest_shards(
                                 peers.push((m.endpoint.id.to_string(), addr));
                             }
                         }
-                        // Deduplicate by node_id
-                        peers.dedup_by(|a, b| a.0 == b.0);
+                        // Deduplicate by node_id, order-preserving (keeps
+                        // the first occurrence so upload-era candidates stay
+                        // in front), then cap the list so a single shard
+                        // cannot eat the whole fetch-phase budget.
+                        {
+                            let mut seen = std::collections::HashSet::new();
+                            peers.retain(|p| seen.insert(p.0.clone()));
+                        }
+                        peers.truncate(crate::constants::REBALANCE_FETCH_MAX_PEERS_PER_SHARD);
 
                         let erasure_ctx = if mine_current {
                             let start_global_idx = stripe_idx * shards_per_stripe;
