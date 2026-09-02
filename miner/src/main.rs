@@ -669,7 +669,9 @@ async fn run_miner(cli: Cli) -> Result<()> {
     let accept_token = CancellationToken::new();
     let accept_cancel = accept_token.clone();
     // Limit concurrent connections to prevent DoS (file descriptor exhaustion)
-    let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(256));
+    let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(
+        crate::constants::INBOUND_CONNECTION_LIMIT,
+    ));
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -682,7 +684,10 @@ async fn run_miner(cli: Cli) -> Result<()> {
                     let permit = match conn_semaphore.clone().try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {
-                            warn!("Connection limit reached (256), dropping incoming connection");
+                            warn!(
+                                "Connection limit reached ({}), dropping incoming connection",
+                                crate::constants::INBOUND_CONNECTION_LIMIT
+                            );
                             drop(incoming);
                             continue;
                         }

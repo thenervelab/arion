@@ -121,6 +121,14 @@ pub const MAX_CONCURRENT_HANDLERS: usize = 2048;
 // QUIC Transport
 // ============================================================================
 
+/// Maximum concurrent inbound connections accepted by the P2P endpoint.
+/// Must stay comfortably above the fleet size: during a fleet-wide
+/// rebalance or recovery wave most of the network can legitimately dial
+/// one miner at once, and a saturated accept loop drops gateway store
+/// pushes (creating permanent manifest gaps) and audit connections
+/// (creating undeserved reputation penalties) alike.
+pub const INBOUND_CONNECTION_LIMIT: usize = 1024;
+
 /// IPv6 P2P port (hardcoded, used when IPv6 bind is configured)
 pub const IPV6_P2P_PORT: u16 = 11231;
 
