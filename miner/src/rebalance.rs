@@ -778,8 +778,36 @@ async fn tally_manifest_shards(
     missing_shard_list: &mut Vec<MissingShard>,
 ) {
     let shards_per_stripe = manifest.stripe_config.k + manifest.stripe_config.m;
-    let num_stripes = manifest.shards.len().div_ceil(shards_per_stripe);
+    // The upload path pushes only the shards that stored successfully; a
+    // shard that failed leaves NO placeholder entry in the manifest, so
+    // every entry after such a gap sits at a vec position that no longer
+    // matches its `index` field. Positions are not a coordinate system —
+    // the `index` field is (shards were placed by it at upload).
+    let manifest_gapped = manifest_is_gapped(&manifest.shards);
+    if manifest_gapped {
+        debug!(
+            file = %&file_hash[..12.min(file_hash.len())],
+            shards_listed = manifest.shards.len(),
+            width = shards_per_stripe,
+            "[REBALANCE] Gapped manifest (upload-time shard loss): reading shards by index field"
+        );
+    }
+    let num_stripes = manifest_stripe_count(&manifest.shards, shards_per_stripe);
     let placement_versions_to_try = repair_placement_versions_to_try(manifest.placement_version);
+
+    // For gapped manifests, retain EVERY listed shard regardless of the
+    // ownership evaluation below: earlier releases evaluated ownership at
+    // shifted (positional) coordinates, so a blob this node stored under
+    // the old interpretation may not map to it under the correct one.
+    // Deleting it would fail a later audit of a still-credited blob;
+    // false retention is safe.
+    if manifest_gapped {
+        for s in &manifest.shards {
+            if let Ok(h) = iroh_blobs::Hash::from_str(&s.blob_hash) {
+                expected_shards.insert(h);
+            }
+        }
+    }
 
     for stripe_idx in 0..num_stripes {
         let stripe_miners = match common::calculate_stripe_placement(
@@ -793,13 +821,17 @@ async fn tally_manifest_shards(
             Err(_) => continue,
         };
 
-        for local_idx in 0..shards_per_stripe {
-            let global_idx = stripe_idx * shards_per_stripe + local_idx;
-            if global_idx >= manifest.shards.len() {
-                continue;
-            }
-
-            let shard = &manifest.shards[global_idx];
+        // Iterate by the shard `index` FIELD. Positional reads on a gapped
+        // manifest mis-evaluate ownership and hand the erasure recovery a
+        // shifted local_idx while stripe_shard_hashes below is keyed by
+        // the index field — the decode then succeeds but extracts the
+        // wrong slot and the blake3 gate discards the result.
+        for shard in manifest
+            .shards
+            .iter()
+            .filter(|s| s.index / shards_per_stripe == stripe_idx)
+        {
+            let local_idx = shard.index % shards_per_stripe;
             let shard_hash = if let Ok(h) = iroh_blobs::Hash::from_str(&shard.blob_hash) {
                 h
             } else {
@@ -1024,6 +1056,24 @@ async fn tally_manifest_shards(
             }
         }
     }
+}
+
+/// True when the manifest's shard list positions no longer match the shard
+/// `index` fields (gapped by upload-time shard loss, or out of order).
+fn manifest_is_gapped(shards: &[common::ShardInfo]) -> bool {
+    shards.iter().enumerate().any(|(pos, s)| s.index != pos)
+}
+
+/// Stripe count from the highest shard `index`. A gapped manifest lists
+/// fewer entries than (stripes x width); deriving the count from the vec
+/// length would silently drop tail stripes.
+fn manifest_stripe_count(shards: &[common::ShardInfo], shards_per_stripe: usize) -> usize {
+    shards
+        .iter()
+        .map(|s| s.index)
+        .max()
+        .map(|mx| mx / shards_per_stripe + 1)
+        .unwrap_or(0)
 }
 
 /// Concurrently fetch missing shards from peer miners with adaptive throttling.
@@ -1841,10 +1891,41 @@ async fn perform_erasure_recovery(
 
 #[cfg(test)]
 mod tests {
-    use super::repair_placement_versions_to_try;
+    use super::{manifest_is_gapped, manifest_stripe_count, repair_placement_versions_to_try};
+
+    fn shard(index: usize) -> common::ShardInfo {
+        common::ShardInfo {
+            index,
+            blob_hash: format!("{index:064x}"),
+        }
+    }
 
     #[test]
     fn test_miner_repair_probes_fallback_versions_for_mistagged_v3_manifests() {
         assert_eq!(repair_placement_versions_to_try(3), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn test_gapped_manifest_detected_and_tail_stripes_kept() {
+        // Width-3 stripes; the shard at index 2 failed at upload, so the
+        // manifest lists indexes [0, 1, 3, 4, 5]: every entry after the
+        // gap sits at a vec position one below its true index.
+        let shards: Vec<_> = [0usize, 1, 3, 4, 5].into_iter().map(shard).collect();
+        assert!(manifest_is_gapped(&shards));
+        assert_eq!(manifest_stripe_count(&shards, 3), 2);
+
+        // Only one shard of the third stripe survived the upload; the vec
+        // length (1) says nothing about how many stripes the file has.
+        let tail_only = vec![shard(7)];
+        assert!(manifest_is_gapped(&tail_only));
+        assert_eq!(manifest_stripe_count(&tail_only, 3), 3);
+    }
+
+    #[test]
+    fn test_clean_manifest_is_not_gapped() {
+        let shards: Vec<_> = (0usize..6).map(shard).collect();
+        assert!(!manifest_is_gapped(&shards));
+        assert_eq!(manifest_stripe_count(&shards, 3), 2);
+        assert_eq!(manifest_stripe_count(&[], 3), 0);
     }
 }
