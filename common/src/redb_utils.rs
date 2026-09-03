@@ -75,6 +75,25 @@ pub unsafe fn emergency_close(db: &Arc<RedbHandle>) {
     unsafe { ManuallyDrop::drop(&mut *ptr) };
 }
 
+/// Begin a write transaction with quick-repair enabled.
+///
+/// Quick-repair persists the allocator state with each commit (using
+/// 2-phase commit), so reopening the database after a crash or unclean
+/// shutdown is near-instant. Without it, redb must walk the entire file
+/// to rebuild allocator state — ~65 minutes observed in production on a
+/// ~100 GB database, with the service fully down. Costs one extra fsync
+/// per commit.
+///
+/// Every write transaction must use this: a single plain commit resets
+/// the file to needing full repair after a crash.
+pub fn begin_write_quick(
+    db: &redb::Database,
+) -> Result<redb::WriteTransaction, redb::TransactionError> {
+    let mut txn = db.begin_write()?;
+    txn.set_quick_repair(true);
+    Ok(txn)
+}
+
 /// Open or create a redb database with repair logging.
 ///
 /// Logs a warning if the database was not shut down cleanly and

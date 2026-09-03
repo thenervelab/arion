@@ -158,6 +158,31 @@ impl FlatBlobStore {
         );
     }
 
+    /// Saturating decrement for the usage counters.
+    ///
+    /// The counters start at 0 on process start and only become authoritative
+    /// once `recompute_usage` finishes -- tens of minutes on a large store. A
+    /// delete processed before that would wrap the raw `fetch_sub` to
+    /// ~u64::MAX, making the heartbeat report available_storage=0 and the
+    /// validator zero this node's weight. Saturate
+    /// instead: after the recompute the counter always covers the decrement,
+    /// so steady-state behavior is unchanged.
+    fn sub_used(&self, n: u64) {
+        let _ = self
+            .used_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(n))
+            });
+    }
+
+    fn sub_trash(&self, n: u64) {
+        let _ = self
+            .trash_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(n))
+            });
+    }
+
     /// Preferred (sharded) path for a blob.
     fn blob_path(&self, hash_hex: &str) -> PathBuf {
         match sharded_rel(hash_hex) {
@@ -172,6 +197,11 @@ impl FlatBlobStore {
     }
 
     /// Where the blob actually lives right now, if anywhere.
+    ///
+    /// Re-checks the sharded path after a flat miss for the same reason `read`
+    /// does: a concurrent `migrate_legacy_layout` rename between the two
+    /// `exists` calls would otherwise report a present blob as absent, and
+    /// `has()` feeds "do you hold this shard?" answers.
     fn locate(&self, hash_hex: &str) -> Option<PathBuf> {
         let sharded = self.blob_path(hash_hex);
         if sharded.exists() {
@@ -180,6 +210,9 @@ impl FlatBlobStore {
         let flat = self.blob_path_flat(hash_hex);
         if flat != sharded && flat.exists() {
             return Some(flat);
+        }
+        if sharded.exists() {
+            return Some(sharded);
         }
         None
     }
@@ -204,6 +237,10 @@ impl FlatBlobStore {
         let flat = self.trash_path_flat(hash_hex);
         if flat != sharded && flat.exists() {
             return Some(flat);
+        }
+        // `migrate_legacy_layout` walks the trash root too — same race as `locate`.
+        if sharded.exists() {
+            return Some(sharded);
         }
         None
     }
@@ -236,8 +273,7 @@ impl FlatBlobStore {
                 self.used_bytes
                     .fetch_add(new_size - existing_size, Ordering::Relaxed);
             } else if existing_size > new_size {
-                self.used_bytes
-                    .fetch_sub(existing_size - new_size, Ordering::Relaxed);
+                self.sub_used(existing_size - new_size);
             }
         } else {
             self.used_bytes.fetch_add(new_size, Ordering::Relaxed);
@@ -246,12 +282,26 @@ impl FlatBlobStore {
     }
 
     /// Read blob data (sharded first, legacy flat fallback).
+    ///
+    /// The flat miss is retried against the sharded path once. Without that,
+    /// `migrate_legacy_layout` renaming this very blob in the window between the
+    /// two lookups makes a permanently-present blob read as absent — which on the
+    /// PoS challenge path (`p2p.rs`) answers "Shard not found" and costs a
+    /// reputation penalty that never decays. A blob that moved mid-check is by
+    /// then definitively sharded, so one retry closes the race completely.
     pub async fn read(&self, hash_hex: &str) -> std::io::Result<Bytes> {
         match tokio::fs::read(self.blob_path(hash_hex)).await {
             Ok(data) => Ok(Bytes::from(data)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let data = tokio::fs::read(self.blob_path_flat(hash_hex)).await?;
-                Ok(Bytes::from(data))
+                match tokio::fs::read(self.blob_path_flat(hash_hex)).await {
+                    Ok(data) => Ok(Bytes::from(data)),
+                    Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => {
+                        // Migrated out from under us between the two lookups.
+                        let data = tokio::fs::read(self.blob_path(hash_hex)).await?;
+                        Ok(Bytes::from(data))
+                    }
+                    Err(e2) => Err(e2),
+                }
             }
             Err(e) => Err(e),
         }
@@ -300,7 +350,7 @@ impl FlatBlobStore {
 
         match tokio::fs::rename(&path, &target).await {
             Ok(()) => {
-                self.used_bytes.fetch_sub(size, Ordering::Relaxed);
+                self.sub_used(size);
                 self.trash_bytes.fetch_add(size, Ordering::Relaxed);
                 Ok(())
             }
@@ -336,7 +386,7 @@ impl FlatBlobStore {
             .unwrap_or(0);
         match tokio::fs::remove_file(path).await {
             Ok(()) => {
-                self.used_bytes.fetch_sub(size, Ordering::Relaxed);
+                self.sub_used(size);
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -359,7 +409,7 @@ impl FlatBlobStore {
         }
         match tokio::fs::rename(&trashed, &target).await {
             Ok(()) => {
-                self.trash_bytes.fetch_sub(size, Ordering::Relaxed);
+                self.sub_trash(size);
                 self.used_bytes.fetch_add(size, Ordering::Relaxed);
                 Ok(true)
             }
@@ -379,7 +429,7 @@ impl FlatBlobStore {
             .unwrap_or(0);
         match tokio::fs::remove_file(path).await {
             Ok(()) => {
-                self.trash_bytes.fetch_sub(size, Ordering::Relaxed);
+                self.sub_trash(size);
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -733,5 +783,19 @@ mod tests {
         store.store(HASH, b"data").await.unwrap();
         store.recompute_usage();
         assert_eq!(store.used_bytes(), 4);
+    }
+
+    #[tokio::test]
+    async fn delete_before_recompute_saturates_instead_of_wrapping() {
+        // Simulates the post-restart window: counters still 0 (recompute_usage
+        // has not run) while validator deletes arrive. The decrement must
+        // clamp at 0 -- a wrapped counter makes the heartbeat report
+        // available_storage=0 and the validator zero the node's weight.
+        let dir = tempfile::tempdir().unwrap();
+        let store = FlatBlobStore::new(dir.path().to_path_buf()).unwrap();
+        store.store(HASH, b"payload").await.unwrap();
+        store.used_bytes.store(0, Ordering::Relaxed);
+        store.delete(HASH).await.unwrap();
+        assert_eq!(store.used_bytes(), 0, "must saturate, not wrap");
     }
 }

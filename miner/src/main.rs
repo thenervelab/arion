@@ -15,6 +15,7 @@ mod mmap_index;
 mod p2p;
 mod packed_store;
 mod rebalance;
+mod reconnect;
 mod state;
 mod state_sync;
 mod store;
@@ -28,6 +29,7 @@ use fs2::free_space;
 use helpers::{load_keypair, truncate_for_log};
 use p2p::MinerControlHandler;
 use rand::Rng as _;
+use reconnect::{DecorrelatedBackoff, FailureKind, classify_validator_failure};
 use state::{
     get_blobs_dir, get_needs_reregistration, get_validator_reachable, get_warden_node_ids,
 };
@@ -440,9 +442,15 @@ async fn run_miner(cli: Cli) -> Result<()> {
     // Load cached cluster map from disk (survives restarts)
     if let Some(map) = rebalance::load_cluster_map_cache(&data_dir).await {
         let epoch = map.epoch;
-        let pgs = tokio::task::spawn_blocking({
-            let map_clone = map.clone();
-            move || common::calculate_my_pgs(miner_uid, &map_clone)
+        // CRUSH wants a filtered view (draining miners excluded); the
+        // unfiltered map stays in state to preserve the broadcast contract.
+        let filtered_for_crush = if map.miners.iter().any(|m| m.draining) {
+            common::filter_map_for_placement(&map)
+        } else {
+            map.clone()
+        };
+        let pgs = tokio::task::spawn_blocking(move || {
+            common::calculate_my_pgs(miner_uid, &filtered_for_crush)
         })
         .await
         .unwrap_or_default();
@@ -669,7 +677,9 @@ async fn run_miner(cli: Cli) -> Result<()> {
     let accept_token = CancellationToken::new();
     let accept_cancel = accept_token.clone();
     // Limit concurrent connections to prevent DoS (file descriptor exhaustion)
-    let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(256));
+    let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(
+        crate::constants::INBOUND_CONNECTION_LIMIT,
+    ));
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -682,7 +692,10 @@ async fn run_miner(cli: Cli) -> Result<()> {
                     let permit = match conn_semaphore.clone().try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {
-                            warn!("Connection limit reached (256), dropping incoming connection");
+                            warn!(
+                                "Connection limit reached ({}), dropping incoming connection",
+                                crate::constants::INBOUND_CONNECTION_LIMIT
+                            );
                             drop(incoming);
                             continue;
                         }
@@ -916,8 +929,13 @@ fn check_network_health() {
 }
 
 async fn register_with_validator(ctx: &MinerContext) -> Result<quinn::Connection> {
-    let initial_backoff = ctx.config.tuning.initial_backoff_secs;
-    let max_backoff = ctx.config.tuning.max_backoff_secs;
+    // Decorrelated jitter: after a fleet-wide restart every miner reaches
+    // this loop at the same moment, so the retry schedule must not be a
+    // fixed function of the attempt count.
+    let mut backoff = DecorrelatedBackoff::new(
+        std::time::Duration::from_secs(ctx.config.tuning.initial_backoff_secs),
+        std::time::Duration::from_secs(ctx.config.tuning.max_backoff_secs),
+    );
     let mut retry_count: u32 = 0;
 
     loop {
@@ -931,33 +949,20 @@ async fn register_with_validator(ctx: &MinerContext) -> Result<quinn::Connection
                 return Ok(conn);
             }
             Err(e) => {
+                retry_count = retry_count.saturating_add(1);
+                let delay = backoff.next_delay();
                 let is_warming_up = e.to_string().contains("warming up");
                 if is_warming_up {
-                    info!(
-                        "Validator is warming up, retrying in {}s",
-                        constants::REGISTRATION_RETRY_SLEEP_SECS
-                    );
-                    let jitter_ms =
-                        rand::rng().random_range(0..constants::MAX_REGISTRATION_RETRY_JITTER_MS);
-                    tokio::time::sleep(
-                        tokio::time::Duration::from_secs(constants::REGISTRATION_RETRY_SLEEP_SECS)
-                            + tokio::time::Duration::from_millis(jitter_ms),
-                    )
-                    .await;
+                    info!("Validator is warming up, retrying in {}s", delay.as_secs());
                 } else {
-                    retry_count = retry_count.saturating_add(1);
-                    let backoff_secs = std::cmp::min(
-                        max_backoff,
-                        initial_backoff.saturating_mul(2u64.saturating_pow(retry_count)),
-                    );
                     error!(
                         error = %e,
-                        backoff_secs = backoff_secs,
+                        backoff_secs = delay.as_secs(),
                         attempt = retry_count,
                         "P2P registration failed, retrying"
                     );
-                    tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
                 }
+                tokio::time::sleep(delay).await;
             }
         }
     }
@@ -982,6 +987,14 @@ fn spawn_heartbeat_loop(
         // Persistent connection: reuse a single QUIC connection across heartbeats
         let mut cached_conn: Option<quinn::Connection> = initial_conn;
         let mut consecutive_rereg_failures: u32 = 0;
+        // Shared by every transient failure path (heartbeat I/O errors,
+        // WARMING_UP, re-registration failures) and reset on the first
+        // success, so a long validator outage keeps widening the retry
+        // window instead of restarting the schedule at each phase.
+        let mut validator_backoff = DecorrelatedBackoff::new(
+            std::time::Duration::from_secs(constants::VALIDATOR_BACKOFF_BASE_SECS),
+            std::time::Duration::from_secs(constants::VALIDATOR_BACKOFF_CAP_SECS),
+        );
 
         loop {
             // Check if re-registration is needed
@@ -997,6 +1010,7 @@ fn spawn_heartbeat_loop(
                 match register_with_validator_once(&rereg_ctx).await {
                     Ok(new_conn) => {
                         consecutive_rereg_failures = 0;
+                        validator_backoff.reset();
                         info!("Re-registration successful");
                         {
                             let mut val_addr = state::get_validator_addr().write().await;
@@ -1011,36 +1025,56 @@ fn spawn_heartbeat_loop(
                         tokio::time::sleep(tokio::time::Duration::from_millis(jitter_ms)).await;
                     }
                     Err(e) => {
-                        consecutive_rereg_failures = consecutive_rereg_failures.saturating_add(1);
-                        error!(
-                            error = %e,
-                            attempt = consecutive_rereg_failures,
-                            "Re-registration failed, will retry on next heartbeat"
-                        );
-
-                        if consecutive_rereg_failures
-                            >= constants::MAX_REREGISTRATION_FAILURES_BEFORE_EXIT
-                        {
+                        if classify_validator_failure(&e.to_string()) == FailureKind::Permanent {
                             error!(
-                                consecutive_failures = consecutive_rereg_failures,
-                                "Re-registration stuck — triggering clean exit for systemd restart"
+                                error = %e,
+                                "Re-registration rejected — miner cannot operate, shutting down"
                             );
                             if let Some(conn) = cached_conn.take() {
-                                conn.close(0u32.into(), b"stale-rereg");
+                                conn.close(0u32.into(), b"shutdown");
                             }
                             shutdown.notify_one();
                             return;
                         }
 
+                        // Transient: the validator is restarting, warming up,
+                        // rate limiting a re-registration storm, or unreachable.
+                        // Never exit — an exit here cascades fleet-wide (every
+                        // miner sees the same validator state at once). Keep
+                        // serving from the local store and retry with
+                        // decorrelated backoff.
+                        consecutive_rereg_failures = consecutive_rereg_failures.saturating_add(1);
+                        let delay = validator_backoff.next_delay();
+                        if consecutive_rereg_failures
+                            >= constants::REREGISTRATION_FAILURES_BEFORE_ESCALATION
+                        {
+                            error!(
+                                error = %e,
+                                attempts = consecutive_rereg_failures,
+                                retry_secs = delay.as_secs(),
+                                "Still disconnected after {} attempts, continuing with backoff",
+                                consecutive_rereg_failures
+                            );
+                        } else {
+                            warn!(
+                                error = %e,
+                                attempt = consecutive_rereg_failures,
+                                retry_secs = delay.as_secs(),
+                                "Re-registration failed, will retry"
+                            );
+                        }
+
                         get_needs_reregistration().store(true, std::sync::atomic::Ordering::SeqCst);
-                        let retry_jitter_ms =
-                            rand::rng().random_range(0..constants::MAX_SOCKET_REFRESH_JITTER_MS);
-                        tokio::time::sleep(
-                            tokio::time::Duration::from_secs(
-                                constants::RELAY_LOSS_RECOVERY_DELAY_SECS,
-                            ) + tokio::time::Duration::from_millis(retry_jitter_ms),
-                        )
-                        .await;
+                        tokio::select! {
+                            () = tokio::time::sleep(delay) => {}
+                            () = cancel_token.cancelled() => {
+                                info!("Heartbeat loop received shutdown signal");
+                                if let Some(conn) = cached_conn.take() {
+                                    conn.close(0u32.into(), b"shutdown");
+                                }
+                                return;
+                            }
+                        }
                         continue;
                     }
                 }
@@ -1180,6 +1214,10 @@ fn spawn_heartbeat_loop(
                             debug!("Validator is warming up, will retry shortly");
                             return Ok(false);
                         }
+                        if ack_str == "RATE_LIMITED" {
+                            debug!("Validator rate limited this heartbeat, will retry shortly");
+                            return Ok(false);
+                        }
 
                         // Try to parse JSON response for warden node IDs
                         if let Ok(response) = serde_json::from_str::<serde_json::Value>(&ack_str) {
@@ -1221,6 +1259,7 @@ fn spawn_heartbeat_loop(
                     match result {
                         Ok(Ok(true)) => {
                             consecutive_failures = 0;
+                            validator_backoff.reset();
                             get_validator_reachable()
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
                             let hb_epoch = {
@@ -1237,20 +1276,27 @@ fn spawn_heartbeat_loop(
                             );
                         }
                         Ok(Ok(false)) => {
-                            // Validator is warming up
+                            // Validator is warming up or rate limiting: reachable,
+                            // not a link failure, just try again later.
                             get_validator_reachable()
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
-                            let jitter_ms =
-                                rand::rng().random_range(0..constants::ERROR_RETRY_JITTER_MS);
-                            tokio::time::sleep(
-                                tokio::time::Duration::from_secs(
-                                    constants::RETRY_BACKOFF_BASE_SECS,
-                                ) + tokio::time::Duration::from_millis(jitter_ms),
-                            )
-                            .await;
+                            let delay = validator_backoff.next_delay();
+                            tokio::select! {
+                                () = tokio::time::sleep(delay) => {}
+                                () = cancel_token.cancelled() => {
+                                    info!("Heartbeat loop received shutdown signal");
+                                    if let Some(conn) = cached_conn.take() {
+                                        conn.close(0u32.into(), b"shutdown");
+                                    }
+                                    return;
+                                }
+                            }
                             continue;
                         }
-                        Ok(Err(e)) if e.to_string() == "FAMILY_REJECTED" => {
+                        Ok(Err(e))
+                            if classify_validator_failure(&e.to_string())
+                                == FailureKind::Permanent =>
+                        {
                             info!(
                                 "[DISCONNECTED] Validator rejected this miner's family, shutting down"
                             );
@@ -1291,6 +1337,7 @@ fn spawn_heartbeat_loop(
             }
 
             // After 3 consecutive heartbeat failures, trigger re-registration.
+            let mut needs_rereg_now = false;
             if consecutive_failures >= constants::HEARTBEAT_FAILURES_BEFORE_REREGISTRATION {
                 warn!(
                     consecutive_failures,
@@ -1298,23 +1345,20 @@ fn spawn_heartbeat_loop(
                 );
                 get_needs_reregistration().store(true, std::sync::atomic::Ordering::SeqCst);
                 consecutive_failures = 0;
+                needs_rereg_now = true;
             }
 
-            // Exponential backoff: 30s, 60s, 120s (capped) on consecutive failures
-            let backoff_secs = if consecutive_failures == 0 {
-                constants::FAILURE_BACKOFF_BASE_SECS
-            } else {
-                std::cmp::min(
-                    constants::FAILURE_BACKOFF_MAX_SECS,
-                    constants::FAILURE_BACKOFF_BASE_SECS << consecutive_failures.min(2),
-                )
-            };
+            // Healthy: plain heartbeat period plus jitter. Failing: decorrelated
+            // backoff (also drives the re-registration retries above).
             let jitter_ms = rand::rng().random_range(0..constants::FAILURE_BACKOFF_JITTER_MS);
+            let delay = if consecutive_failures == 0 && !needs_rereg_now {
+                tokio::time::Duration::from_secs(constants::FAILURE_BACKOFF_BASE_SECS)
+                    + tokio::time::Duration::from_millis(jitter_ms)
+            } else {
+                validator_backoff.next_delay()
+            };
             tokio::select! {
-                () = tokio::time::sleep(
-                    tokio::time::Duration::from_secs(backoff_secs)
-                        + tokio::time::Duration::from_millis(jitter_ms),
-                ) => {}
+                () = tokio::time::sleep(delay) => {}
                 () = cancel_token.cancelled() => {
                     info!("Heartbeat loop received shutdown signal");
                     if let Some(conn) = cached_conn.take() {
@@ -1396,7 +1440,7 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<quinn::Conne
 
     // Connect to validator via quinn
     let conn = tokio::time::timeout(
-        std::time::Duration::from_secs(constants::DEFAULT_CONNECT_TIMEOUT_SECS),
+        std::time::Duration::from_secs(constants::REGISTER_CONNECT_TIMEOUT_SECS),
         common::transport::connect_with_alpn(
             &ctx.endpoint,
             ctx.validator_socket_addr,
@@ -1429,7 +1473,7 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<quinn::Conne
             "OK" => Ok(()),
             "RATE_LIMITED" => Err(anyhow::anyhow!("RATE_LIMITED")),
             "WARMING_UP" => Err(anyhow::anyhow!("Validator warming up")),
-            _ if ack_str.starts_with("FAMILY_REJECTED:") => Err(anyhow::anyhow!("{ack_str}")),
+            _ if ack_str.starts_with("FAMILY_REJECTED") => Err(anyhow::anyhow!("{ack_str}")),
             _ => Err(anyhow::anyhow!("Registration failed: {ack_str}")),
         }
     }

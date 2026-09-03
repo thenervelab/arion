@@ -169,6 +169,23 @@ pub struct MinerNode {
     /// invisible as a destination for new shard placement.
     #[serde(default)]
     pub draining: bool,
+    /// True when `draining` was set because the miner went sustained-offline
+    /// (OUT threshold) rather than a deliberate on-chain deregistration.
+    /// Offline-drained miners are automatically undrained when they
+    /// re-register — a transient outage must not permanently remove a miner
+    /// from CRUSH placement. Deliberate drains stay sticky.
+    #[serde(default)]
+    pub drained_for_offline: bool,
+    /// Join quarantine: admitted (in the map, heartbeating, has a UID) but
+    /// not yet eligible as a placement destination. Cleared by the epoch
+    /// rotation loop once the miner has proven consecutive liveness.
+    /// Unlike `draining`, this is NOT a departure: drain/recovery ignore it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub placement_hold: bool,
+    /// heartbeat_count observed when placement_hold was set; the hold lifts
+    /// once heartbeat_count - this >= join_quarantine_heartbeats.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub placement_hold_base_hb: u32,
 
     /// P2P reliability score in range [0.0, 1.0].
     /// Used to modulate CRUSH weight — miners with low scores get fewer shards.
@@ -220,19 +237,6 @@ pub struct FileSummary {
     pub hash: String,
     /// File size in bytes
     pub size: u64,
-}
-
-/// Index for synchronizing file metadata between components.
-///
-/// Contains a snapshot of all files at a given cluster map version.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct SyncIndex {
-    /// Hash of the cluster map at sync time (for version tracking)
-    pub map_hash: String,
-    /// List of all files in the system
-    pub files: Vec<FileSummary>,
-    /// Unix timestamp when index was generated
-    pub timestamp: u64,
 }
 
 // ============================================================================
@@ -653,6 +657,9 @@ impl LegacyMinerNode {
             trust_score: self.trust_score,
             earned_capacity_bytes: self.earned_capacity_bytes,
             draining: self.draining,
+            drained_for_offline: false,
+            placement_hold: false,
+            placement_hold_base_hb: 0,
             p2p_reliability_score: self.p2p_reliability_score,
             balancer_reweight: 1.0,
         }
@@ -1048,9 +1055,9 @@ pub fn calculate_placement_for_stripe(
     // before calling this function. Draining miners must be
     // excluded so that all paths (upload, download, recovery, rebalance)
     // compute identical placements from the same filtered miner set.
-    if map.miners.iter().any(|m| m.draining) {
+    if map.miners.iter().any(|m| m.draining || m.placement_hold) {
         tracing::error!(
-            "CRUSH placement called with an unfiltered map containing draining miners! Callers MUST pre-filter the map with common::filter_map_for_placement"
+            "CRUSH placement called with an unfiltered map containing draining or held miners! Callers MUST pre-filter the map with common::filter_map_for_placement"
         );
     }
 
@@ -2610,15 +2617,36 @@ pub fn calculate_pg_placement(
 /// # Returns
 /// - `Ok(Vec<MinerNode>)` with miners for this stripe (rotated by stripe_index)
 /// - `Err(String)` if insufficient miners
+/// Index into a PG's ordered uid list for a shard's expected holder.
+///
+/// The write path rotates the miner list by `stripe_index % len` before
+/// assigning the stripe's shards in order (`calculate_pg_placement_for_stripe`
+/// and its straw2 variant). Any consumer mapping a manifest shard back to its
+/// expected holder MUST apply the same rotation; using `index % shards_per_file`
+/// alone is only correct for stripe 0 and silently mis-attributes every
+/// multi-stripe file.
+pub fn expected_uid_index_for_shard(
+    shard_index: usize,
+    shards_per_file: usize,
+    len: usize,
+) -> usize {
+    if len == 0 || shards_per_file == 0 {
+        return 0;
+    }
+    let stripe = shard_index / shards_per_file;
+    let offset = shard_index % shards_per_file;
+    (stripe % len + offset) % len
+}
+
 pub fn calculate_pg_placement_for_stripe(
     file_hash: &str,
     stripe_index: u64,
     shards_per_stripe: usize,
     map: &ClusterMap,
 ) -> Result<Vec<MinerNode>, String> {
-    if map.miners.iter().any(|m| m.draining) {
+    if map.miners.iter().any(|m| m.draining || m.placement_hold) {
         tracing::error!(
-            "CRUSH placement called with an unfiltered map containing draining miners! Callers MUST pre-filter the map with common::filter_map_for_placement"
+            "CRUSH placement called with an unfiltered map containing draining or held miners! Callers MUST pre-filter the map with common::filter_map_for_placement"
         );
     }
     let pg_id = calculate_pg(file_hash, map.pg_count)?;
@@ -2643,7 +2671,7 @@ pub fn calculate_pg_placement_straw2(
     // Auto-filter draining miners — see calculate_pg_placement_uids_straw2
     // for why v3 must compute on the same filtered set as the write path.
     let filtered_owned: Option<ClusterMap>;
-    let map = if map.miners.iter().any(|m| m.draining) {
+    let map = if map.miners.iter().any(|m| m.draining || m.placement_hold) {
         filtered_owned = Some(filter_map_for_placement(map));
         filtered_owned.as_ref().unwrap()
     } else {
@@ -2714,12 +2742,13 @@ pub fn calculate_stripe_placement(
     map: &ClusterMap,
     placement_version: u8,
 ) -> Result<Vec<MinerNode>, String> {
-    // Versions 1 and 2 require filtering draining nodes for backward compatibility.
     // All versions compute placement on the draining-filtered miner set —
-    // v1/v2 are filtered here; v3 auto-filters inside calculate_pg_placement_straw2.
+    // the write path pre-filters, so every reader/mover must too or data
+    // converges toward a placement the writer never used. v1/v2 are filtered
+    // here; v3 (straw2) auto-filters inside calculate_pg_placement_straw2.
     let filtered_map_owned: Option<ClusterMap>;
     let map_ref = if (placement_version == 1 || placement_version == 2)
-        && map.miners.iter().any(|m| m.draining)
+        && map.miners.iter().any(|m| m.draining || m.placement_hold)
     {
         filtered_map_owned = Some(filter_map_for_placement(map));
         filtered_map_owned.as_ref().unwrap()
@@ -2811,7 +2840,7 @@ pub fn calculate_stripe_placement_with_fallbacks(
     let mut pool: Vec<&MinerNode> = cluster_map
         .miners
         .iter()
-        .filter(|m| !primary_uids.contains(&m.uid) && m.weight > 0)
+        .filter(|m| !primary_uids.contains(&m.uid) && m.weight > 0 && !m.draining && !m.placement_hold)
         .collect();
     pool.sort_by_key(|m| m.uid);
 
@@ -3073,7 +3102,7 @@ pub fn calculate_pg_placement_uids(
 ) -> Result<Vec<u32>, String> {
     // v2 logic requires filtering draining miners for backward compatibility.
     let filtered_map_owned: Option<ClusterMap>;
-    let map_ref = if map.miners.iter().any(|m| m.draining) {
+    let map_ref = if map.miners.iter().any(|m| m.draining || m.placement_hold) {
         filtered_map_owned = Some(filter_map_for_placement(map));
         filtered_map_owned.as_ref().unwrap()
     } else {
@@ -3113,7 +3142,7 @@ pub fn calculate_pg_placement_uids_straw2(
     // never used. Determinism across drain transitions comes from historical
     // epoch maps, not from keeping draining miners in the CRUSH input.
     let filtered_owned: Option<ClusterMap>;
-    let map = if map.miners.iter().any(|m| m.draining) {
+    let map = if map.miners.iter().any(|m| m.draining || m.placement_hold) {
         filtered_owned = Some(filter_map_for_placement(map));
         filtered_owned.as_ref().unwrap()
     } else {
@@ -3162,7 +3191,7 @@ pub fn calculate_my_pgs(miner_uid: u32, map: &ClusterMap) -> Vec<u32> {
     // and self-rebalance flood logs and compute ownership against a topology that
     // should no longer receive new shards.
     let filtered_map_owned;
-    let map_ref = if map.miners.iter().any(|m| m.draining) {
+    let map_ref = if map.miners.iter().any(|m| m.draining || m.placement_hold) {
         filtered_map_owned = filter_map_for_placement(map);
         &filtered_map_owned
     } else {
@@ -3295,13 +3324,17 @@ pub fn socket_addr_from_endpoint(addr: &iroh::EndpointAddr) -> Option<std::net::
 /// computes CRUSH placement (download, recovery, rebalance) **must** apply
 /// the same filter; otherwise CRUSH sees a different miner set and returns
 /// different placements, causing "shard not found" errors.
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
 pub fn filter_map_for_placement(map: &ClusterMap) -> ClusterMap {
-    let has_draining = map.miners.iter().any(|m| m.draining);
-    if !has_draining {
+    let needs_filter = map.miners.iter().any(|m| m.draining || m.placement_hold);
+    if !needs_filter {
         return map.clone();
     }
     let mut filtered = map.clone();
-    filtered.miners.retain(|m| !m.draining);
+    filtered.miners.retain(|m| !m.draining && !m.placement_hold);
     filtered
 }
 
@@ -4753,6 +4786,9 @@ mod tests {
                     trust_score: 0.0,
                     earned_capacity_bytes: 0,
                     draining: false,
+                    drained_for_offline: false,
+                    placement_hold: false,
+                    placement_hold_base_hb: 0,
                     p2p_reliability_score: 1.0,
                     is_historical_seeder: false,
                 }
@@ -4885,6 +4921,9 @@ mod tests {
                     trust_score: 0.0,
                     earned_capacity_bytes: 0,
                     draining: false,
+                    drained_for_offline: false,
+                    placement_hold: false,
+                    placement_hold_base_hb: 0,
                     p2p_reliability_score: 1.0,
                     is_historical_seeder: false,
                 }
@@ -4923,6 +4962,57 @@ mod tests {
         let result =
             calculate_placement_for_stripe_straw2("file_hash", 0, 30, &map).expect("placement");
         assert_eq!(result.len(), 30);
+    }
+
+    #[test]
+    fn test_v3_placement_auto_filters_draining_miners() {
+        // The write path pre-filters draining miners; v3 must compute the
+        // IDENTICAL placement from a raw map (auto-filter), even when the
+        // draining miners carry nonzero weight (the historical-epoch case
+        // that used to diverge).
+        let mut raw = make_straw2_test_map(50, 15);
+        // Mark a handful of miners draining, keeping their weight
+        for m in raw.miners.iter_mut().filter(|m| m.uid % 10 == 3) {
+            m.draining = true;
+        }
+        let filtered = filter_map_for_placement(&raw);
+        assert!(
+            filtered.miners.len() < raw.miners.len(),
+            "test needs draining miners"
+        );
+
+        for pg_id in [0u32, 7, 42] {
+            let from_raw = calculate_pg_placement_uids_straw2(pg_id, 30, &raw).expect("raw uids");
+            let from_filtered =
+                calculate_pg_placement_uids_straw2(pg_id, 30, &filtered).expect("filtered uids");
+            assert_eq!(
+                from_raw, from_filtered,
+                "pg {pg_id}: v3 uids must auto-filter"
+            );
+            assert!(
+                from_raw.iter().all(|u| u % 10 != 3),
+                "pg {pg_id}: draining miner selected by v3 placement"
+            );
+        }
+
+        let stripe_raw =
+            calculate_pg_placement_for_stripe_straw2("deadbeef", 2, 30, &raw).expect("raw stripe");
+        let stripe_filtered =
+            calculate_pg_placement_for_stripe_straw2("deadbeef", 2, 30, &filtered)
+                .expect("filtered stripe");
+        let raw_uids: Vec<u32> = stripe_raw.iter().map(|m| m.uid).collect();
+        let f_uids: Vec<u32> = stripe_filtered.iter().map(|m| m.uid).collect();
+        assert_eq!(raw_uids, f_uids, "v3 stripe placement must auto-filter");
+
+        // Dispatcher parity: v3 via calculate_stripe_placement on raw map
+        // equals the explicit filtered computation (write-path parity).
+        let dispatched =
+            calculate_stripe_placement("deadbeef", 2, 30, &raw, 3).expect("dispatched");
+        let d_uids: Vec<u32> = dispatched.iter().map(|m| m.uid).collect();
+        assert_eq!(
+            d_uids, f_uids,
+            "dispatcher v3 must match filtered placement"
+        );
     }
 
     #[test]
@@ -5123,6 +5213,9 @@ mod tests {
                     trust_score: 0.0,
                     earned_capacity_bytes: 0,
                     draining: false,
+                    drained_for_offline: false,
+                    placement_hold: false,
+                    placement_hold_base_hb: 0,
                     p2p_reliability_score: 1.0,
                     is_historical_seeder: false,
                 });
@@ -5277,5 +5370,77 @@ mod tests {
         for &idx in &indices {
             assert!(idx < 30);
         }
+    }
+}
+
+
+#[cfg(test)]
+mod placement_hold_tests {
+    use super::*;
+
+    fn node(uid: u32, hold: bool) -> MinerNode {
+        let i = uid;
+        let sk = iroh::SecretKey::from_bytes(&[i as u8 + 1; 32]);
+        let mut n = MinerNode {
+                    uid: uid,
+                    weight: 100,
+                    balancer_reweight: 1.0,
+                    family_id: format!("family-{}", i % 10),
+                    endpoint: iroh::EndpointAddr::from(sk.public()),
+                    ip_subnet: String::new(),
+                    ip_address: None,
+                    http_addr: format!("http://10.0.0.{}:3001", i),
+                    public_key: format!("{:064x}", i),
+                    total_storage: 1_000_000,
+                    available_storage: 500_000,
+                    strikes: 0,
+                    last_seen: 0,
+                    heartbeat_count: 0,
+                    registration_time: 0,
+                    bandwidth_total: 0,
+                    bandwidth_window_start: 0,
+                    weight_manual_override: false,
+                    reputation: 0.0,
+                    consecutive_audit_passes: 0,
+                    integrity_fails: 0,
+                    version: String::new(),
+                    base_weight: 0,
+                    warden_challenges_total: 0,
+                    warden_challenges_passed: 0,
+                    fetch_timeout_count: 0,
+                    expected_shards: 0,
+                    actual_shards: 0,
+                    trust_score: 0.0,
+                    earned_capacity_bytes: 0,
+                    draining: false,
+                    drained_for_offline: false,
+                    placement_hold: false,
+                    placement_hold_base_hb: 0,
+                    p2p_reliability_score: 1.0,
+                    is_historical_seeder: false,
+                };
+        n.placement_hold = hold;
+        n
+    }
+
+    /// A held miner must never be a placement destination.
+    #[test]
+    fn filter_excludes_placement_hold() {
+        let mut map = ClusterMap::default();
+        map.epoch = 1;
+        map.miners = vec![node(1, true), node(2, false)];
+        let f = filter_map_for_placement(&map);
+        assert_eq!(f.miners.len(), 1);
+        assert_eq!(f.miners[0].uid, 2);
+    }
+
+    /// Wire compatibility: when unset, the new fields are ABSENT from JSON so
+    /// old binaries hash/sign the exact same bytes.
+    #[test]
+    fn placement_hold_fields_absent_when_default() {
+        let js = serde_json::to_string(&node(7, false)).unwrap();
+        assert!(!js.contains("placement_hold"), "{js}");
+        let hj = serde_json::to_string(&node(8, true)).unwrap();
+        assert!(hj.contains(r#""placement_hold":true"#), "{hj}");
     }
 }

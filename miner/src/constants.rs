@@ -51,8 +51,19 @@ pub const CONNECTION_POOL_EVICTION_FRACTION: usize = 10;
 // Caching
 // ============================================================================
 
-/// Blob cache size (number of entries)
-pub const BLOB_CACHE_SIZE: usize = 10_000;
+/// Blob cache weight ceiling — bytes. Each cached blob counts its own
+/// length toward this ceiling via a custom Weighter (see `state.rs::BlobWeighter`).
+///
+/// Replaces the previous count-bounded `BLOB_CACHE_SIZE = 10_000` which,
+/// at shard sizes up to ~800 KiB, allowed the cache to grow to ~8 GiB
+/// in pathological cases and competed with the page cache + chain node
+/// for RAM on memory-constrained boxes.
+pub const BLOB_CACHE_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+
+/// Estimated entry count for the cache's internal hash table sizing.
+/// Approximately `BLOB_CACHE_BYTES / typical_shard_size`. Doesn't bound
+/// the actual entry count — that's enforced by byte weight.
+pub const BLOB_CACHE_ESTIMATED_ITEMS: usize = 5_000;
 
 /// Maximum peer cache entries (prevents unbounded memory growth)
 /// Based on typical cluster size: 10k miners should be more than enough
@@ -110,6 +121,14 @@ pub const MAX_CONCURRENT_HANDLERS: usize = 2048;
 // QUIC Transport
 // ============================================================================
 
+/// Maximum concurrent inbound connections accepted by the P2P endpoint.
+/// Must stay comfortably above the fleet size: during a fleet-wide
+/// rebalance or recovery wave most of the network can legitimately dial
+/// one miner at once, and a saturated accept loop drops gateway store
+/// pushes (creating permanent manifest gaps) and audit connections
+/// (creating undeserved reputation penalties) alike.
+pub const INBOUND_CONNECTION_LIMIT: usize = 1024;
+
 /// IPv6 P2P port (hardcoded, used when IPv6 bind is configured)
 pub const IPV6_P2P_PORT: u16 = 11231;
 
@@ -145,9 +164,6 @@ pub const RECEIVE_WINDOW_BYTES: u32 = 64 * 1024 * 1024;
 // Registration & Heartbeat
 // ============================================================================
 
-/// Sleep between registration retries when validator is warming up (seconds)
-pub const REGISTRATION_RETRY_SLEEP_SECS: u64 = 5;
-
 /// Timeout for STUN public IP detection (seconds)
 pub const STUN_TIMEOUT_SECS: u64 = 3;
 
@@ -164,6 +180,16 @@ pub const HEARTBEAT_ACK_BUFFER_SIZE: usize = 4096;
 /// Timeout for registration ACK from validator (seconds)
 pub const REGISTER_COMPLETION_TIMEOUT_SECS: u64 = 10;
 
+/// Timeout for opening the QUIC connection to the validator during registration.
+///
+/// Decoupled from `DEFAULT_CONNECT_TIMEOUT_SECS` (which governs peer-to-peer
+/// connects for rebalance/fetch) so the registration path can tolerate
+/// validator-side load spikes without forcing peer connects to wait longer
+/// than they need to. Observed in production: the validator QUIC accept queue
+/// can miss the 20s default during high-load windows, causing the
+/// heartbeat re-registration loop to fail repeatedly.
+pub const REGISTER_CONNECT_TIMEOUT_SECS: u64 = 60;
+
 /// Maximum buffer size for registration ACK response (bytes)
 pub const REGISTER_ACK_BUFFER_SIZE: usize = 4096;
 
@@ -171,43 +197,39 @@ pub const REGISTER_ACK_BUFFER_SIZE: usize = 4096;
 // Retry & Backoff
 // ============================================================================
 
-/// Maximum jitter added to registration retry sleep (milliseconds)
-pub const MAX_REGISTRATION_RETRY_JITTER_MS: u64 = 2000;
-
 /// Maximum jitter added to post-re-registration heartbeat delay (milliseconds)
 pub const MAX_HEARTBEAT_RETRY_JITTER_MS: u64 = 5000;
 
-/// Maximum jitter for re-registration retry after socket refresh failure (milliseconds)
-pub const MAX_SOCKET_REFRESH_JITTER_MS: u64 = 10000;
-
-/// Base retry sleep for warming-up validator responses (seconds)
-pub const RETRY_BACKOFF_BASE_SECS: u64 = 5;
-
-/// Base backoff for heartbeat failures (seconds)
+/// Heartbeat period while the validator link is healthy (seconds)
 pub const FAILURE_BACKOFF_BASE_SECS: u64 = 30;
+
+/// Decorrelated-jitter backoff for transient validator failures (heartbeat
+/// I/O errors, WARMING_UP, RATE_LIMITED, UNKNOWN, re-registration failures):
+/// `sleep = random(base, min(cap, prev * 3))`. See `reconnect.rs`.
+/// The fleet sees every validator restart at once; the jitter keeps ~300
+/// miners from re-registering in lockstep. The cap bounds how long a miner
+/// can stay unaware that the validator is back: it must stay well below the
+/// validator's startup grace (300s) and miner-offline threshold (600s), or
+/// a miner asleep at the cap when the validator recovers is scored stale
+/// or offline. 120s is the cap the heartbeat failure path already used.
+pub const VALIDATOR_BACKOFF_BASE_SECS: u64 = 5;
+pub const VALIDATOR_BACKOFF_CAP_SECS: u64 = 120;
 
 /// Number of consecutive heartbeat failures before triggering automatic re-registration.
 /// After a validator restart, miners lose their connection. This triggers re-registration
 /// after 3 failures (~30s × 3 = ~90s) instead of waiting indefinitely.
 pub const HEARTBEAT_FAILURES_BEFORE_REREGISTRATION: u32 = 3;
 
-/// Maximum consecutive re-registration failures before triggering a clean exit.
-/// When iroh's QUIC path to the validator goes stale, re-registration keeps
-/// timing out on the same dead path. After this many failures the miner exits
-/// cleanly so systemd restarts it with a fresh iroh endpoint.
-pub const MAX_REREGISTRATION_FAILURES_BEFORE_EXIT: u32 = 10;
+/// Consecutive re-registration failures after which the miner escalates its
+/// "still disconnected" log line to error level. It keeps retrying with
+/// backoff either way: transient validator failures (restart, warm-up, rate
+/// limiting, network) never exit the process. This used to be an exit
+/// threshold, which turned every validator restart into a fleet-wide miner
+/// restart cascade — all miners hit it at the same time.
+pub const REREGISTRATION_FAILURES_BEFORE_ESCALATION: u32 = 10;
 
-/// Maximum backoff cap for heartbeat failures (seconds)
-pub const FAILURE_BACKOFF_MAX_SECS: u64 = 120;
-
-/// Maximum jitter added to heartbeat failure backoff (milliseconds)
+/// Maximum jitter added to the healthy heartbeat period (milliseconds)
 pub const FAILURE_BACKOFF_JITTER_MS: u64 = 5000;
-
-/// Maximum jitter for warming-up retry sleep (milliseconds)
-pub const ERROR_RETRY_JITTER_MS: u64 = 2000;
-
-/// Delay after re-registration failure before retry (seconds)
-pub const RELAY_LOSS_RECOVERY_DELAY_SECS: u64 = 5;
 
 // ============================================================================
 // Relay & Monitoring
@@ -273,6 +295,18 @@ pub const REBALANCE_FETCH_MIN_CONCURRENCY: usize = 1;
 /// Number of consecutive successes before increasing rebalance fetch concurrency
 pub const REBALANCE_FETCH_SCALEUP_THRESHOLD: usize = 5;
 
+/// How often the fetch phase logs a progress line at info. Without it a
+/// failing fetch phase is indistinguishable from a hung one: every failure
+/// path in `fetch_missing_shards` logs at debug only (observed in production:
+/// 85 min of total journal silence mid-pass).
+pub const REBALANCE_FETCH_PROGRESS_SECS: u64 = 60;
+
+/// Hard deadline for one shard's entire fetch attempt (peer loop + erasure
+/// recovery). `open_bi()`/`write_all()` have no timeout of their own, so a
+/// half-dead pooled connection could stall the pass forever; this also caps
+/// the legitimate worst case (~30 candidate peers x 33 s reads).
+pub const REBALANCE_SHARD_FETCH_DEADLINE_SECS: u64 = 180;
+
 /// Epoch lookback depth for shard placement during rebalance.
 /// Shards placed on this miner under any cluster map within this window
 /// are considered expected, preventing premature orphan GC during transitions.
@@ -280,6 +314,11 @@ pub const EPOCH_LOOKBACK: u64 = 50;
 
 /// Maximum cluster map history entries retained for epoch lookback.
 pub const MAX_CLUSTER_MAP_HISTORY: usize = 10;
+
+/// Cap on fetch candidate peers per missing shard. The list merges upload-era,
+/// historical-window and current-stripe holders; without a cap one shard could
+/// spend the whole fetch-phase budget dialing peers.
+pub const REBALANCE_FETCH_MAX_PEERS_PER_SHARD: usize = 40;
 
 // ============================================================================
 // P2P Operations
@@ -312,14 +351,48 @@ pub const PEER_DATA_RECEPTION_TIMEOUT_SECS: u64 = 30;
 /// Timeout for reading batch PG query response from validator (seconds)
 pub const BATCH_RESPONSE_TIMEOUT_SECS: u64 = 60;
 
-/// Number of PGs to query per batch chunk
+/// Number of PGs to query per batch chunk. Only the starting point of a
+/// cycle: the query loop halves the chunk size automatically when a
+/// response overflows the entry cap, so growing per-PG file density
+/// degrades gracefully instead of erroring.
 pub const PG_BATCH_CHUNK_SIZE: usize = 50;
 
-/// Maximum total file entries accepted from a batch PG response
-pub const MAX_PG_BATCH_FILE_ENTRIES: usize = 100_000;
+/// Maximum total file entries accepted from a batch PG response.
+///
+/// Raised 100k → 400k: this check runs AFTER the response has
+/// been fully read (bounded by `MAX_BATCH_PG_RESPONSE_SIZE` = 20 MiB, the
+/// real memory guard) and JSON-parsed, so tripping it only discards data we
+/// already paid to transfer. 20 MiB of JSON cannot exceed ~290k hash entries,
+/// so at 400k this cap can never bind before the byte cap — it survives only
+/// as a sanity ceiling.
+pub const MAX_PG_BATCH_FILE_ENTRIES: usize = 400_000;
+
+/// Maximum consecutive failed batch PG chunk queries before the cycle's
+/// query loop aborts (prevents hammering a broken validator connection
+/// with dozens of doomed chunk requests every tick).
+pub const MAX_CONSECUTIVE_BATCH_FAILURES: u32 = 5;
+
+/// Maximum validator reconnects per rebalance cycle after a batch PG chunk
+/// query fails. Each reconnect is preceded by a backoff (see
+/// `BATCH_RECONNECT_BACKOFF_SECS`) and retries the SAME chunk window.
+/// Rationale: a loaded validator closes the batch connection ~30-45 s
+/// in and answers an *immediate* reconnect with `server busy` (code 1); the
+/// old single instant reconnect therefore always failed and roughly half of
+/// observed cycles aborted having checked nothing.
+pub const MAX_BATCH_RECONNECTS: u32 = 3;
+
+/// Base backoff before a batch-query reconnect; attempt `n` waits `n x base`
+/// (20 s, 40 s, 60 s -> at most 120 s per cycle, well under the 300 s tick).
+pub const BATCH_RECONNECT_BACKOFF_SECS: u64 = 20;
 
 /// Number of concurrent QUIC streams for manifest fetches during rebalance
-pub const CONCURRENT_MANIFEST_FETCH_STREAMS: usize = 16;
+// 16 -> 8: with 16 parallel streams one connection stall made
+// all in-flight fetches time out together, so the 10-consecutive-failures
+// abort tripped on a single wave (observed in production: 10 failures
+// within 4 ms). At 8, an abort requires sustained failure across two
+// waves, and the load
+// on the struggling validator is halved.
+pub const CONCURRENT_MANIFEST_FETCH_STREAMS: usize = 8;
 
 /// Maximum consecutive manifest fetch failures before aborting rebalance
 pub const MAX_CONSECUTIVE_MANIFEST_FAILURES: u32 = 10;

@@ -95,15 +95,11 @@ impl BlobStore for MigratingStore {
     }
 
     async fn read(&self, hash_hex: &str) -> std::io::Result<Bytes> {
-        match self.packed.read(hash_hex).await {
-            Ok(b) => Ok(b),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.flat.read(hash_hex).await,
-            Err(e) => Err(e),
-        }
+        read_across(|| self.packed.read(hash_hex), || self.flat.read(hash_hex)).await
     }
 
     fn has(&self, hash_hex: &str) -> bool {
-        self.packed.has(hash_hex) || self.flat.has(hash_hex)
+        has_across(|| self.packed.has(hash_hex), || self.flat.has(hash_hex))
     }
 
     async fn delete(&self, hash_hex: &str) -> std::io::Result<()> {
@@ -272,6 +268,35 @@ impl BinPager {
         self.exhausted = self.cursor.is_none();
         page
     }
+}
+
+/// Packed → flat → packed lookup. The mover stores a blob durably into
+/// packed and only then unlinks its flat copy, so a reader that missed
+/// packed *before* the move and flat *after* it would report a blob the
+/// node holds as absent (false FetchBlob miss, false PoS failure). A final
+/// packed recheck after a flat miss closes that window: any move that
+/// raced the two lookups had already landed in packed when flat was
+/// unlinked. Errors other than NotFound are surfaced as they occur.
+async fn read_across<P, PF, F, FF>(packed: P, flat: F) -> std::io::Result<Bytes>
+where
+    P: Fn() -> PF,
+    PF: std::future::Future<Output = std::io::Result<Bytes>>,
+    F: FnOnce() -> FF,
+    FF: std::future::Future<Output = std::io::Result<Bytes>>,
+{
+    match packed().await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        r => return r,
+    }
+    match flat().await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => packed().await,
+        r => r,
+    }
+}
+
+/// Existence check with the same final packed recheck as [`read_across`].
+fn has_across(packed: impl Fn() -> bool, flat: impl FnOnce() -> bool) -> bool {
+    packed() || flat() || packed()
 }
 
 /// Move one live flat blob into the packed store. Returns payload size, or
@@ -686,6 +711,63 @@ mod tests {
         // Hybrid semantics unchanged after the drain.
         assert_eq!(hybrid.read(&h(&live2)).await.unwrap().as_ref(), &live2[..]);
         assert!(hybrid.has_trashed(&h(&trashed)));
+    }
+
+    // Regression (flat→packed TOCTOU): the mover lands the blob in packed
+    // and unlinks flat *between* the reader's packed miss and its flat
+    // lookup. The reader must still find the blob.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_finds_blob_moved_between_packed_miss_and_flat_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let (flat, packed) = setup(dir.path()).await;
+        let payload = b"raced-by-the-mover".to_vec();
+        let hash = h(&payload);
+        flat.store(&hash, &payload).await.unwrap();
+
+        let got = read_across(
+            || packed.read(&hash),
+            || async {
+                // Interleaved mover: packed store + flat unlink, then the
+                // reader's flat lookup runs against the unlinked file.
+                assert_eq!(
+                    move_one(&flat, &packed, &hash).await,
+                    Some(payload.len() as u64)
+                );
+                assert!(!flat.has(&hash));
+                flat.read(&hash).await
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.as_ref(), &payload[..]);
+
+        // Same interleaving for the existence check.
+        let payload2 = b"raced-by-the-mover-2".to_vec();
+        let hash2 = h(&payload2);
+        flat.store(&hash2, &payload2).await.unwrap();
+        let present = has_across(
+            || packed.has(&hash2),
+            || {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(move_one(&flat, &packed, &hash2))
+                        .unwrap()
+                });
+                flat.has(&hash2)
+            },
+        );
+        assert!(present);
+
+        // A genuinely absent blob is still reported absent.
+        let missing = h(b"never-stored");
+        assert_eq!(
+            read_across(|| packed.read(&missing), || flat.read(&missing))
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(!has_across(|| packed.has(&missing), || flat.has(&missing)));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

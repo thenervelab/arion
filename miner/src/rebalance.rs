@@ -5,8 +5,11 @@
 //!
 //! 1. **PG calculation**: Compute which Placement Groups this miner is
 //!    responsible for using CRUSH over the current cluster map (cached by epoch).
-//! 2. **Manifest fetch**: Query the validator for all files in those PGs
-//!    via chunked `QueryPgFilesBatch` requests (500 PGs per chunk).
+//! 2. **Manifest fetch**: Query the validator for files in those PGs via
+//!    chunked `QueryPgFilesBatch` requests, issued from a persistent rotating
+//!    cursor and only until the cycle's file budget
+//!    (`rebalance_max_files_per_cycle`) is covered. Chunk size halves
+//!    automatically when a response overflows the entry cap.
 //!    Falls back to local iroh-doc replica if validator is unreachable.
 //! 3. **Shard verification**: For each file, fetch the manifest and walk
 //!    stripes to identify shards this miner should hold (CRUSH placement
@@ -21,12 +24,14 @@
 //! migration via `PullFromPeer` commands as a fallback.
 
 use crate::constants::{
-    BATCH_RESPONSE_TIMEOUT_SECS, CONCURRENT_MANIFEST_FETCH_STREAMS, EPOCH_LOOKBACK,
-    MANIFEST_READ_TIMEOUT_SECS, MANIFEST_RESPONSE_MAX_SIZE, MANIFEST_STREAM_OPEN_TIMEOUT_SECS,
-    MAX_BATCH_PG_RESPONSE_SIZE, MAX_CONSECUTIVE_MANIFEST_FAILURES, MAX_PG_BATCH_FILE_ENTRIES,
+    BATCH_RECONNECT_BACKOFF_SECS, BATCH_RESPONSE_TIMEOUT_SECS, CONCURRENT_MANIFEST_FETCH_STREAMS,
+    EPOCH_LOOKBACK, MANIFEST_READ_TIMEOUT_SECS, MANIFEST_RESPONSE_MAX_SIZE,
+    MANIFEST_STREAM_OPEN_TIMEOUT_SECS, MAX_BATCH_PG_RESPONSE_SIZE, MAX_BATCH_RECONNECTS,
+    MAX_CONSECUTIVE_BATCH_FAILURES, MAX_CONSECUTIVE_MANIFEST_FAILURES, MAX_PG_BATCH_FILE_ENTRIES,
     PG_BATCH_CHUNK_SIZE, REBALANCE_FETCH_CONCURRENCY, REBALANCE_FETCH_MAX_CONCURRENCY,
-    REBALANCE_FETCH_MIN_CONCURRENCY, REBALANCE_FETCH_SCALEUP_THRESHOLD,
-    REBALANCE_MAX_FILES_PER_CYCLE,
+    REBALANCE_FETCH_MIN_CONCURRENCY, REBALANCE_FETCH_PROGRESS_SECS,
+    REBALANCE_FETCH_SCALEUP_THRESHOLD, REBALANCE_MAX_FILES_PER_CYCLE,
+    REBALANCE_SHARD_FETCH_DEADLINE_SECS,
 };
 use crate::state::{
     get_cluster_map, get_validator_addr, get_validator_node_id_global, get_validator_reachable,
@@ -35,8 +40,8 @@ use crate::store::BlobStore;
 use anyhow::Result;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::Semaphore;
@@ -53,6 +58,110 @@ const MAX_CACHED_CLUSTER_MAPS: usize = 256;
 static CLUSTER_MAP_CACHE: LazyLock<
     TokioRwLock<std::collections::HashMap<u64, Option<Arc<common::ClusterMap>>>>,
 > = LazyLock::new(|| TokioRwLock::new(std::collections::HashMap::new()));
+
+/// Persistent rotating sweep over the sorted PG assignment for budgeted
+/// validator batch queries. Survives across cycles so successive cycles
+/// continue the sweep instead of re-querying the same prefix every tick.
+static PG_SWEEP: Mutex<PgSweep> = Mutex::new(PgSweep::new());
+
+/// Cursor/budget bookkeeping of the rotating PG sweep. Pure: no I/O.
+///
+/// Lossless continuation: a PG is consumed (the cursor moves past it) only
+/// once every file the validator returned for it has been handed out by
+/// [`PgSweep::take`]. Files received beyond a cycle's budget stay in
+/// `carry` and are handed out first by the next cycle, so a dense PG is
+/// never restarted from its prefix. `carry` never exceeds the last chunk
+/// response, since no chunk is issued once the budget is covered.
+#[derive(Debug)]
+struct PgSweep {
+    /// Index into the sorted assignment of the next PG to request.
+    cursor: usize,
+    /// Files received but not yet handed out, in sweep order.
+    carry: std::collections::VecDeque<(u32, Vec<String>)>,
+}
+
+impl PgSweep {
+    const fn new() -> Self {
+        Self {
+            cursor: 0,
+            carry: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Next chunk to request: at most `max_pgs` PGs in ascending order,
+    /// never spanning the wrap so the truncation rule of [`Self::absorb`]
+    /// applies to a sorted slice. The caller also caps `max_pgs` by the
+    /// PGs left in the cycle's rotation so no PG is requested twice per
+    /// cycle.
+    fn next_chunk<'a>(&self, pgs_sorted: &'a [u32], max_pgs: usize) -> &'a [u32] {
+        let start = self.cursor % pgs_sorted.len();
+        &pgs_sorted[start..(start + max_pgs.max(1)).min(pgs_sorted.len())]
+    }
+
+    /// Absorb the validator's response for `chunk` (ascending, as returned
+    /// by [`Self::next_chunk`]) and return how many leading PGs of the chunk
+    /// are consumed. The compatible validator omits empty PGs and, when the
+    /// response exceeds its size cap, silently drops the HIGHEST PG ids —
+    /// so an absent PG is provably empty only when a higher PG id is
+    /// present. Absent PGs above the highest returned one are left
+    /// unconsumed and re-requested next cycle; an entirely empty response
+    /// means every requested PG is empty. (A single PG whose listing alone
+    /// exceeds the validator's cap also yields an empty response; such a
+    /// PG cannot be served through this path by the current validator and
+    /// is skipped, as before.)
+    fn absorb(
+        &mut self,
+        pgs_sorted: &[u32],
+        chunk: &[u32],
+        mut response: std::collections::HashMap<u32, Vec<String>>,
+    ) -> usize {
+        let highest_present = chunk
+            .iter()
+            .filter(|pg| response.contains_key(pg))
+            .max()
+            .copied();
+        let consumed = match highest_present {
+            Some(top) => chunk.iter().take_while(|pg| **pg <= top).count(),
+            None => chunk.len(),
+        };
+        for pg in &chunk[..consumed] {
+            if let Some(files) = response.remove(pg)
+                && !files.is_empty()
+            {
+                self.carry.push_back((*pg, files));
+            }
+        }
+        self.advance(pgs_sorted, consumed);
+        consumed
+    }
+
+    /// Move the cursor past `count` PGs without any files (error policy).
+    fn advance(&mut self, pgs_sorted: &[u32], count: usize) {
+        self.cursor = (self.cursor + count) % pgs_sorted.len().max(1);
+    }
+
+    /// Hand out carried files into `out` until it holds `budget` entries.
+    /// A partially drained PG keeps its remainder at the front.
+    fn take(&mut self, out: &mut Vec<String>, budget: usize) {
+        while out.len() < budget {
+            let Some((_, files)) = self.carry.front_mut() else {
+                break;
+            };
+            let room = budget - out.len();
+            if files.len() <= room {
+                out.extend(files.drain(..));
+                self.carry.pop_front();
+            } else {
+                out.extend(files.drain(..room));
+            }
+        }
+    }
+
+    /// Drop carried files of PGs no longer assigned to this miner.
+    fn retain_assigned(&mut self, assigned: &std::collections::HashSet<u32>) {
+        self.carry.retain(|(pg, _)| assigned.contains(pg));
+    }
+}
 
 fn repair_placement_versions_to_try(tagged_version: u8) -> Vec<u8> {
     common::get_placement_probing_sequence(tagged_version)
@@ -289,20 +398,37 @@ pub async fn self_rebalance_pg(
         nid.clone()
     };
 
+    // CRUSH must see a filtered map (draining miners excluded) so all paths
+    // -- upload, download, recovery, rebalance -- compute identical placements.
+    // The unfiltered map stays in `state::cluster_map` (broadcast contract).
+    let cluster_map: Arc<common::ClusterMap> = if cluster_map.miners.iter().any(|m| m.draining) {
+        Arc::new(common::filter_map_for_placement(&cluster_map))
+    } else {
+        cluster_map
+    };
+
     if validator_addr.is_none() && !doc_available {
         warn!("No validator address stored and no doc replica, skipping rebalance");
         return Ok(());
     }
 
     // Snapshot cluster map history for epoch lookback (prevents premature deletion).
-    // Only keep maps within the EPOCH_LOOKBACK window.
+    // Only keep maps within the EPOCH_LOOKBACK window. Each map is filtered
+    // for placement before use so CRUSH calls downstream don't trip the
+    // `filter_map_for_placement` precondition.
     let history_maps: Vec<Arc<common::ClusterMap>> = {
         let history = crate::state::get_cluster_map_history().read().await;
         let min_epoch = cluster_map.epoch.saturating_sub(EPOCH_LOOKBACK);
         history
             .iter()
             .filter(|m| m.epoch >= min_epoch)
-            .map(|m| m.clone())
+            .map(|m| {
+                if m.miners.iter().any(|x| x.draining) {
+                    Arc::new(common::filter_map_for_placement(m))
+                } else {
+                    m.clone()
+                }
+            })
             .collect()
     };
 
@@ -361,6 +487,12 @@ pub async fn self_rebalance_pg(
                     None => continue,
                 }
             };
+            let updated_map: Arc<common::ClusterMap> =
+                if updated_map.miners.iter().any(|m| m.draining) {
+                    Arc::new(common::filter_map_for_placement(&updated_map))
+                } else {
+                    updated_map
+                };
             let map_for_pgs = updated_map.clone();
             let pgs =
                 tokio::task::spawn_blocking(move || common::calculate_my_pgs(my_uid, &map_for_pgs))
@@ -391,8 +523,14 @@ pub async fn self_rebalance_pg(
     trace!(pgs = ?my_pgs.iter().take(10).collect::<Vec<_>>(), "My PG assignments (first 10)");
 
     // Pre-build set of locally present hashes from the flat file store.
+    // The directory walk is blocking IO that can take minutes on a large
+    // store with a cold dentry cache; run it on the blocking pool so the
+    // async workers (heartbeats included) keep flowing.
     let local_hashes: std::collections::HashSet<iroh_blobs::Hash> = {
-        let hash_strings = store.list_hashes();
+        let store_for_scan = Arc::clone(&store);
+        let hash_strings = tokio::task::spawn_blocking(move || store_for_scan.list_hashes())
+            .await
+            .expect("list_hashes task panicked");
         let set: std::collections::HashSet<iroh_blobs::Hash> = hash_strings
             .iter()
             .filter_map(|h| iroh_blobs::Hash::from_str(h).ok())
@@ -410,6 +548,10 @@ pub async fn self_rebalance_pg(
     let mut missing_shard_list: Vec<MissingShard> = Vec::new();
     let mut total_manifest_failures: u32 = 0;
     let mut aborted = false;
+    // Set when the validator batch-query loop gives up; routes the cycle to
+    // the doc fallback (if joined) and to an honest WARN instead of a
+    // "Complete - all 0 shards verified" line.
+    let mut batch_aborted = false;
 
     // Cache of cluster maps keyed by placement epoch.  Populated lazily as
     // manifests are processed — prevents premature deletion for files uploaded more
@@ -438,19 +580,56 @@ pub async fn self_rebalance_pg(
         };
 
         if let Some(validator_conn) = validator_conn {
+            let mut validator_conn = validator_conn;
             // ---- Validator path: query PGs then fetch manifests ----
-            let mut pg_files_map: std::collections::HashMap<u32, Vec<String>> =
-                std::collections::HashMap::with_capacity(my_pgs.len());
+            //
+            // Budget-aware rotating-cursor querying.
+            // Previously every cycle queried ALL assigned PGs (~22M file
+            // entries at 5k PGs × ~4.5k files/PG at observed densities) and then
+            // kept only `REBALANCE_MAX_FILES_PER_CYCLE` of them — >99% of the
+            // transferred JSON was discarded, saturating the WAN link every
+            // tick. Chunks are now issued only until the cycle's file budget
+            // is covered, and a persistent cursor rotates the starting PG so
+            // successive cycles sweep the whole assignment.
+            let file_budget = REBALANCE_MAX_FILES_PER_CYCLE.max(1);
+            let max_batch_entries = MAX_PG_BATCH_FILE_ENTRIES.max(1);
+
+            let mut pgs_sorted = my_pgs.clone();
+            pgs_sorted.sort_unstable();
+            // Taken out of the static for the cycle (no guard across awaits)
+            // and written back after the query loop.
+            let mut sweep = std::mem::replace(
+                &mut *PG_SWEEP.lock().unwrap_or_else(|e| e.into_inner()),
+                PgSweep::new(),
+            );
+            sweep.retain_assigned(&my_pgs.iter().copied().collect());
+            let cursor_start = sweep.cursor % pgs_sorted.len();
+
+            // Files carried over from the previous cycle come first.
+            let mut file_entries: Vec<String> = Vec::with_capacity(file_budget);
+            let carried = sweep.carry.iter().map(|(_, f)| f.len()).sum::<usize>();
+            sweep.take(&mut file_entries, file_budget);
             let read_timeout = std::time::Duration::from_secs(BATCH_RESPONSE_TIMEOUT_SECS);
 
             debug!(
-                pg_count = my_pgs.len(),
-                "Querying validator for files in assigned PGs (chunked batch)"
+                pg_count = pgs_sorted.len(),
+                cursor = cursor_start,
+                carried_files = carried,
+                file_budget = file_budget,
+                "Querying validator for files in assigned PGs (budgeted rotating batch)"
             );
 
-            for chunk in my_pgs.chunks(PG_BATCH_CHUNK_SIZE) {
+            let mut chunk_size = PG_BATCH_CHUNK_SIZE.max(1);
+            let mut pgs_queried = 0usize; // PGs consumed this cycle; one full sweep at most
+            let mut total_files = carried;
+            let mut batch_failures = 0u32;
+            let mut reconnects = 0u32;
+
+            while pgs_queried < pgs_sorted.len() && file_entries.len() < file_budget {
+                let max_pgs = chunk_size.min(pgs_sorted.len() - pgs_queried);
+                let chunk = sweep.next_chunk(&pgs_sorted, max_pgs).to_vec();
                 let query_msg = common::ValidatorControlMessage::QueryPgFilesBatch {
-                    pg_ids: chunk.to_vec(),
+                    pg_ids: chunk.clone(),
                 };
 
                 let result: Result<std::collections::HashMap<u32, Vec<String>>> = async {
@@ -471,11 +650,11 @@ pub async fn self_rebalance_pg(
                         serde_json::from_slice(&response_bytes)?;
 
                     let total_entries: usize = files.values().map(|v| v.len()).sum();
-                    if total_entries > MAX_PG_BATCH_FILE_ENTRIES {
+                    if total_entries > max_batch_entries {
                         anyhow::bail!(
                             "PG batch response too large: {} file entries (max {})",
                             total_entries,
-                            MAX_PG_BATCH_FILE_ENTRIES,
+                            max_batch_entries,
                         );
                     }
 
@@ -485,94 +664,249 @@ pub async fn self_rebalance_pg(
 
                 match result {
                     Ok(f) => {
-                        for (k, v) in f {
-                            pg_files_map.insert(k, v);
+                        batch_failures = 0;
+                        total_files += f.values().map(|v| v.len()).sum::<usize>();
+                        pgs_queried += sweep.absorb(&pgs_sorted, &chunk, f);
+                        sweep.take(&mut file_entries, file_budget);
+                    }
+                    Err(e)
+                        if e.to_string().contains("too large")
+                            || e.to_string().contains("too long") =>
+                    {
+                        // Entry-cap overflow ("too large") or 20 MiB byte-cap
+                        // overflow (quinn "too long"): shrink the window and
+                        // retry the SAME PGs instead of discarding their data.
+                        if chunk_size > 1 {
+                            chunk_size = (chunk_size / 2).max(1);
+                            warn!(
+                                new_chunk_size = chunk_size,
+                                "PG batch response too large — halving chunk size and retrying"
+                            );
+                        } else {
+                            error!(
+                                pg = chunk[0],
+                                "Single-PG batch response exceeds entry cap — skipping PG"
+                            );
+                            sweep.advance(&pgs_sorted, chunk.len());
+                            pgs_queried += chunk.len();
+                            batch_failures += 1;
                         }
                     }
                     Err(e) => {
                         error!(error = %e, "Batch PG chunk query failed");
+                        batch_failures += 1;
+                        // All chunks share one QUIC connection; a validator-side
+                        // close would otherwise doom every remaining chunk. The
+                        // validator answers an *immediate* reconnect with
+                        // `server busy` (code 1), so back off before each of up
+                        // to MAX_BATCH_RECONNECTS reconnects and retry the SAME
+                        // window (cursor unchanged).
+                        if reconnects < MAX_BATCH_RECONNECTS {
+                            reconnects += 1;
+                            let wait = std::time::Duration::from_secs(
+                                BATCH_RECONNECT_BACKOFF_SECS * u64::from(reconnects),
+                            );
+                            warn!(
+                                attempt = reconnects,
+                                max_attempts = MAX_BATCH_RECONNECTS,
+                                backoff_secs = wait.as_secs(),
+                                "Backing off before validator reconnect for batch queries"
+                            );
+                            tokio::time::sleep(wait).await;
+                            match common::transport::connect_with_alpn(
+                                &endpoint,
+                                validator_addr,
+                                &validator_node_id,
+                                &signing_key,
+                                &[common::VALIDATOR_CONTROL_ALPN],
+                            )
+                            .await
+                            {
+                                Ok(conn) => {
+                                    warn!(
+                                        attempt = reconnects,
+                                        "Reconnected to validator for batch queries"
+                                    );
+                                    validator_conn = conn;
+                                    continue;
+                                }
+                                Err(e2) => {
+                                    warn!(
+                                        error = %e2,
+                                        "Validator reconnect failed — aborting batch queries this cycle"
+                                    );
+                                    batch_aborted = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if batch_failures >= MAX_CONSECUTIVE_BATCH_FAILURES {
+                            warn!(
+                                failures = batch_failures,
+                                "Too many consecutive batch failures — aborting batch queries this cycle"
+                            );
+                            batch_aborted = true;
+                            break;
+                        }
+                        sweep.advance(&pgs_sorted, chunk.len());
+                        pgs_queried += chunk.len();
                     }
                 }
             }
 
+            // Persist the sweep: the cursor sits on the first PG whose files
+            // were not all handed out, and their remainder is carried over,
+            // so the next cycle continues exactly where this one stopped.
+            let carried_over = sweep.carry.iter().map(|(_, f)| f.len()).sum::<usize>();
             debug!(
-                pgs_with_files = pg_files_map.len(),
-                "Received batch PG query response"
+                pgs_queried,
+                total_files,
+                selected_files = file_entries.len(),
+                carried_over,
+                "Received batch PG query responses"
             );
+            *PG_SWEEP.lock().unwrap_or_else(|e| e.into_inner()) = sweep;
 
-            let file_entries: Vec<String> = pg_files_map
-                .values()
-                .flat_map(|files| files.iter().cloned())
-                .take(REBALANCE_MAX_FILES_PER_CYCLE)
-                .collect();
-
-            // Fetch manifests concurrently (16 parallel QUIC streams on one connection)
+            // Fetch manifests concurrently (CONCURRENT_MANIFEST_FETCH_STREAMS
+            // parallel QUIC streams on one connection). Up to
+            // MAX_BATCH_RECONNECTS escalating backoff+reconnect retries on
+            // abort, mirroring the batch phase: one 20 s retry never converted
+            // (28/28 second-streak failures overnight 08-30/31) because the
+            // validator accepts the fresh connection and then serves nothing.
             {
                 use futures::stream::StreamExt;
-                let mut manifest_stream = futures::stream::iter(file_entries.into_iter())
-                    .map(|file_hash| {
-                        let conn = validator_conn.clone();
-                        async move {
-                            let result = fetch_manifest_on_conn(&conn, &file_hash).await;
-                            (file_hash, result)
-                        }
-                    })
-                    .buffer_unordered(CONCURRENT_MANIFEST_FETCH_STREAMS);
-
-                let mut consecutive_failures: u32 = 0;
-
-                while let Some((file_hash, result)) = manifest_stream.next().await {
-                    match result {
-                        Ok(Some(manifest)) => {
-                            consecutive_failures = 0;
-                            // Lazily fetch the placement-epoch cluster map if
-                            // we haven't seen this epoch before.
-                            let pe = manifest.placement_epoch;
-                            if !placement_epoch_maps.contains_key(&pe)
-                                && pe != cluster_map.epoch
-                                && let Some(pe_map) = get_or_fetch_cluster_map(
-                                    &endpoint,
-                                    &signing_key,
-                                    &validator_node_id,
-                                    validator_addr,
-                                    pe,
-                                )
-                                .await
-                            {
-                                placement_epoch_maps.insert(pe, pe_map);
+                let mut pending: Vec<String> = file_entries;
+                for attempt in 0..(MAX_BATCH_RECONNECTS + 1) {
+                    if pending.is_empty() {
+                        break;
+                    }
+                    if attempt > 0 {
+                        let wait = std::time::Duration::from_secs(
+                            BATCH_RECONNECT_BACKOFF_SECS * u64::from(attempt),
+                        );
+                        warn!(
+                            remaining = pending.len(),
+                            backoff_secs = wait.as_secs(),
+                            "Backing off before validator reconnect for manifest fetches"
+                        );
+                        tokio::time::sleep(wait).await;
+                        match common::transport::connect_with_alpn(
+                            &endpoint,
+                            validator_addr,
+                            &validator_node_id,
+                            &signing_key,
+                            &[common::VALIDATOR_CONTROL_ALPN],
+                        )
+                        .await
+                        {
+                            Ok(conn) => {
+                                warn!("Reconnected to validator for manifest fetches");
+                                validator_conn = conn;
                             }
-                            tally_manifest_shards(
-                                &file_hash,
-                                &manifest,
-                                my_uid,
-                                &cluster_map,
-                                &history_maps,
-                                &placement_epoch_maps,
-                                &store,
-                                &local_hashes,
-                                &mut expected_shards,
-                                &mut missing_shards,
-                                &mut missing_shard_list,
-                            )
-                            .await;
-                        }
-                        Ok(None) => {
-                            consecutive_failures = 0;
-                        }
-                        Err(_) => {
-                            total_manifest_failures += 1;
-                            consecutive_failures += 1;
-                            if consecutive_failures >= MAX_CONSECUTIVE_MANIFEST_FAILURES {
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    "Validator reconnect for manifest fetches failed"
+                                );
                                 aborted = true;
                                 break;
                             }
                         }
                     }
+                    aborted = false;
+                    let batch_all: Vec<String> = std::mem::take(&mut pending);
+                    let mut emitted: std::collections::HashSet<String> =
+                        std::collections::HashSet::with_capacity(batch_all.len());
+                    let mut failed_this_attempt: Vec<String> = Vec::new();
+                    let mut manifest_stream = futures::stream::iter(batch_all.clone().into_iter())
+                        .map(|file_hash| {
+                            let conn = validator_conn.clone();
+                            async move {
+                                let result = fetch_manifest_on_conn(&conn, &file_hash).await;
+                                (file_hash, result)
+                            }
+                        })
+                        .buffer_unordered(CONCURRENT_MANIFEST_FETCH_STREAMS);
+
+                    let mut consecutive_failures: u32 = 0;
+
+                    while let Some((file_hash, result)) = manifest_stream.next().await {
+                        emitted.insert(file_hash.clone());
+                        match result {
+                            Ok(Some(manifest)) => {
+                                consecutive_failures = 0;
+                                // Lazily fetch the placement-epoch cluster map if
+                                // we haven't seen this epoch before.
+                                let pe = manifest.placement_epoch;
+                                if !placement_epoch_maps.contains_key(&pe)
+                                    && pe != cluster_map.epoch
+                                    && let Some(pe_map) = get_or_fetch_cluster_map(
+                                        &endpoint,
+                                        &signing_key,
+                                        &validator_node_id,
+                                        validator_addr,
+                                        pe,
+                                    )
+                                    .await
+                                {
+                                    let pe_map = if pe_map.miners.iter().any(|m| m.draining) {
+                                        Arc::new(common::filter_map_for_placement(&pe_map))
+                                    } else {
+                                        pe_map
+                                    };
+                                    placement_epoch_maps.insert(pe, pe_map);
+                                }
+                                tally_manifest_shards(
+                                    &file_hash,
+                                    &manifest,
+                                    my_uid,
+                                    &cluster_map,
+                                    &history_maps,
+                                    &placement_epoch_maps,
+                                    &store,
+                                    &local_hashes,
+                                    &mut expected_shards,
+                                    &mut missing_shards,
+                                    &mut missing_shard_list,
+                                )
+                                .await;
+                            }
+                            Ok(None) => {
+                                consecutive_failures = 0;
+                            }
+                            Err(e) => {
+                                if consecutive_failures == 0 {
+                                    warn!(
+                                        error = %e,
+                                        file = %&file_hash[..12.min(file_hash.len())],
+                                        "Manifest fetch failed (start of a failure streak)"
+                                    );
+                                }
+                                total_manifest_failures += 1;
+                                consecutive_failures += 1;
+                                failed_this_attempt.push(file_hash);
+                                if consecutive_failures >= MAX_CONSECUTIVE_MANIFEST_FAILURES {
+                                    aborted = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if aborted {
+                        // Retry what failed plus what the dropped stream never
+                        // emitted; successes are already tallied and must not
+                        // be re-processed (their shards would double-count).
+                        pending = failed_this_attempt;
+                        pending.extend(batch_all.into_iter().filter(|h| !emitted.contains(h)));
+                    } else {
+                        break;
+                    }
                 }
             }
 
-            // If too many failures, try doc fallback for remaining work
-            aborted && doc_available
+            // If too many failures (manifest phase OR batch-query phase),
+            // try doc fallback for remaining work
+            (aborted || batch_aborted) && doc_available
         } else {
             // Connection failed, try doc fallback
             doc_available
@@ -598,7 +932,7 @@ pub async fn self_rebalance_pg(
 
                 let file_hashes: Vec<String> = file_hashes
                     .into_iter()
-                    .take(REBALANCE_MAX_FILES_PER_CYCLE)
+                    .take(REBALANCE_MAX_FILES_PER_CYCLE.max(1))
                     .collect();
 
                 for file_hash in &file_hashes {
@@ -620,6 +954,11 @@ pub async fn self_rebalance_pg(
                                 )
                                 .await
                             {
+                                let pe_map = if pe_map.miners.iter().any(|m| m.draining) {
+                                    Arc::new(common::filter_map_for_placement(&pe_map))
+                                } else {
+                                    pe_map
+                                };
                                 placement_epoch_maps.insert(pe, pe_map);
                             }
                             tally_manifest_shards(
@@ -668,6 +1007,14 @@ pub async fn self_rebalance_pg(
     missing_shards = missing_shards.saturating_sub(shards_fetched);
 
     let verified = expected_shards.len().saturating_sub(missing_shards);
+    if batch_aborted && expected_shards.is_empty() {
+        // Nothing was queried, so nothing was verified: say so instead of
+        // reporting a vacuous "Complete".
+        warn!(
+            "[REBALANCE] Cycle aborted — validator batch queries failed, nothing was checked this tick"
+        );
+        return Ok(());
+    }
     if missing_shards > 0 {
         let pct = if expected_shards.is_empty() {
             0
@@ -680,6 +1027,14 @@ pub async fn self_rebalance_pg(
             expected_shards.len(),
             pct,
             missing_shards,
+        );
+    } else if aborted || batch_aborted {
+        warn!(
+            checked_shards = expected_shards.len(),
+            manifest_aborted = aborted,
+            batch_aborted = batch_aborted,
+            used_doc_fallback = used_doc_fallback,
+            "[REBALANCE] Cycle aborted early — partial check only, not a clean pass"
         );
     } else {
         info!(
@@ -700,6 +1055,12 @@ struct ErasureRecoveryCtx {
     stripe_config: common::StripeConfig,
     stripe_miners: Vec<common::MinerNode>,
     stripe_shard_hashes: Vec<Option<String>>,
+    /// Upload-era stripe assignees: for files placed before the lookback
+    /// window the current holders are usually empty; these nodes are the
+    /// plausible source of surviving siblings. Endpoints already re-resolved
+    /// against the current map. None when the placement-epoch map is
+    /// unavailable or the file is current-epoch.
+    upload_era_stripe_miners: Option<Vec<common::MinerNode>>,
 }
 
 /// Info about a shard that is missing locally and should be fetched from a peer.
@@ -739,8 +1100,36 @@ async fn tally_manifest_shards(
     missing_shard_list: &mut Vec<MissingShard>,
 ) {
     let shards_per_stripe = manifest.stripe_config.k + manifest.stripe_config.m;
-    let num_stripes = manifest.shards.len().div_ceil(shards_per_stripe);
+    // The upload path pushes only the shards that stored successfully; a
+    // shard that failed leaves NO placeholder entry in the manifest, so
+    // every entry after such a gap sits at a vec position that no longer
+    // matches its `index` field. Positions are not a coordinate system —
+    // the `index` field is (shards were placed by it at upload).
+    let manifest_gapped = manifest_is_gapped(&manifest.shards);
+    if manifest_gapped {
+        debug!(
+            file = %&file_hash[..12.min(file_hash.len())],
+            shards_listed = manifest.shards.len(),
+            width = shards_per_stripe,
+            "[REBALANCE] Gapped manifest (upload-time shard loss): reading shards by index field"
+        );
+    }
+    let num_stripes = manifest_stripe_count(&manifest.shards, shards_per_stripe);
     let placement_versions_to_try = repair_placement_versions_to_try(manifest.placement_version);
+
+    // For gapped manifests, retain EVERY listed shard regardless of the
+    // ownership evaluation below: earlier releases evaluated ownership at
+    // shifted (positional) coordinates, so a blob this node stored under
+    // the old interpretation may not map to it under the correct one.
+    // Deleting it would fail a later audit of a still-credited blob;
+    // false retention is safe.
+    if manifest_gapped {
+        for s in &manifest.shards {
+            if let Ok(h) = iroh_blobs::Hash::from_str(&s.blob_hash) {
+                expected_shards.insert(h);
+            }
+        }
+    }
 
     for stripe_idx in 0..num_stripes {
         let stripe_miners = match common::calculate_stripe_placement(
@@ -754,13 +1143,17 @@ async fn tally_manifest_shards(
             Err(_) => continue,
         };
 
-        for local_idx in 0..shards_per_stripe {
-            let global_idx = stripe_idx * shards_per_stripe + local_idx;
-            if global_idx >= manifest.shards.len() {
-                continue;
-            }
-
-            let shard = &manifest.shards[global_idx];
+        // Iterate by the shard `index` FIELD. Positional reads on a gapped
+        // manifest mis-evaluate ownership and hand the erasure recovery a
+        // shifted local_idx while stripe_shard_hashes below is keyed by
+        // the index field — the decode then succeeds but extracts the
+        // wrong slot and the blake3 gate discards the result.
+        for shard in manifest
+            .shards
+            .iter()
+            .filter(|s| s.index / shards_per_stripe == stripe_idx)
+        {
+            let local_idx = shard.index % shards_per_stripe;
             let shard_hash = if let Ok(h) = iroh_blobs::Hash::from_str(&shard.blob_hash) {
                 h
             } else {
@@ -831,6 +1224,49 @@ async fn tally_manifest_shards(
                         // and historical epochs (the previous holder likely
                         // still has it during the rebalancing window).
                         let mut peers: Vec<(String, std::net::SocketAddr)> = Vec::new();
+                        // Upload-era placement:
+                        // for files older than the EPOCH_LOOKBACK window, the
+                        // nodes assigned when the file was uploaded are the
+                        // most likely long-term holders -- the 50-epoch
+                        // history below cannot reach them. The map is already
+                        // in placement_epoch_maps (fetched for the retention
+                        // check), so this adds no validator load; when the
+                        // map is absent nothing is added. Addresses are
+                        // re-resolved against the current map (stable node
+                        // id, possibly moved endpoint), falling back to the
+                        // upload-era address. Pushed first so these are
+                        // dialed before the current siblings, which are
+                        // empirically almost always empty for old files.
+                        if let Some(pe_map) = placement_epoch_maps.get(&manifest.placement_epoch) {
+                            for m in stripe_candidates_for_versions(
+                                file_hash,
+                                stripe_idx as u64,
+                                shards_per_stripe,
+                                pe_map,
+                                &placement_versions_to_try,
+                            )
+                            .get(local_idx)
+                            .into_iter()
+                            .flatten()
+                            {
+                                if m.uid == my_uid {
+                                    continue;
+                                }
+                                let addr = cluster_map
+                                    .miners
+                                    .iter()
+                                    .find(|cm| cm.endpoint.id == m.endpoint.id)
+                                    .and_then(|cm| {
+                                        crate::state::socket_addr_from_endpoint(&cm.endpoint)
+                                    })
+                                    .or_else(|| {
+                                        crate::state::socket_addr_from_endpoint(&m.endpoint)
+                                    });
+                                if let Some(addr) = addr {
+                                    peers.push((m.endpoint.id.to_string(), addr));
+                                }
+                            }
+                        }
                         // Historical placements: the miner that held this
                         // position in a previous epoch likely still has it.
                         for hist_map in history_maps {
@@ -868,8 +1304,15 @@ async fn tally_manifest_shards(
                                 peers.push((m.endpoint.id.to_string(), addr));
                             }
                         }
-                        // Deduplicate by node_id
-                        peers.dedup_by(|a, b| a.0 == b.0);
+                        // Deduplicate by node_id, order-preserving (keeps
+                        // the first occurrence so upload-era candidates stay
+                        // in front), then cap the list so a single shard
+                        // cannot eat the whole fetch-phase budget.
+                        {
+                            let mut seen = std::collections::HashSet::new();
+                            peers.retain(|p| seen.insert(p.0.clone()));
+                        }
+                        peers.truncate(crate::constants::REBALANCE_FETCH_MAX_PEERS_PER_SHARD);
 
                         let erasure_ctx = if mine_current {
                             let start_global_idx = stripe_idx * shards_per_stripe;
@@ -882,6 +1325,34 @@ async fn tally_manifest_shards(
                                 }
                             }
 
+                            // Upload-era stripe assignees for erasure
+                            // recovery, endpoints re-resolved against the
+                            // current map (stable node key, possibly moved
+                            // address).
+                            let upload_era_stripe_miners = placement_epoch_maps
+                                .get(&manifest.placement_epoch)
+                                .and_then(|pe_map| {
+                                    common::calculate_stripe_placement(
+                                        file_hash,
+                                        stripe_idx as u64,
+                                        shards_per_stripe,
+                                        pe_map,
+                                        manifest.placement_version,
+                                    )
+                                    .ok()
+                                })
+                                .map(|mut era| {
+                                    for m in era.iter_mut() {
+                                        if let Some(cur) = cluster_map
+                                            .miners
+                                            .iter()
+                                            .find(|cm| cm.public_key == m.public_key)
+                                        {
+                                            m.endpoint = cur.endpoint.clone();
+                                        }
+                                    }
+                                    era
+                                });
                             Some(ErasureRecoveryCtx {
                                 file_hash: file_hash.to_string(),
                                 file_size: manifest.size,
@@ -890,6 +1361,7 @@ async fn tally_manifest_shards(
                                 stripe_config: manifest.stripe_config.clone(),
                                 stripe_miners: stripe_miners.clone(),
                                 stripe_shard_hashes,
+                                upload_era_stripe_miners,
                             })
                         } else {
                             None
@@ -906,6 +1378,24 @@ async fn tally_manifest_shards(
             }
         }
     }
+}
+
+/// True when the manifest's shard list positions no longer match the shard
+/// `index` fields (gapped by upload-time shard loss, or out of order).
+fn manifest_is_gapped(shards: &[common::ShardInfo]) -> bool {
+    shards.iter().enumerate().any(|(pos, s)| s.index != pos)
+}
+
+/// Stripe count from the highest shard `index`. A gapped manifest lists
+/// fewer entries than (stripes x width); deriving the count from the vec
+/// length would silently drop tail stripes.
+fn manifest_stripe_count(shards: &[common::ShardInfo], shards_per_stripe: usize) -> usize {
+    shards
+        .iter()
+        .map(|s| s.index)
+        .max()
+        .map(|mx| mx / shards_per_stripe + 1)
+        .unwrap_or(0)
 }
 
 /// Concurrently fetch missing shards from peer miners with adaptive throttling.
@@ -930,6 +1420,11 @@ async fn fetch_missing_shards(
     let concurrency = Arc::new(AtomicUsize::new(REBALANCE_FETCH_CONCURRENCY));
     let consecutive_ok = Arc::new(AtomicUsize::new(0));
     let fetched = Arc::new(AtomicUsize::new(0));
+    let attempted = Arc::new(AtomicUsize::new(0));
+    let not_found_events = Arc::new(AtomicUsize::new(0));
+    let stream_error_events = Arc::new(AtomicUsize::new(0));
+    let deadline_shards = Arc::new(AtomicUsize::new(0));
+    let store_failures = Arc::new(AtomicUsize::new(0));
 
     // Local semaphore — separate from the inbound fetch_sem
     let sem = Arc::new(Semaphore::new(REBALANCE_FETCH_CONCURRENCY));
@@ -943,6 +1438,30 @@ async fn fetch_missing_shards(
         REBALANCE_FETCH_CONCURRENCY,
     );
 
+    let progress_ticker = {
+        let attempted = attempted.clone();
+        let fetched = fetched.clone();
+        let concurrency = concurrency.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let mut iv = tokio::time::interval(std::time::Duration::from_secs(
+                REBALANCE_FETCH_PROGRESS_SECS,
+            ));
+            iv.tick().await; // consume the immediate first tick
+            loop {
+                iv.tick().await;
+                info!(
+                    attempted = attempted.load(Ordering::Relaxed),
+                    total = total,
+                    fetched = fetched.load(Ordering::Relaxed),
+                    concurrency = concurrency.load(Ordering::Relaxed),
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "[REBALANCE] Fetch progress"
+                );
+            }
+        })
+    };
+
     let mut join_set = tokio::task::JoinSet::new();
 
     for shard in missing {
@@ -950,6 +1469,11 @@ async fn fetch_missing_shards(
         let concurrency = concurrency.clone();
         let consecutive_ok = consecutive_ok.clone();
         let fetched = fetched.clone();
+        let attempted = attempted.clone();
+        let not_found_events = not_found_events.clone();
+        let stream_error_events = stream_error_events.clone();
+        let deadline_shards = deadline_shards.clone();
+        let store_failures = store_failures.clone();
         let store = Arc::clone(store);
         let endpoint = endpoint.clone();
 
@@ -959,114 +1483,146 @@ async fn fetch_missing_shards(
 
             let hash_short = &shard.shard_hash.to_string()[..12];
 
-            // Try each peer until one succeeds
-            let mut success = false;
-            for (peer_node_id, peer_addr) in &shard.peer_endpoints {
-                let conn = match tokio::time::timeout(
-                    connect_timeout,
-                    crate::state::get_pooled_connection(&endpoint, peer_node_id, *peer_addr),
-                )
-                .await
-                {
-                    Ok(Ok(c)) => c,
-                    _ => continue,
-                };
-
-                let request = common::MinerControlMessage::FetchBlob {
-                    hash: shard.blob_hash_str.clone(),
-                };
-                let request_bytes = match serde_json::to_vec(&request) {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                };
-
-                let fetch_result: Result<Option<Vec<u8>>> = async {
-                    let (mut send, mut recv) = conn.open_bi().await?;
-                    send.write_all(&request_bytes).await?;
-                    send.finish()?;
-                    let response = tokio::time::timeout(
-                        read_timeout,
-                        recv.read_to_end(crate::constants::MAX_FETCH_RESPONSE_SIZE),
+            // Hard deadline for this shard's NETWORK attempt (peer loop +
+            // erasure recovery): open_bi()/write_all() carry no timeout, so a
+            // half-dead connection could otherwise stall the pass forever.
+            // The permit wait above is deliberately OUTSIDE the deadline —
+            // queued tasks must not expire while waiting their turn. So are
+            // the store and the inventory insert: `fetch` only yields
+            // verified bytes, and `fetch_under_deadline_then_persist` writes
+            // them once the deadline no longer applies.
+            let fetch = async {
+                // Try each peer until one returns bytes that verify
+                for (peer_node_id, peer_addr) in &shard.peer_endpoints {
+                    let conn = match tokio::time::timeout(
+                        connect_timeout,
+                        crate::state::get_pooled_connection(&endpoint, peer_node_id, *peer_addr),
                     )
                     .await
-                    .map_err(|_| anyhow::anyhow!("Read timeout"))??;
+                    {
+                        Ok(Ok(c)) => c,
+                        _ => continue,
+                    };
 
-                    if response.starts_with(b"DATA:") {
-                        Ok(Some(response[5..].to_vec()))
-                    } else {
-                        Ok(None)
-                    }
-                }
-                .await;
+                    let request = common::MinerControlMessage::FetchBlob {
+                        hash: shard.blob_hash_str.clone(),
+                    };
+                    let request_bytes = match serde_json::to_vec(&request) {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
 
-                match fetch_result {
-                    Ok(Some(data)) => {
-                        // Verify blake3 hash before storing
-                        let computed = blake3::hash(&data);
-                        let computed_hex = computed.to_hex();
-                        if computed_hex.as_str() == shard.blob_hash_str {
-                            match store.store(&shard.blob_hash_str, &data).await {
-                                Ok(()) => {
-                                    success = true;
-                                    debug!(
-                                        shard = hash_short,
-                                        "[REBALANCE] Fetched shard from peer"
-                                    );
-                                    break;
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        error = %e,
-                                        shard = hash_short,
-                                        "[REBALANCE] Failed to store fetched shard"
-                                    );
-                                }
-                            }
+                    let fetch_result: Result<Option<Vec<u8>>> = async {
+                        let (mut send, mut recv) = conn.open_bi().await?;
+                        send.write_all(&request_bytes).await?;
+                        send.finish()?;
+                        let response = tokio::time::timeout(
+                            read_timeout,
+                            recv.read_to_end(crate::constants::MAX_FETCH_RESPONSE_SIZE),
+                        )
+                        .await
+                        .map_err(|_| anyhow::anyhow!("Read timeout"))??;
+
+                        if response.starts_with(b"DATA:") {
+                            Ok(Some(response[5..].to_vec()))
                         } else {
+                            Ok(None)
+                        }
+                    }
+                    .await;
+
+                    match fetch_result {
+                        Ok(Some(data)) => {
+                            // Verify blake3 hash before handing the bytes out
+                            let computed = blake3::hash(&data);
+                            let computed_hex = computed.to_hex();
+                            if computed_hex.as_str() == shard.blob_hash_str {
+                                return Some((data, ShardSource::Peer));
+                            }
                             warn!(
                                 shard = hash_short,
                                 "[REBALANCE] Shard hash mismatch from peer"
                             );
                         }
-                    }
-                    Ok(None) => {
-                        // Peer doesn't have it, try next
-                        continue;
-                    }
-                    Err(_) => {
-                        // Timeout or error — adaptive: reduce concurrency
-                        let cur = concurrency.load(Ordering::Relaxed);
-                        if cur > REBALANCE_FETCH_MIN_CONCURRENCY {
-                            let new = cur.saturating_sub(1).max(REBALANCE_FETCH_MIN_CONCURRENCY);
-                            concurrency.store(new, Ordering::Relaxed);
-                            // Shrink the semaphore by forgetting a permit
-                            if let Ok(p) = sem.try_acquire() {
-                                p.forget();
+                        Ok(None) => {
+                            // Peer doesn't have it, try next
+                            not_found_events.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        Err(_) => {
+                            // Timeout or error — adaptive: reduce concurrency
+                            stream_error_events.fetch_add(1, Ordering::Relaxed);
+                            let cur = concurrency.load(Ordering::Relaxed);
+                            if cur > REBALANCE_FETCH_MIN_CONCURRENCY {
+                                let new =
+                                    cur.saturating_sub(1).max(REBALANCE_FETCH_MIN_CONCURRENCY);
+                                concurrency.store(new, Ordering::Relaxed);
+                                // Shrink the semaphore by forgetting a permit
+                                if let Ok(p) = sem.try_acquire() {
+                                    p.forget();
+                                }
+                                // Log unconditionally: gating this behind
+                                // try_acquire hid every decrement in practice.
                                 debug!(
                                     new_concurrency = new,
                                     "[REBALANCE] Reduced fetch concurrency (timeout)"
                                 );
                             }
+                            consecutive_ok.store(0, Ordering::Relaxed);
+                            continue;
                         }
-                        consecutive_ok.store(0, Ordering::Relaxed);
-                        continue;
                     }
                 }
-            }
 
-            if !success {
                 if let Some(ctx) = &shard.erasure_ctx {
                     debug!(
                         shard = hash_short,
                         file_hash = %ctx.file_hash,
                         "Peer fetch failed, attempting local erasure coding recovery"
                     );
-                    if perform_erasure_recovery(&shard.blob_hash_str, ctx, &store, &endpoint).await
+                    if let Some(data) =
+                        perform_erasure_recovery(&shard.blob_hash_str, ctx, &endpoint).await
                     {
-                        success = true;
+                        return Some((data, ShardSource::Erasure));
                     }
                 }
-            }
+                None
+            };
+            let outcome = fetch_under_deadline_then_persist(
+                std::time::Duration::from_secs(REBALANCE_SHARD_FETCH_DEADLINE_SECS),
+                fetch,
+                |data| persist_fetched_shard(store.as_ref(), &shard.blob_hash_str, data),
+            )
+            .await;
+            let success = match outcome {
+                ShardOutcome::Stored(ShardSource::Peer) => {
+                    debug!(shard = hash_short, "[REBALANCE] Fetched shard from peer");
+                    true
+                }
+                ShardOutcome::Stored(ShardSource::Erasure) => {
+                    warn!(
+                        missing_blob_hash = %shard.blob_hash_str,
+                        "[REBALANCE] Successfully reconstructed missing shard via Erasure Coding"
+                    );
+                    true
+                }
+                ShardOutcome::StoreFailed(e) => {
+                    store_failures.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        error = %e,
+                        shard = hash_short,
+                        "[REBALANCE] Failed to store fetched shard"
+                    );
+                    false
+                }
+                ShardOutcome::Unavailable => false,
+                ShardOutcome::DeadlineExpired => {
+                    deadline_shards.fetch_add(1, Ordering::Relaxed);
+                    consecutive_ok.store(0, Ordering::Relaxed);
+                    false
+                }
+            };
+            attempted.fetch_add(1, Ordering::Relaxed);
 
             if success {
                 fetched.fetch_add(1, Ordering::Relaxed);
@@ -1092,19 +1648,108 @@ async fn fetch_missing_shards(
         });
     }
 
-    // Await all tasks
+    // Await all tasks. Each shard's network attempt (peer loop + erasure
+    // fallback) is bounded by REBALANCE_SHARD_FETCH_DEADLINE_SECS, so the
+    // phase cannot wedge on a single hung stream. Only the local store +
+    // inventory insert run past the deadline, and only once bytes are in hand.
     while let Some(result) = join_set.join_next().await {
         if let Err(e) = result {
-            warn!(error = %e, "[REBALANCE] Fetch task panicked");
+            if !e.is_cancelled() {
+                warn!(error = %e, "[REBALANCE] Fetch task panicked");
+            }
         }
     }
+    progress_ticker.abort();
 
     let total_fetched = fetched.load(Ordering::Relaxed);
     let final_concurrency = concurrency.load(Ordering::Relaxed);
-    info!(
-        "[REBALANCE] Fetched {total_fetched}/{total} missing shards (final concurrency={final_concurrency})",
-    );
+    let nf = not_found_events.load(Ordering::Relaxed);
+    let se = stream_error_events.load(Ordering::Relaxed);
+    let dl = deadline_shards.load(Ordering::Relaxed);
+    let sf = store_failures.load(Ordering::Relaxed);
+    if total_fetched == 0 && total >= 50 {
+        warn!(
+            not_found_events = nf,
+            stream_error_events = se,
+            deadline_shards = dl,
+            store_failures = sf,
+            final_concurrency = final_concurrency,
+            "[REBALANCE] Fetched 0/{total} missing shards — no peer returned data",
+        );
+    } else {
+        info!(
+            not_found_events = nf,
+            stream_error_events = se,
+            deadline_shards = dl,
+            store_failures = sf,
+            "[REBALANCE] Fetched {total_fetched}/{total} missing shards (final concurrency={final_concurrency})",
+        );
+    }
     total_fetched
+}
+
+/// Where the fetch phase obtained a shard's bytes; picks the post-store log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShardSource {
+    Peer,
+    Erasure,
+}
+
+/// Terminal state of one shard's fetch-then-persist attempt.
+#[derive(Debug)]
+enum ShardOutcome {
+    /// Bytes obtained within the deadline and persisted.
+    Stored(ShardSource),
+    /// Bytes obtained within the deadline, but the local store rejected them.
+    StoreFailed(std::io::Error),
+    /// Every peer (and erasure recovery) came up empty within the deadline.
+    Unavailable,
+    /// The network phase exceeded the deadline; nothing was written.
+    DeadlineExpired,
+}
+
+/// Bound only the network phase (`fetch`) by `deadline`; once bytes are in
+/// hand, run `persist` to completion. Store and inventory insert are local
+/// disk ops: cancelling between them leaves a blob on disk without an
+/// inventory row, and no later cycle repairs that (`list_hashes` sees the
+/// blob, so the shard is never fetched or inserted again).
+async fn fetch_under_deadline_then_persist<F, P, PF>(
+    deadline: std::time::Duration,
+    fetch: F,
+    persist: P,
+) -> ShardOutcome
+where
+    F: std::future::Future<Output = Option<(Vec<u8>, ShardSource)>>,
+    P: FnOnce(Vec<u8>) -> PF,
+    PF: std::future::Future<Output = std::io::Result<()>>,
+{
+    let (data, source) = match tokio::time::timeout(deadline, fetch).await {
+        Ok(Some(hit)) => hit,
+        Ok(None) => return ShardOutcome::Unavailable,
+        Err(_) => return ShardOutcome::DeadlineExpired,
+    };
+    match persist(data).await {
+        Ok(()) => ShardOutcome::Stored(source),
+        Err(e) => ShardOutcome::StoreFailed(e),
+    }
+}
+
+/// Write a verified shard and record its inventory row. Only the store
+/// failure is surfaced: a missing inventory row is logged, as before.
+async fn persist_fetched_shard(
+    store: &dyn BlobStore,
+    blob_hash_hex: &str,
+    data: Vec<u8>,
+) -> std::io::Result<()> {
+    store.store(blob_hash_hex, &data).await?;
+    if let Err(e) = crate::inventory::insert_shard(blob_hash_hex) {
+        warn!(
+            shard = %&blob_hash_hex[..12.min(blob_hash_hex.len())],
+            error = %e,
+            "inventory: failed to insert rebalance-fetched shard"
+        );
+    }
+    Ok(())
 }
 
 /// Fetch a single manifest from the local iroh-doc replica.
@@ -1371,6 +2016,12 @@ pub async fn reconstruct_shard(
                 None => return Ok(false),
             }
         };
+        let cluster_map: Arc<common::ClusterMap> = if cluster_map.miners.iter().any(|m| m.draining)
+        {
+            Arc::new(common::filter_map_for_placement(&cluster_map))
+        } else {
+            cluster_map
+        };
         let placement_versions_to_try =
             repair_placement_versions_to_try(manifest.placement_version);
 
@@ -1515,6 +2166,14 @@ pub async fn reconstruct_shard(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to store reconstructed shard: {}", e))?;
 
+    if let Err(e) = crate::inventory::insert_shard(&shard_hash_hex) {
+        warn!(
+            shard = %&shard_hash_hex[..12],
+            error = %e,
+            "inventory: failed to insert reconstructed shard"
+        );
+    }
+
     // 6. Return Ok(true) if successful
     warn!(
         shard = %&shard_hash.to_string()[..12],
@@ -1527,19 +2186,21 @@ pub async fn reconstruct_shard(
     Ok(true)
 }
 
+/// Fetch sibling shards and reconstruct `missing_blob_hash` via RS decode.
+/// Returns the verified bytes; the caller persists them outside the
+/// per-shard fetch deadline (see `fetch_under_deadline_then_persist`).
 async fn perform_erasure_recovery(
     missing_blob_hash: &str,
     ctx: &ErasureRecoveryCtx,
-    store: &Arc<dyn BlobStore>,
     endpoint: &quinn::Endpoint,
-) -> bool {
+) -> Option<Vec<u8>> {
     let k = ctx.stripe_config.k;
     let m = ctx.stripe_config.m;
     let total_shards = k + m;
 
     if ctx.stripe_shard_hashes.len() != total_shards {
         error!("Erasure recovery failed: mismatch in stripe_shard_hashes length");
-        return false;
+        return None;
     }
 
     // We need exactly 'k' distinct valid shards to reconstruct.
@@ -1551,8 +2212,29 @@ async fn perform_erasure_recovery(
         std::time::Duration::from_secs(crate::constants::REBALANCE_PEER_CONNECT_TIMEOUT_SECS);
     let read_timeout = std::time::Duration::from_secs(crate::constants::DEFAULT_READ_TIMEOUT_SECS);
 
+    // Merge current-map assignees with upload-era assignees. For files
+    // placed before the lookback window the current holders are usually
+    // empty; the upload-era nodes are the plausible source of surviving
+    // siblings. Deduped per position by node key; upload-era endpoints were
+    // re-resolved against the current map at ctx construction.
+    let mut candidates: Vec<(usize, common::MinerNode)> = Vec::new();
     for (idx, miner) in ctx.stripe_miners.iter().enumerate() {
-        if idx == ctx.local_idx {
+        candidates.push((idx, miner.clone()));
+    }
+    if let Some(era) = &ctx.upload_era_stripe_miners {
+        for (idx, miner) in era.iter().enumerate() {
+            let dup = ctx
+                .stripe_miners
+                .get(idx)
+                .map(|cur| cur.public_key == miner.public_key)
+                .unwrap_or(false);
+            if !dup {
+                candidates.push((idx, miner.clone()));
+            }
+        }
+    }
+    for (idx, miner) in candidates {
+        if idx == ctx.local_idx || idx >= total_shards {
             continue;
         }
 
@@ -1624,6 +2306,11 @@ async fn perform_erasure_recovery(
 
     while let Some(res) = fetch_tasks.join_next().await {
         if let Ok((idx, Some(data))) = res {
+            if shards[idx].is_some() {
+                // Both the current-map and the upload-era holder answered
+                // for this position; count it once toward k.
+                continue;
+            }
             shards[idx] = Some(data);
             fetched_count += 1;
 
@@ -1636,11 +2323,14 @@ async fn perform_erasure_recovery(
     }
 
     if fetched_count < k {
-        debug!(
+        // WARN, not debug: a systemic recovery outage (peers no longer
+        // holding siblings) is otherwise invisible at default log levels
+        // while the store silently loses redundancy.
+        warn!(
             missing_blob_hash,
             fetched_count, k, "[REBALANCE] Erasure recovery failed: not enough shards fetched"
         );
-        return false;
+        return None;
     }
 
     // Now reconstruct
@@ -1657,41 +2347,241 @@ async fn perform_erasure_recovery(
                 // Verify hash
                 let computed = blake3::hash(&recovered_bytes);
                 if computed.to_hex().as_str() == missing_blob_hash {
-                    if let Err(e) = store.store(missing_blob_hash, &recovered_bytes).await {
-                        error!(error = %e, "[REBALANCE] Failed to store reconstructed shard");
-                        return false;
-                    }
-                    warn!(
-                        missing_blob_hash,
-                        "[REBALANCE] Successfully reconstructed missing shard via Erasure Coding"
-                    );
-                    true
+                    Some(recovered_bytes)
                 } else {
                     error!(
                         expected = %missing_blob_hash,
                         computed = %computed.to_hex(),
                         "[REBALANCE] Reconstructed shard hash mismatch"
                     );
-                    false
+                    None
                 }
             } else {
                 error!("[REBALANCE] Reconstructed shard was missing from decode output");
-                false
+                None
             }
         }
         Err(e) => {
             error!(error = %e, "[REBALANCE] Erasure decode failed");
-            false
+            None
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::repair_placement_versions_to_try;
+    use super::{
+        PgSweep, ShardOutcome, ShardSource, fetch_under_deadline_then_persist, manifest_is_gapped,
+        manifest_stripe_count, repair_placement_versions_to_try,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    fn shard(index: usize) -> common::ShardInfo {
+        common::ShardInfo {
+            index,
+            blob_hash: format!("{index:064x}"),
+        }
+    }
 
     #[test]
     fn test_miner_repair_probes_fallback_versions_for_mistagged_v3_manifests() {
         assert_eq!(repair_placement_versions_to_try(3), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn test_gapped_manifest_detected_and_tail_stripes_kept() {
+        // Width-3 stripes; the shard at index 2 failed at upload, so the
+        // manifest lists indexes [0, 1, 3, 4, 5]: every entry after the
+        // gap sits at a vec position one below its true index.
+        let shards: Vec<_> = [0usize, 1, 3, 4, 5].into_iter().map(shard).collect();
+        assert!(manifest_is_gapped(&shards));
+        assert_eq!(manifest_stripe_count(&shards, 3), 2);
+
+        // Only one shard of the third stripe survived the upload; the vec
+        // length (1) says nothing about how many stripes the file has.
+        let tail_only = vec![shard(7)];
+        assert!(manifest_is_gapped(&tail_only));
+        assert_eq!(manifest_stripe_count(&tail_only, 3), 3);
+    }
+
+    #[test]
+    fn test_clean_manifest_is_not_gapped() {
+        let shards: Vec<_> = (0usize..6).map(shard).collect();
+        assert!(!manifest_is_gapped(&shards));
+        assert_eq!(manifest_stripe_count(&shards, 3), 2);
+        assert_eq!(manifest_stripe_count(&[], 3), 0);
+    }
+
+    const DEADLINE: Duration = Duration::from_millis(50);
+
+    // Regression: the per-shard deadline must bound only the network fetch.
+    // A store slower than the deadline still runs to completion, so the
+    // deadline cannot leave a blob on disk without its inventory row.
+    #[tokio::test]
+    async fn persist_runs_to_completion_outside_the_fetch_deadline() {
+        let persisted = Arc::new(AtomicBool::new(false));
+        let flag = persisted.clone();
+        let outcome = fetch_under_deadline_then_persist(
+            DEADLINE,
+            async { Some((vec![1u8, 2, 3], ShardSource::Erasure)) },
+            |data| async move {
+                tokio::time::sleep(DEADLINE * 4).await;
+                assert_eq!(data, vec![1, 2, 3]);
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            ShardOutcome::Stored(ShardSource::Erasure)
+        ));
+        assert!(persisted.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn deadline_expiry_counts_as_timeout_and_never_persists() {
+        let persisted = Arc::new(AtomicBool::new(false));
+        let flag = persisted.clone();
+        let outcome = fetch_under_deadline_then_persist(
+            DEADLINE,
+            std::future::pending::<Option<(Vec<u8>, ShardSource)>>(),
+            |_data| async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(matches!(outcome, ShardOutcome::DeadlineExpired));
+        assert!(!persisted.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn store_failure_is_reported_as_such_not_as_timeout() {
+        let outcome = fetch_under_deadline_then_persist(
+            DEADLINE,
+            async { Some((vec![9u8], ShardSource::Peer)) },
+            |_data| async move { Err(std::io::Error::other("disk full")) },
+        )
+        .await;
+        assert!(matches!(outcome, ShardOutcome::StoreFailed(_)));
+    }
+
+    fn pg_files(pg: u32, n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{pg}-{i:05}")).collect()
+    }
+
+    /// One rebalance cycle's query loop over a simulated validator, as
+    /// driven by `self_rebalance_pg`: carried files first, then chunks
+    /// until the budget is covered or the whole assignment was consumed.
+    fn run_cycle(
+        sweep: &mut PgSweep,
+        pgs: &[u32],
+        budget: usize,
+        chunk_size: usize,
+        validator: &mut impl FnMut(&[u32]) -> HashMap<u32, Vec<String>>,
+    ) -> (Vec<String>, Vec<Vec<u32>>) {
+        let mut out = Vec::new();
+        let mut requested = Vec::new();
+        sweep.take(&mut out, budget);
+        let mut queried = 0;
+        while queried < pgs.len() && out.len() < budget {
+            let chunk = sweep
+                .next_chunk(pgs, chunk_size.min(pgs.len() - queried))
+                .to_vec();
+            requested.push(chunk.clone());
+            let response = validator(&chunk);
+            queried += sweep.absorb(pgs, &chunk, response);
+            sweep.take(&mut out, budget);
+        }
+        (out, requested)
+    }
+
+    // Regression: a PG denser than the cycle budget used to be marked
+    // consumed after its first 1000 files; the next visit restarted from
+    // the same prefix and the tail was never checked.
+    #[test]
+    fn pg_sweep_continues_dense_pg_across_cycles_without_loss() {
+        let pgs = [7u32, 8, 9, 10];
+        let table: HashMap<u32, Vec<String>> = [
+            (7, pg_files(7, 2500)),
+            (9, pg_files(9, 10)),
+            (10, pg_files(10, 300)),
+        ]
+        .into_iter()
+        .collect();
+        // Like the real validator: empty PGs are omitted from the response.
+        let mut validator = |chunk: &[u32]| -> HashMap<u32, Vec<String>> {
+            chunk
+                .iter()
+                .filter_map(|pg| table.get(pg).map(|f| (*pg, f.clone())))
+                .collect()
+        };
+
+        let mut sweep = PgSweep::new();
+        let mut seen: Vec<String> = Vec::new();
+        let mut requests: Vec<Vec<u32>> = Vec::new();
+        for _ in 0..3 {
+            let (out, req) = run_cycle(&mut sweep, &pgs, 1000, 2, &mut validator);
+            assert!(out.len() <= 1000);
+            seen.extend(out);
+            requests.extend(req);
+        }
+
+        // The first sweep covers all 2810 files exactly once; cycle 3 then
+        // wraps into the second sweep and starts PG 7 over.
+        let mut expected: Vec<String> = table.values().flatten().cloned().collect();
+        expected.sort();
+        let mut got = seen[..2810].to_vec();
+        got.sort();
+        assert_eq!(got, expected, "every file seen exactly once over the sweep");
+        assert_eq!(seen[2810..], pg_files(7, 190)[..]);
+        // Cycle 2 was served entirely from the carry: no query issued.
+        // Empty PG 8 sat above the highest returned PG in its first chunk,
+        // so it was re-requested; PG 10 was never split across the wrap;
+        // the second sweep's chunk was clipped to the one PG left in the
+        // cycle's rotation, so PG 8 was not requested twice in cycle 3.
+        assert_eq!(requests, vec![vec![7, 8], vec![8, 9], vec![10], vec![7]]);
+        assert_eq!(sweep.cursor, 1);
+        assert_eq!(sweep.carry.len(), 1);
+        assert_eq!(sweep.carry[0].1, pg_files(7, 2500)[190..]);
+    }
+
+    // The compatible validator drops the highest PG ids from an oversized
+    // response without any marker: such a PG must not be consumed.
+    #[test]
+    fn pg_sweep_re_requests_pg_dropped_from_response() {
+        let pgs = [1u32, 2, 3];
+        let table: HashMap<u32, Vec<String>> =
+            pgs.iter().map(|pg| (*pg, pg_files(*pg, 5))).collect();
+        let mut first = true;
+        let mut validator = |chunk: &[u32]| -> HashMap<u32, Vec<String>> {
+            let mut resp: HashMap<u32, Vec<String>> =
+                chunk.iter().map(|pg| (*pg, table[pg].clone())).collect();
+            if std::mem::take(&mut first) {
+                resp.remove(&3); // truncated away by the validator
+            }
+            resp
+        };
+
+        let mut sweep = PgSweep::new();
+        let (out1, req1) = run_cycle(&mut sweep, &pgs, 100, 3, &mut validator);
+        assert_eq!(req1, vec![vec![1, 2, 3], vec![3]]);
+        assert_eq!(out1.len(), 15);
+        let mut got = out1;
+        got.sort();
+        let mut expected: Vec<String> = table.values().flatten().cloned().collect();
+        expected.sort();
+        assert_eq!(got, expected);
+
+        // An entirely empty response means every requested PG is empty.
+        let mut empty = |_: &[u32]| HashMap::new();
+        let (out2, req2) = run_cycle(&mut sweep, &pgs, 100, 2, &mut empty);
+        assert!(out2.is_empty());
+        assert_eq!(req2, vec![vec![1, 2], vec![3]]);
+        assert_eq!(sweep.cursor, 0);
     }
 }

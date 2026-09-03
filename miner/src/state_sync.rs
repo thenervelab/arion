@@ -20,7 +20,7 @@ struct SyncSource {
 
 pub async fn run_state_sync_loop() {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-    
+
     loop {
         interval.tick().await;
 
@@ -42,7 +42,7 @@ pub async fn run_state_sync_loop() {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 if let Some(name) = entry.file_name().to_str() {
                     if name.starts_with("epoch_") && name.ends_with(".json") {
-                        if let Ok(epoch) = name[6..name.len()-5].parse::<u64>() {
+                        if let Ok(epoch) = name[6..name.len() - 5].parse::<u64>() {
                             if epoch > highest_epoch {
                                 highest_epoch = epoch;
                             }
@@ -51,9 +51,16 @@ pub async fn run_state_sync_loop() {
                 }
             }
         }
-        
-        let start_sync_from = if highest_epoch > 0 { highest_epoch + 1 } else { 0 };
-        info!(highest_epoch_on_disk = highest_epoch, start_sync_from, "Archive directory scanned");
+
+        let start_sync_from = if highest_epoch > 0 {
+            highest_epoch + 1
+        } else {
+            0
+        };
+        info!(
+            highest_epoch_on_disk = highest_epoch,
+            start_sync_from, "Archive directory scanned"
+        );
 
         let first_missing_epoch = start_sync_from;
 
@@ -64,20 +71,24 @@ pub async fn run_state_sync_loop() {
                 map.epoch
             } else {
                 debug!("State sync: waiting for cluster map...");
-                continue; 
+                continue;
             }
         };
 
         if first_missing_epoch >= target_epoch {
             // Fully synced!
-            crate::state::get_is_historical_seeder().store(true, std::sync::atomic::Ordering::Relaxed);
-            debug!(first_missing_epoch, target_epoch, "State sync: already up to date");
-            continue; 
+            crate::state::get_is_historical_seeder()
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            debug!(
+                first_missing_epoch,
+                target_epoch, "State sync: already up to date"
+            );
+            continue;
         }
 
         info!(
-            first_missing_epoch, target_epoch,
-            "Missing historical epochs. Starting state sync..."
+            first_missing_epoch,
+            target_epoch, "Missing historical epochs. Starting state sync..."
         );
 
         if let Err(e) = perform_state_sync(first_missing_epoch, target_epoch, archive_dir).await {
@@ -151,7 +162,9 @@ async fn perform_state_sync_from_source(
 
     loop {
         let mut magic_buf = [0u8; 4];
-        recv.read_exact(&mut magic_buf).await.context("read_magic")?;
+        recv.read_exact(&mut magic_buf)
+            .await
+            .context("read_magic")?;
         let magic = u32::from_be_bytes(magic_buf);
 
         if magic == 0x454F4621 {
@@ -167,12 +180,18 @@ async fn perform_state_sync_from_source(
         }
 
         let mut epoch_buf = [0u8; 8];
-        recv.read_exact(&mut epoch_buf).await.context("read_epoch")?;
+        recv.read_exact(&mut epoch_buf)
+            .await
+            .context("read_epoch")?;
         let epoch = u64::from_be_bytes(epoch_buf);
 
         let mut skip_hash_check = false;
         if epoch < current_epoch {
-            anyhow::bail!("Expected epoch {}, but received older epoch {}", current_epoch, epoch);
+            anyhow::bail!(
+                "Expected epoch {}, but received older epoch {}",
+                current_epoch,
+                epoch
+            );
         } else if epoch > current_epoch {
             warn!(
                 expected_epoch = current_epoch,
@@ -211,7 +230,10 @@ async fn perform_state_sync_from_source(
             }
         }
 
-        let validator_pk = crate::state::get_validator_node_id_global().read().await.clone();
+        let validator_pk = crate::state::get_validator_node_id_global()
+            .read()
+            .await
+            .clone();
         if !validator_pk.is_empty() {
             if let Some(sig_hex) = &map.signature {
                 use ed25519_dalek::Verifier;
@@ -242,8 +264,12 @@ async fn perform_state_sync_from_source(
         let path = archive_dir.join(format!("epoch_{}.json", epoch));
         let mut tmp_path = path.clone();
         tmp_path.set_extension("json.tmp");
-        tokio::fs::write(&tmp_path, &map_bytes).await.context("write_map")?;
-        tokio::fs::rename(&tmp_path, &path).await.context("rename_map")?;
+        tokio::fs::write(&tmp_path, &map_bytes)
+            .await
+            .context("write_map")?;
+        tokio::fs::rename(&tmp_path, &path)
+            .await
+            .context("rename_map")?;
 
         expected_previous_hash = map.compute_hash();
         current_epoch += 1;
@@ -264,7 +290,10 @@ async fn find_sync_sources() -> Result<Vec<SyncSource>> {
         None => anyhow::bail!("No cluster map available"),
     };
     let val_addr = *crate::state::get_validator_addr().read().await;
-    let val_id = crate::state::get_validator_node_id_global().read().await.clone();
+    let val_id = crate::state::get_validator_node_id_global()
+        .read()
+        .await
+        .clone();
     let sources = build_sync_sources(map, &val_id, val_addr);
     if sources.is_empty() {
         anyhow::bail!("No seeders available and validator unreachable");
@@ -362,6 +391,9 @@ mod tests {
             trust_score: 0.0,
             earned_capacity_bytes: 0,
             draining: false,
+            drained_for_offline: false,
+            placement_hold: false,
+            placement_hold_base_hb: 0,
             p2p_reliability_score: 1.0,
             balancer_reweight: 1.0,
         }
