@@ -1398,6 +1398,11 @@ fn manifest_stripe_count(shards: &[common::ShardInfo], shards_per_stripe: usize)
         .unwrap_or(0)
 }
 
+/// Peers that failed to connect or errored mid-stream during the current
+/// fetch phase; skipped for the rest of it by the direct loop and erasure
+/// recovery alike. Discarded with the phase.
+type DeadPeers = Arc<Mutex<std::collections::HashSet<String>>>;
+
 /// Concurrently fetch missing shards from peer miners with adaptive throttling.
 ///
 /// Uses a local semaphore (separate from `fetch_sem` used for inbound FetchBlob)
@@ -1405,6 +1410,8 @@ fn manifest_stripe_count(shards: &[common::ShardInfo], shards_per_stripe: usize)
 /// - On timeout/failure: reduce concurrency by 1 (floor: `REBALANCE_FETCH_MIN_CONCURRENCY`)
 /// - On `REBALANCE_FETCH_SCALEUP_THRESHOLD` consecutive successes: increase by 1
 ///   (ceiling: `REBALANCE_FETCH_MAX_CONCURRENCY`)
+///
+/// Peers that fail this phase are skipped for the rest of it (see `DeadPeers`).
 ///
 /// Returns the number of shards successfully fetched.
 async fn fetch_missing_shards(
@@ -1425,6 +1432,9 @@ async fn fetch_missing_shards(
     let stream_error_events = Arc::new(AtomicUsize::new(0));
     let deadline_shards = Arc::new(AtomicUsize::new(0));
     let store_failures = Arc::new(AtomicUsize::new(0));
+    let connect_fail_events = Arc::new(AtomicUsize::new(0));
+    let skipped_dead_events = Arc::new(AtomicUsize::new(0));
+    let dead_peers: DeadPeers = Arc::new(Mutex::new(std::collections::HashSet::new()));
 
     // Local semaphore — separate from the inbound fetch_sem
     let sem = Arc::new(Semaphore::new(REBALANCE_FETCH_CONCURRENCY));
@@ -1474,6 +1484,9 @@ async fn fetch_missing_shards(
         let stream_error_events = stream_error_events.clone();
         let deadline_shards = deadline_shards.clone();
         let store_failures = store_failures.clone();
+        let connect_fail_events = connect_fail_events.clone();
+        let skipped_dead_events = skipped_dead_events.clone();
+        let dead_peers = dead_peers.clone();
         let store = Arc::clone(store);
         let endpoint = endpoint.clone();
 
@@ -1494,6 +1507,14 @@ async fn fetch_missing_shards(
             let fetch = async {
                 // Try each peer until one returns bytes that verify
                 for (peer_node_id, peer_addr) in &shard.peer_endpoints {
+                    let is_dead = dead_peers
+                        .lock()
+                        .map(|s| s.contains(peer_node_id))
+                        .unwrap_or(false);
+                    if is_dead {
+                        skipped_dead_events.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     let conn = match tokio::time::timeout(
                         connect_timeout,
                         crate::state::get_pooled_connection(&endpoint, peer_node_id, *peer_addr),
@@ -1501,7 +1522,13 @@ async fn fetch_missing_shards(
                     .await
                     {
                         Ok(Ok(c)) => c,
-                        _ => continue,
+                        _ => {
+                            connect_fail_events.fetch_add(1, Ordering::Relaxed);
+                            if let Ok(mut set) = dead_peers.lock() {
+                                set.insert(peer_node_id.clone());
+                            }
+                            continue;
+                        }
                     };
 
                     let request = common::MinerControlMessage::FetchBlob {
@@ -1569,6 +1596,9 @@ async fn fetch_missing_shards(
                                 );
                             }
                             consecutive_ok.store(0, Ordering::Relaxed);
+                            if let Ok(mut set) = dead_peers.lock() {
+                                set.insert(peer_node_id.clone());
+                            }
                             continue;
                         }
                     }
@@ -1581,7 +1611,8 @@ async fn fetch_missing_shards(
                         "Peer fetch failed, attempting local erasure coding recovery"
                     );
                     if let Some(data) =
-                        perform_erasure_recovery(&shard.blob_hash_str, ctx, &endpoint).await
+                        perform_erasure_recovery(&shard.blob_hash_str, ctx, &endpoint, &dead_peers)
+                            .await
                     {
                         return Some((data, ShardSource::Erasure));
                     }
@@ -1667,10 +1698,16 @@ async fn fetch_missing_shards(
     let se = stream_error_events.load(Ordering::Relaxed);
     let dl = deadline_shards.load(Ordering::Relaxed);
     let sf = store_failures.load(Ordering::Relaxed);
+    let cf = connect_fail_events.load(Ordering::Relaxed);
+    let sd = skipped_dead_events.load(Ordering::Relaxed);
+    let dp = dead_peers.lock().map(|s| s.len()).unwrap_or(0);
     if total_fetched == 0 && total >= 50 {
         warn!(
             not_found_events = nf,
             stream_error_events = se,
+            connect_fail_events = cf,
+            skipped_dead_peer_events = sd,
+            dead_peers = dp,
             deadline_shards = dl,
             store_failures = sf,
             final_concurrency = final_concurrency,
@@ -1680,6 +1717,9 @@ async fn fetch_missing_shards(
         info!(
             not_found_events = nf,
             stream_error_events = se,
+            connect_fail_events = cf,
+            skipped_dead_peer_events = sd,
+            dead_peers = dp,
             deadline_shards = dl,
             store_failures = sf,
             "[REBALANCE] Fetched {total_fetched}/{total} missing shards (final concurrency={final_concurrency})",
@@ -2189,10 +2229,12 @@ pub async fn reconstruct_shard(
 /// Fetch sibling shards and reconstruct `missing_blob_hash` via RS decode.
 /// Returns the verified bytes; the caller persists them outside the
 /// per-shard fetch deadline (see `fetch_under_deadline_then_persist`).
+/// Dead siblings (see `DeadPeers`) are not dialed; failures mark them dead.
 async fn perform_erasure_recovery(
     missing_blob_hash: &str,
     ctx: &ErasureRecoveryCtx,
     endpoint: &quinn::Endpoint,
+    dead_peers: &DeadPeers,
 ) -> Option<Vec<u8>> {
     let k = ctx.stripe_config.k;
     let m = ctx.stripe_config.m;
@@ -2247,7 +2289,15 @@ async fn perform_erasure_recovery(
             Some(h) => h.clone(),
             None => continue,
         };
+        let is_dead = dead_peers
+            .lock()
+            .map(|s| s.contains(&peer_node_id))
+            .unwrap_or(false);
+        if is_dead {
+            continue;
+        }
         let endpoint_clone = endpoint.clone();
+        let dead_peers = Arc::clone(dead_peers);
 
         fetch_tasks.spawn(async move {
             let conn = match tokio::time::timeout(
@@ -2257,7 +2307,12 @@ async fn perform_erasure_recovery(
             .await
             {
                 Ok(Ok(c)) => c,
-                _ => return (idx, None),
+                _ => {
+                    if let Ok(mut set) = dead_peers.lock() {
+                        set.insert(peer_node_id.clone());
+                    }
+                    return (idx, None);
+                }
             };
 
             let request = common::MinerControlMessage::FetchBlob {
@@ -2296,7 +2351,13 @@ async fn perform_erasure_recovery(
                         (idx, None)
                     }
                 }
-                _ => (idx, None),
+                Ok(None) => (idx, None),
+                Err(_) => {
+                    if let Ok(mut set) = dead_peers.lock() {
+                        set.insert(peer_node_id.clone());
+                    }
+                    (idx, None)
+                }
             }
         });
     }
