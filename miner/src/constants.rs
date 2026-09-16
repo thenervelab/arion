@@ -292,8 +292,13 @@ pub const REBALANCE_FETCH_MAX_CONCURRENCY: usize = 16;
 /// Min concurrent shard fetches (adaptive floor)
 pub const REBALANCE_FETCH_MIN_CONCURRENCY: usize = 1;
 
-/// Number of consecutive successes before increasing rebalance fetch concurrency
+/// Consecutive cleanly resolved shards (fetched, or "not found" everywhere
+/// without a stream error) before increasing rebalance fetch concurrency.
 pub const REBALANCE_FETCH_SCALEUP_THRESHOLD: usize = 5;
+
+/// Consecutive shards hitting a stream error or the per-shard deadline
+/// before decreasing rebalance fetch concurrency.
+pub const REBALANCE_FETCH_SCALEDOWN_THRESHOLD: usize = 2;
 
 /// How often the fetch phase logs a progress line at info. Without it a
 /// failing fetch phase is indistinguishable from a hung one: every failure
