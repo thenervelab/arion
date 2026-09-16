@@ -27,6 +27,10 @@ const TRASH_DIR: &str = "trash";
 /// Directory for in-flight writes (crash leftovers are purged on startup).
 const TMP_DIR: &str = ".tmp";
 
+/// Per-process sequence for temp-file names, so concurrent stores of one
+/// hash never share a temp file.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Simple sharded-file blob store.
 #[derive(Debug)]
 pub struct FlatBlobStore {
@@ -251,7 +255,11 @@ impl FlatBlobStore {
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let tmp = self.tmp_dir.join(format!("{hash_hex}.part"));
+        // Unique per write; a later rename replaces identical bytes.
+        let tmp = self.tmp_dir.join(format!(
+            "{hash_hex}.{}.part",
+            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
 
         let existing_size = match self.locate(hash_hex) {
             Some(p) => tokio::fs::metadata(&p).await.map(|m| m.len()).unwrap_or(0),
@@ -639,6 +647,18 @@ fn is_out_of_space(e: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn concurrent_stores_of_the_same_hash_both_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FlatBlobStore::new(dir.path()).unwrap();
+        let h = "9670450a4602c0e98665f6767b17d18c4cfc8c00ae40372949cf7896579d1238";
+        let data = vec![7u8; 4096];
+        // Overlapping stores of one hash used to share `.tmp/<hash>.part`.
+        let (a, b) = tokio::join!(store.store(h, &data), store.store(h, &data));
+        assert!(a.is_ok() && b.is_ok(), "{a:?} {b:?}");
+        assert!(store.has(h));
+    }
 
     #[test]
     fn out_of_space_matches_enospc_and_edquot_only() {
