@@ -30,8 +30,8 @@ use crate::constants::{
     MAX_CONSECUTIVE_BATCH_FAILURES, MAX_CONSECUTIVE_MANIFEST_FAILURES, MAX_PG_BATCH_FILE_ENTRIES,
     PG_BATCH_CHUNK_SIZE, REBALANCE_FETCH_CONCURRENCY, REBALANCE_FETCH_MAX_CONCURRENCY,
     REBALANCE_FETCH_MIN_CONCURRENCY, REBALANCE_FETCH_PROGRESS_SECS,
-    REBALANCE_FETCH_SCALEUP_THRESHOLD, REBALANCE_MAX_FILES_PER_CYCLE,
-    REBALANCE_SHARD_FETCH_DEADLINE_SECS,
+    REBALANCE_FETCH_SCALEDOWN_THRESHOLD, REBALANCE_FETCH_SCALEUP_THRESHOLD,
+    REBALANCE_MAX_FILES_PER_CYCLE, REBALANCE_SHARD_FETCH_DEADLINE_SECS,
 };
 use crate::state::{
     get_cluster_map, get_validator_addr, get_validator_node_id_global, get_validator_reachable,
@@ -1398,13 +1398,39 @@ fn manifest_stripe_count(shards: &[common::ShardInfo], shards_per_stripe: usize)
         .unwrap_or(0)
 }
 
+/// Adaptive fetch-concurrency step, decided once per resolved shard: `1`
+/// after `REBALANCE_FETCH_SCALEUP_THRESHOLD` consecutive clean shards, `-1`
+/// after `REBALANCE_FETCH_SCALEDOWN_THRESHOLD` consecutive erroring ones,
+/// `0` otherwise. Each streak resets the other.
+fn fetch_concurrency_step(
+    clean: bool,
+    consecutive_ok: &AtomicUsize,
+    consecutive_err: &AtomicUsize,
+) -> i8 {
+    if clean {
+        consecutive_err.store(0, Ordering::Relaxed);
+        let streak = consecutive_ok.fetch_add(1, Ordering::Relaxed) + 1;
+        if streak >= REBALANCE_FETCH_SCALEUP_THRESHOLD {
+            consecutive_ok.store(0, Ordering::Relaxed);
+            return 1;
+        }
+    } else {
+        consecutive_ok.store(0, Ordering::Relaxed);
+        let streak = consecutive_err.fetch_add(1, Ordering::Relaxed) + 1;
+        if streak >= REBALANCE_FETCH_SCALEDOWN_THRESHOLD {
+            consecutive_err.store(0, Ordering::Relaxed);
+            return -1;
+        }
+    }
+    0
+}
+
 /// Concurrently fetch missing shards from peer miners with adaptive throttling.
 ///
 /// Uses a local semaphore (separate from `fetch_sem` used for inbound FetchBlob)
-/// to bound concurrency. Starts at `REBALANCE_FETCH_CONCURRENCY` and adapts:
-/// - On timeout/failure: reduce concurrency by 1 (floor: `REBALANCE_FETCH_MIN_CONCURRENCY`)
-/// - On `REBALANCE_FETCH_SCALEUP_THRESHOLD` consecutive successes: increase by 1
-///   (ceiling: `REBALANCE_FETCH_MAX_CONCURRENCY`)
+/// to bound concurrency. Starts at `REBALANCE_FETCH_CONCURRENCY` and adapts once
+/// per resolved shard (see `fetch_concurrency_step`), between
+/// `REBALANCE_FETCH_MIN_CONCURRENCY` and `REBALANCE_FETCH_MAX_CONCURRENCY`.
 ///
 /// Returns the number of shards successfully fetched.
 async fn fetch_missing_shards(
@@ -1419,6 +1445,7 @@ async fn fetch_missing_shards(
     let total = missing.len();
     let concurrency = Arc::new(AtomicUsize::new(REBALANCE_FETCH_CONCURRENCY));
     let consecutive_ok = Arc::new(AtomicUsize::new(0));
+    let consecutive_err = Arc::new(AtomicUsize::new(0));
     let fetched = Arc::new(AtomicUsize::new(0));
     let attempted = Arc::new(AtomicUsize::new(0));
     let not_found_events = Arc::new(AtomicUsize::new(0));
@@ -1468,6 +1495,7 @@ async fn fetch_missing_shards(
         let sem = sem.clone();
         let concurrency = concurrency.clone();
         let consecutive_ok = consecutive_ok.clone();
+        let consecutive_err = consecutive_err.clone();
         let fetched = fetched.clone();
         let attempted = attempted.clone();
         let not_found_events = not_found_events.clone();
@@ -1491,6 +1519,7 @@ async fn fetch_missing_shards(
             // the store and the inventory insert: `fetch` only yields
             // verified bytes, and `fetch_under_deadline_then_persist` writes
             // them once the deadline no longer applies.
+            let had_stream_error = std::sync::atomic::AtomicBool::new(false);
             let fetch = async {
                 // Try each peer until one returns bytes that verify
                 for (peer_node_id, peer_addr) in &shard.peer_endpoints {
@@ -1550,25 +1579,9 @@ async fn fetch_missing_shards(
                             continue;
                         }
                         Err(_) => {
-                            // Timeout or error — adaptive: reduce concurrency
+                            // Timeout or error; concurrency adapts per shard below.
                             stream_error_events.fetch_add(1, Ordering::Relaxed);
-                            let cur = concurrency.load(Ordering::Relaxed);
-                            if cur > REBALANCE_FETCH_MIN_CONCURRENCY {
-                                let new =
-                                    cur.saturating_sub(1).max(REBALANCE_FETCH_MIN_CONCURRENCY);
-                                concurrency.store(new, Ordering::Relaxed);
-                                // Shrink the semaphore by forgetting a permit
-                                if let Ok(p) = sem.try_acquire() {
-                                    p.forget();
-                                }
-                                // Log unconditionally: gating this behind
-                                // try_acquire hid every decrement in practice.
-                                debug!(
-                                    new_concurrency = new,
-                                    "[REBALANCE] Reduced fetch concurrency (timeout)"
-                                );
-                            }
-                            consecutive_ok.store(0, Ordering::Relaxed);
+                            had_stream_error.store(true, Ordering::Relaxed);
                             continue;
                         }
                     }
@@ -1594,17 +1607,17 @@ async fn fetch_missing_shards(
                 |data| persist_fetched_shard(store.as_ref(), &shard.blob_hash_str, data),
             )
             .await;
-            let success = match outcome {
+            let (success, deadline_expired) = match outcome {
                 ShardOutcome::Stored(ShardSource::Peer) => {
                     debug!(shard = hash_short, "[REBALANCE] Fetched shard from peer");
-                    true
+                    (true, false)
                 }
                 ShardOutcome::Stored(ShardSource::Erasure) => {
                     warn!(
                         missing_blob_hash = %shard.blob_hash_str,
                         "[REBALANCE] Successfully reconstructed missing shard via Erasure Coding"
                     );
-                    true
+                    (true, false)
                 }
                 ShardOutcome::StoreFailed(e) => {
                     store_failures.fetch_add(1, Ordering::Relaxed);
@@ -1613,23 +1626,24 @@ async fn fetch_missing_shards(
                         shard = hash_short,
                         "[REBALANCE] Failed to store fetched shard"
                     );
-                    false
+                    (false, false)
                 }
-                ShardOutcome::Unavailable => false,
+                ShardOutcome::Unavailable => (false, false),
                 ShardOutcome::DeadlineExpired => {
                     deadline_shards.fetch_add(1, Ordering::Relaxed);
-                    consecutive_ok.store(0, Ordering::Relaxed);
-                    false
+                    (false, true)
                 }
             };
             attempted.fetch_add(1, Ordering::Relaxed);
-
             if success {
                 fetched.fetch_add(1, Ordering::Relaxed);
-                let streak = consecutive_ok.fetch_add(1, Ordering::Relaxed) + 1;
-                // Adaptive scale-up after consecutive successes
-                if streak >= REBALANCE_FETCH_SCALEUP_THRESHOLD {
-                    consecutive_ok.store(0, Ordering::Relaxed);
+            }
+
+            // Clean = fetched, or no stream error and no deadline: a definitive
+            // "not found" everywhere is a cheap answer, not overload.
+            let clean = success || (!deadline_expired && !had_stream_error.load(Ordering::Relaxed));
+            match fetch_concurrency_step(clean, &consecutive_ok, &consecutive_err) {
+                1 => {
                     let cur = concurrency.load(Ordering::Relaxed);
                     if cur < REBALANCE_FETCH_MAX_CONCURRENCY {
                         let new = (cur + 1).min(REBALANCE_FETCH_MAX_CONCURRENCY);
@@ -1638,12 +1652,26 @@ async fn fetch_missing_shards(
                         sem.add_permits(1);
                         debug!(
                             new_concurrency = new,
-                            "[REBALANCE] Increased fetch concurrency (streak)"
+                            "[REBALANCE] Increased fetch concurrency (clean streak)"
                         );
                     }
                 }
-            } else {
-                consecutive_ok.store(0, Ordering::Relaxed);
+                -1 => {
+                    let cur = concurrency.load(Ordering::Relaxed);
+                    if cur > REBALANCE_FETCH_MIN_CONCURRENCY {
+                        let new = cur.saturating_sub(1).max(REBALANCE_FETCH_MIN_CONCURRENCY);
+                        concurrency.store(new, Ordering::Relaxed);
+                        // Shrink the semaphore by forgetting a permit
+                        if let Ok(p) = sem.try_acquire() {
+                            p.forget();
+                        }
+                        debug!(
+                            new_concurrency = new,
+                            "[REBALANCE] Reduced fetch concurrency (error streak)"
+                        );
+                    }
+                }
+                _ => {}
             }
         });
     }
@@ -2583,5 +2611,27 @@ mod tests {
         assert!(out2.is_empty());
         assert_eq!(req2, vec![vec![1, 2], vec![3]]);
         assert_eq!(sweep.cursor, 0);
+    }
+
+    #[test]
+    fn fetch_concurrency_steps_on_clean_and_error_streaks() {
+        use std::sync::atomic::AtomicUsize;
+        let step = super::fetch_concurrency_step;
+        let ok = AtomicUsize::new(0);
+        let err = AtomicUsize::new(0);
+        // Four clean shards: no change; the fifth scales up and resets.
+        for _ in 0..4 {
+            assert_eq!(step(true, &ok, &err), 0);
+        }
+        assert_eq!(step(true, &ok, &err), 1);
+        assert_eq!(step(true, &ok, &err), 0);
+        // One erroring shard resets the clean streak; the second scales down.
+        assert_eq!(step(false, &ok, &err), 0);
+        assert_eq!(step(false, &ok, &err), -1);
+        // A clean shard breaks the error streak.
+        assert_eq!(step(false, &ok, &err), 0);
+        assert_eq!(step(true, &ok, &err), 0);
+        assert_eq!(step(false, &ok, &err), 0);
+        assert_eq!(step(false, &ok, &err), -1);
     }
 }
