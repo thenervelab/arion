@@ -23,16 +23,78 @@ use std::time::Duration;
 use bytes::Bytes;
 
 /// Backend-agnostic interface to the miner's blob store.
+/// Snapshot of a backend's in-flight write budget against one payload,
+/// taken before the payload is read off the wire (see
+/// [`BlobStore::inflight_headroom`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InflightHeadroom {
+    /// Bytes the writer queue can still admit right now.
+    pub available: u64,
+    /// The whole budget.
+    pub budget: u64,
+    /// What admitting this payload would cost (payload + fixed overhead,
+    /// capped at the budget like the backend does).
+    pub cost: u64,
+}
+
+impl InflightHeadroom {
+    /// Whether `store()` would be admitted without waiting.
+    pub fn admits(&self) -> bool {
+        self.cost <= self.available
+    }
+
+    /// The delay to advertise when it does not: 500 ms with an almost
+    /// empty queue, 5000 ms with a full one, linear in between
+    /// (`common::store_reply::RETRY_AFTER_MS_{MIN,MAX}`).
+    pub fn retry_after_ms(&self) -> u32 {
+        use common::store_reply::{RETRY_AFTER_MS_MAX, RETRY_AFTER_MS_MIN};
+        if self.budget == 0 {
+            return RETRY_AFTER_MS_MAX;
+        }
+        let fill = 1.0 - (self.available.min(self.budget) as f64 / self.budget as f64);
+        let span = (RETRY_AFTER_MS_MAX - RETRY_AFTER_MS_MIN) as f64;
+        (RETRY_AFTER_MS_MIN as f64 + fill * span)
+            .round()
+            .clamp(RETRY_AFTER_MS_MIN as f64, RETRY_AFTER_MS_MAX as f64) as u32
+    }
+}
+
 #[async_trait::async_trait]
 pub trait BlobStore: Send + Sync + std::fmt::Debug {
     /// Store blob data atomically under its hex hash.
     async fn store(&self, hash_hex: &str, data: &[u8]) -> std::io::Result<()>;
 
+    /// Headroom of the in-flight write budget for a payload of
+    /// `payload_len` bytes, `None` for a backend whose `store()` never
+    /// waits for admission (the flat store). A snapshot, not a
+    /// reservation: `store()` still takes the permits itself. The Store
+    /// handler consults it before reading the payload so an exhausted
+    /// budget answers a structured Busy instead of buffering bytes it
+    /// cannot admit.
+    fn inflight_headroom(&self, payload_len: u64) -> Option<InflightHeadroom> {
+        let _ = payload_len;
+        None
+    }
+
     /// Read a live blob's data.
     async fn read(&self, hash_hex: &str) -> std::io::Result<Bytes>;
 
+    /// Read a live blob's data only if it is at most `max_len` bytes long.
+    ///
+    /// A longer blob fails with [`std::io::ErrorKind::FileTooLarge`] before
+    /// its content is buffered: the backend checks the stored length first
+    /// and never allocates or reads past `max_len` (plus one byte to detect
+    /// a blob growing under the read). Consumers that know the expected
+    /// length (the storage-proof path) use this instead of `read` so an
+    /// oversized or corrupted entry cannot allocate beyond their bound.
+    async fn read_at_most(&self, hash_hex: &str, max_len: u64) -> std::io::Result<Bytes>;
+
     /// Whether a live blob exists.
     fn has(&self, hash_hex: &str) -> bool;
+
+    /// Stored length of a live blob in bytes, `None` if absent. Cheap
+    /// (index or one `stat`), never reads the payload.
+    fn blob_len(&self, hash_hex: &str) -> Option<u64>;
 
     /// Two-phase delete: move the blob to the trash (quota freed, blob no
     /// longer listed or served) while staying restorable.
@@ -84,11 +146,20 @@ impl<T: BlobStore + ?Sized> BlobStore for std::sync::Arc<T> {
     async fn store(&self, hash_hex: &str, data: &[u8]) -> std::io::Result<()> {
         (**self).store(hash_hex, data).await
     }
+    fn inflight_headroom(&self, payload_len: u64) -> Option<InflightHeadroom> {
+        (**self).inflight_headroom(payload_len)
+    }
     async fn read(&self, hash_hex: &str) -> std::io::Result<Bytes> {
         (**self).read(hash_hex).await
     }
+    async fn read_at_most(&self, hash_hex: &str, max_len: u64) -> std::io::Result<Bytes> {
+        (**self).read_at_most(hash_hex, max_len).await
+    }
     fn has(&self, hash_hex: &str) -> bool {
         (**self).has(hash_hex)
+    }
+    fn blob_len(&self, hash_hex: &str) -> Option<u64> {
+        (**self).blob_len(hash_hex)
     }
     async fn delete(&self, hash_hex: &str) -> std::io::Result<()> {
         (**self).delete(hash_hex).await

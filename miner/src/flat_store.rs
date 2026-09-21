@@ -59,7 +59,7 @@ fn sharded_rel(hash_hex: &str) -> Option<PathBuf> {
 /// name once String and allocator overhead are counted) that glibc never
 /// returns to the kernel — measured 7+ GB of permanent RSS plus swap on
 /// 31 GB nodes. Any walk over a blob space must go through a visitor.
-pub(crate) fn for_each_bin(root: &Path, visit: &mut dyn FnMut(&str, &std::fs::DirEntry)) {
+pub fn for_each_bin(root: &Path, visit: &mut dyn FnMut(&str, &std::fs::DirEntry)) {
     let Ok(top) = std::fs::read_dir(root) else {
         return;
     };
@@ -101,7 +101,7 @@ pub(crate) fn for_each_bin(root: &Path, visit: &mut dyn FnMut(&str, &std::fs::Di
 
 /// Materialized listing — ONLY for spaces known to be small (trash) or
 /// explicit rebuild paths. Steady-state code must use [`for_each_bin`].
-pub(crate) fn walk_bin_names(root: &Path) -> Vec<String> {
+pub fn walk_bin_names(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     for_each_bin(root, &mut |h, _| out.push(h.to_string()));
     out
@@ -181,6 +181,16 @@ impl FlatBlobStore {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(n))
             });
+    }
+
+    /// Root of the live blob tree.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// Root of the trash tree.
+    pub fn trash_dir(&self) -> &Path {
+        &self.trash_dir
     }
 
     /// Preferred (sharded) path for a blob.
@@ -290,14 +300,34 @@ impl FlatBlobStore {
     /// reputation penalty that never decays. A blob that moved mid-check is by
     /// then definitively sharded, so one retry closes the race completely.
     pub async fn read(&self, hash_hex: &str) -> std::io::Result<Bytes> {
-        match tokio::fs::read(self.blob_path(hash_hex)).await {
+        self.read_either_layout(hash_hex, tokio::fs::read).await
+    }
+
+    /// Read blob data only if the file is at most `max_len` bytes long
+    /// (see [`BlobStore::read_at_most`](crate::store::BlobStore::read_at_most)).
+    /// The size is checked on the open file before any buffer is
+    /// allocated, and the read itself is capped at `max_len + 1` so a file
+    /// growing under the read is still refused instead of buffered.
+    pub async fn read_at_most(&self, hash_hex: &str, max_len: u64) -> std::io::Result<Bytes> {
+        self.read_either_layout(hash_hex, |path| read_file_at_most(path, max_len))
+            .await
+    }
+
+    /// Sharded path first, legacy flat fallback, sharded retry (the lookup
+    /// race documented on [`read`](Self::read)); `read` does the file I/O.
+    async fn read_either_layout<F, Fut>(&self, hash_hex: &str, read: F) -> std::io::Result<Bytes>
+    where
+        F: Fn(PathBuf) -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<Vec<u8>>>,
+    {
+        match read(self.blob_path(hash_hex)).await {
             Ok(data) => Ok(Bytes::from(data)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                match tokio::fs::read(self.blob_path_flat(hash_hex)).await {
+                match read(self.blob_path_flat(hash_hex)).await {
                     Ok(data) => Ok(Bytes::from(data)),
                     Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => {
                         // Migrated out from under us between the two lookups.
-                        let data = tokio::fs::read(self.blob_path(hash_hex)).await?;
+                        let data = read(self.blob_path(hash_hex)).await?;
                         Ok(Bytes::from(data))
                     }
                     Err(e2) => Err(e2),
@@ -310,6 +340,13 @@ impl FlatBlobStore {
     /// Check if a blob exists in either layout.
     pub fn has(&self, hash_hex: &str) -> bool {
         self.locate(hash_hex).is_some()
+    }
+
+    /// Length of a live blob from its file metadata (one `stat`).
+    pub fn blob_len(&self, hash_hex: &str) -> Option<u64> {
+        self.locate(hash_hex)
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
     }
 
     /// Two-phase delete: move the blob (wherever it lives) into the sharded
@@ -562,6 +599,35 @@ impl FlatBlobStore {
     }
 }
 
+/// Read `path` whole only if it is at most `max_len` bytes long. The
+/// length comes from the open file's metadata (no TOCTOU between stat and
+/// read) and the buffer is allocated at exactly that length, once: an
+/// oversized file costs an open and a stat, never its content, and a file
+/// that grows under the read is detected by a one-byte probe into a stack
+/// buffer, never by growing the vector.
+async fn read_file_at_most(path: PathBuf, max_len: u64) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let too_large = || {
+        std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!("blob longer than the {max_len}-byte bound"),
+        )
+    };
+    let mut file = tokio::fs::File::open(path).await?;
+    let len = file.metadata().await?.len();
+    if len > max_len {
+        return Err(too_large());
+    }
+    let mut data = vec![0u8; usize::try_from(len).map_err(|_| too_large())?];
+    file.read_exact(&mut data).await?;
+    let mut probe = [0u8; 1];
+    if file.read(&mut probe).await? != 0 {
+        return Err(too_large());
+    }
+    Ok(data)
+}
+
 /// [`BlobStore`](crate::store::BlobStore) implementation: pure delegation to
 /// the inherent methods above.
 #[async_trait::async_trait]
@@ -574,8 +640,16 @@ impl crate::store::BlobStore for FlatBlobStore {
         FlatBlobStore::read(self, hash_hex).await
     }
 
+    async fn read_at_most(&self, hash_hex: &str, max_len: u64) -> std::io::Result<Bytes> {
+        FlatBlobStore::read_at_most(self, hash_hex, max_len).await
+    }
+
     fn has(&self, hash_hex: &str) -> bool {
         FlatBlobStore::has(self, hash_hex)
+    }
+
+    fn blob_len(&self, hash_hex: &str) -> Option<u64> {
+        FlatBlobStore::blob_len(self, hash_hex)
     }
 
     async fn delete(&self, hash_hex: &str) -> std::io::Result<()> {
@@ -732,6 +806,43 @@ mod tests {
         store.purge_trashed(HASH).await.unwrap();
         assert!(!store.has_trashed(HASH));
         assert_eq!(store.trash_bytes(), 0);
+    }
+
+    /// `read_at_most` refuses a longer blob before buffering it (stat on
+    /// the open file), accepts an exact fit, and follows the legacy flat
+    /// fallback like `read`.
+    #[tokio::test]
+    async fn read_at_most_refuses_oversized_blobs_before_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FlatBlobStore::new(dir.path()).unwrap();
+        let big = vec![0x5Au8; 1 << 20];
+        store.store(HASH, &big).await.unwrap();
+
+        let err = store.read_at_most(HASH, 16).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+        let err = store
+            .read_at_most(HASH, big.len() as u64 - 1)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+        let data = store.read_at_most(HASH, big.len() as u64).await.unwrap();
+        assert_eq!(data.len(), big.len());
+        let data = store.read_at_most(HASH, u64::MAX).await.unwrap();
+        assert_eq!(data.len(), big.len());
+
+        // Absent blob is NotFound, not FileTooLarge.
+        let other = "bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff001122334455";
+        let err = store.read_at_most(other, 16).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+
+        // Legacy flat entry: same bound, same fallback.
+        std::fs::write(dir.path().join(format!("{other}.bin")), b"legacy").unwrap();
+        assert_eq!(
+            store.read_at_most(other, 6).await.unwrap().as_ref(),
+            b"legacy"
+        );
+        let err = store.read_at_most(other, 5).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 [package]
 name = "miner"
-version = "0.1.32"
+version = "0.1.34"
 edition = "2024"
 
 [dependencies]
@@ -40,7 +40,25 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 ed25519-dalek = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 memmap2 = { workspace = true }
+sha2 = { workspace = true }
 libc = { workspace = true }
+
+[features]
+# 0.1.34 ships both code paths (0.1.33 was the read-and-observe release
+# without them). Compiled in does NOT mean active: the runtime switches
+# stay off (`PURGE_ENABLED=false`, `PURGE_DRY_RUN=true` once enabled,
+# `BACKFILL_ENABLED=false`); see README "Operator guide". A census-only
+# binary is still one `cargo build -p miner --no-default-features` away.
+default = ["purge-enforce", "backfill"]
+# Compiles the deleting arm of the obligation-list purge (`purge::Mode::Enforce`,
+# the trash/unlink calls of `pg_purge::run_pass`). Without it a build counts
+# and never deletes, whatever PURGE_DRY_RUN says.
+purge-enforce = []
+# Compiles and spawns the obligation-list backfill loop (`pg_backfill`), a
+# background path that writes blobs fetched from peer miners. Without it
+# the binary carries no such path. The module is still built under
+# `cfg(test)` so its tests run without the feature.
+backfill = []
 
 [dev-dependencies]
 tempfile = { workspace = true }

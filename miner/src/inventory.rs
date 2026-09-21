@@ -1,8 +1,10 @@
 //! Persistent SQLite inventory of stored shards.
 //!
 //! Tracks every blob hash stored on this miner in a WAL-mode SQLite database.
-//! Used by `ListAllBlobs` instead of scanning the filesystem, and kept in sync
-//! by `insert_shard` / `trash_shard` hooks in the Store and Delete handlers.
+//! Read locally by `CheckBlob`, rebalance and the obligation-list purge
+//! instead of scanning the filesystem, and kept in sync by `insert_shard` /
+//! `trash_shard` hooks in the Store and Delete handlers. It is never served
+//! whole to a peer: the `ListAllBlobs`/`ListBlobsPage` messages are refused.
 //!
 //! Trashed shards keep their row with `trashed_at` set: they are excluded
 //! from every listing (the validator must see them as "not held") but the
@@ -18,11 +20,21 @@ static DB: OnceLock<Mutex<rusqlite::Connection>> = OnceLock::new();
 
 /// Set once the inventory reflects what is actually on disk.
 ///
-/// Until then the DB may be empty or half-rebuilt, and answering
-/// `ListAllBlobs`/`ListBlobsPage` from it would report a partial holding as
-/// a *complete, successful* scan — the validator would then read the missing
-/// blobs as data loss (unfair presence penalties, spurious repair jobs).
+/// Until then the DB may be empty or half-rebuilt, and any consumer reading
+/// it as complete (the obligation purge, a rebalance scan) would treat a
+/// partial holding as the whole store.
 static INVENTORY_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set when a write to the inventory failed after the blob itself was
+/// written. The row then lies about the blob (age, liveness): the
+/// obligation-list purge refuses to run until the next restart rebuilds.
+static INVENTORY_WRITE_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether an inventory write has failed since startup.
+pub fn had_write_failure() -> bool {
+    INVENTORY_WRITE_FAILED.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// Whether the inventory can be served to the validator.
 pub fn is_ready() -> bool {
@@ -63,19 +75,40 @@ fn db() -> &'static Mutex<rusqlite::Connection> {
 }
 
 /// Record a newly-stored shard (idempotent). A re-stored or restored shard
-/// is live again: any pending trash mark is cleared.
+/// is live again: any pending trash mark is cleared and `stored_at` is
+/// refreshed, so `stored_at` is the time of the LAST write. The
+/// obligation-list purge reads it as the blob's age: a content-addressed
+/// re-upload of old bytes must count as young again, otherwise a list
+/// generation older than the re-upload would let the purge trash it.
 pub fn insert_shard(hash: &str) -> Result<()> {
     let conn = db().lock().unwrap_or_else(|e| e.into_inner());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    conn.execute(
+    let result = conn.execute(
         "INSERT INTO shards (hash, stored_at, trashed_at) VALUES (?1, ?2, NULL)
-         ON CONFLICT(hash) DO UPDATE SET trashed_at = NULL",
+         ON CONFLICT(hash) DO UPDATE SET trashed_at = NULL, stored_at = excluded.stored_at",
         rusqlite::params![hash, now],
-    )?;
+    );
+    if result.is_err() {
+        INVENTORY_WRITE_FAILED.store(true, std::sync::atomic::Ordering::Release);
+    }
+    result?;
     Ok(())
+}
+
+/// `stored_at` of a live shard, `None` if unknown or trashed. The purge
+/// re-reads it under the per-hash write lock right before a delete.
+pub fn live_stored_at(hash: &str) -> Result<Option<i64>> {
+    let conn = db().lock().unwrap_or_else(|e| e.into_inner());
+    let mut stmt =
+        conn.prepare_cached("SELECT stored_at FROM shards WHERE hash = ?1 AND trashed_at IS NULL")?;
+    let mut rows = stmt.query(rusqlite::params![hash])?;
+    Ok(match rows.next()? {
+        Some(row) => Some(row.get(0)?),
+        None => None,
+    })
 }
 
 /// Mark a shard as trashed: excluded from every listing, retention clock
@@ -119,73 +152,9 @@ pub fn trashed_shards_oldest(limit: usize) -> Result<Vec<(String, i64)>> {
     Ok(rows.flatten().collect())
 }
 
-/// Stream all stored hashes via a channel to bound memory usage.
-/// Returns the total count of hashes that will be sent.
-pub fn stream_all_hashes(tx: tokio::sync::mpsc::Sender<String>) -> Result<usize> {
-    let count: usize = {
-        let conn = db().lock().unwrap_or_else(|e| e.into_inner());
-        conn.query_row(
-            "SELECT COUNT(*) FROM shards WHERE trashed_at IS NULL",
-            [],
-            |row| row.get(0),
-        )?
-    };
-
-    tokio::task::spawn_blocking(move || {
-        // Keyset pagination on the PK index: O(log n) per batch regardless
-        // of depth. The previous OFFSET loop re-skipped from the start on
-        // every batch — minutes of SQL for multi-million-blob inventories,
-        // which made validator-side scans time out.
-        let mut after_hash = String::new();
-        let batch_size = 10_000;
-        loop {
-            let hashes: Vec<String> = {
-                let conn = db().lock().unwrap_or_else(|e| e.into_inner());
-                let mut stmt = match conn.prepare(
-                    "SELECT hash FROM shards WHERE hash > ?1 AND trashed_at IS NULL
-                     ORDER BY hash LIMIT ?2",
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!("inventory: DB prepare failed: {}", e);
-                        break;
-                    }
-                };
-                match stmt.query_map(rusqlite::params![after_hash, batch_size], |row| row.get(0)) {
-                    Ok(rows) => {
-                        let mut batch = Vec::with_capacity(batch_size as usize);
-                        for h in rows.flatten() {
-                            batch.push(h);
-                        }
-                        batch
-                    }
-                    Err(e) => {
-                        warn!("inventory: DB query failed: {}", e);
-                        break;
-                    }
-                }
-            };
-
-            if hashes.is_empty() {
-                break;
-            }
-            if let Some(last) = hashes.last() {
-                after_hash = last.clone();
-            }
-
-            for hash in hashes {
-                if tx.blocking_send(hash).is_err() {
-                    // Receiver dropped, stop streaming
-                    return;
-                }
-            }
-        }
-    });
-
-    Ok(count)
-}
-
-/// One keyset page of hashes for `ListBlobsPage`.
+/// One keyset page of live hashes; a test oracle for the inventory's
+/// contents now that the miner serves no enumeration message.
+#[cfg(test)]
 pub fn list_hashes_page(after_hash: Option<&str>, limit: usize) -> Result<Vec<String>> {
     let conn = db().lock().unwrap_or_else(|e| e.into_inner());
     let mut stmt = conn.prepare(
@@ -195,6 +164,22 @@ pub fn list_hashes_page(after_hash: Option<&str>, limit: usize) -> Result<Vec<St
     let rows = stmt.query_map(
         rusqlite::params![after_hash.unwrap_or(""), limit as i64],
         |row| row.get(0),
+    )?;
+    Ok(rows.flatten().collect())
+}
+
+/// Keyset page of live shards in hash order: `(hash, stored_at)` rows
+/// strictly after `after_hash`. Drives the obligation-list purge pass,
+/// which needs the age of every blob and must never walk the store.
+pub fn live_shards_page(after_hash: Option<&str>, limit: usize) -> Result<Vec<(String, i64)>> {
+    let conn = db().lock().unwrap_or_else(|e| e.into_inner());
+    let mut stmt = conn.prepare(
+        "SELECT hash, stored_at FROM shards WHERE hash > ?1 AND trashed_at IS NULL
+         ORDER BY hash LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![after_hash.unwrap_or(""), limit as i64],
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     Ok(rows.flatten().collect())
 }
@@ -213,8 +198,7 @@ pub fn rebuild_from_fs(blobs_dir: &Path) -> Result<usize> {
     // names is gigabytes of heap that glibc never gives back (measured on
     // 31 GB nodes: 7+ GB permanent RSS). Walks the flat legacy level AND
     // the sharded ab/cd tree; a fresh DB on a sharded-layout node must see
-    // every blob or ListAllBlobs would truthfully report an empty
-    // inventory as a successful scan.
+    // every blob or the inventory would truthfully describe an empty store.
     let mut fs_count = 0i64;
     crate::flat_store::for_each_bin(blobs_dir, &mut |h, _| {
         if h.len() == 64 {

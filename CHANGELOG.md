@@ -2,6 +2,52 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.34] - 2026-09-21
+
+### Miner
+
+The release that can act on the obligation lists. Nothing acts by default.
+
+- **Purge enforcement and backfill compiled in.** The `purge-enforce` and
+  `backfill` Cargo features are default features. Runtime switches are
+  unchanged and off: `PURGE_ENABLED=false`, `PURGE_DRY_RUN=true` when
+  enabled, `BACKFILL_ENABLED=false`. Purge and backfill both stay off
+  without `PG_LISTS_BASE_URL`.
+- **Purge gates.** A pass refuses to run when this miner owns no PG under
+  the current map (weight 0), holds when the owned set shrank by more than
+  half since the last pass, and requires the owned set to be stable for
+  `PURGE_OWNERSHIP_STABLE_SECS` (6 h). The ownership record persists in the
+  data directory so a restart does not reset the clock.
+- **Delta chain.** `current.json` v2 names a base generation and a chain of
+  deltas (`.added` / `.deleted` objects); the reader applies them in
+  sequence and checks the base manifest digest. Tombstoned blobs are purged
+  immediately; a blob a live record still names is never purged on a
+  tombstone.
+- **RAM-derived resource limits.** Packed-store in-flight write budget
+  `clamp(RAM/8, 256 MiB, 4 GiB)` and inbound handler cap
+  `clamp(budget/3 MiB, 256, 8192)`, overridable with
+  `PACKED_INFLIGHT_MAX_BYTES` and `MINER_MAX_CONCURRENT_HANDLERS`. Nodes
+  below 32 GiB of RAM get a lower handler cap than the former 2048.
+- **Structured Busy on write-budget exhaustion.** A Store the budget cannot
+  admit is answered `RATE_LIMITED {"kind":"Busy","retry_after_ms":N}` after
+  draining the payload instead of stalling until the sender's ACK timeout.
+  Additive on the wire.
+
+## [0.1.33] - 2026-09-14
+
+### Miner
+
+Read-and-observe release.
+
+- **Obligation-list purge as a census.** With `PG_LISTS_BASE_URL` set the
+  miner fetches the signed per-PG obligation lists of the PGs it owns,
+  verifies the generation manifest against the validator key, and counts
+  and logs what a full pass would delete. Nothing is deleted.
+- `ListAllBlobs` / `ListBlobsPage` are refused for every peer
+  (`ERROR: unsupported message`).
+- Peer node id derived from the authenticated SPKI only; the validator
+  identity is pinned on registration and heartbeat connections.
+
 ## [0.1.30] - 2026-08-24
 
 ### Miner

@@ -4,22 +4,29 @@
 //! in a flat file store, and serves them back to gateways and other miners on request.
 
 mod config;
-mod constants;
 mod doc_replica;
-mod flat_store;
 mod gateway_keepalive;
-mod helpers;
 mod inventory;
 mod migrating_store;
 mod mmap_index;
 mod p2p;
 mod packed_store;
+// The obligation-list backfill loop is not part of the release binary: it
+// is a background path that writes blobs fetched from peers, and this
+// release observes only. The module stays compiled for its tests and for a
+// build that opts in with `--features backfill`.
+#[cfg(any(test, feature = "backfill"))]
+mod pg_backfill;
+mod pg_purge;
 mod rebalance;
 mod reconnect;
 mod state;
 mod state_sync;
-mod store;
 mod version_check;
+
+// Standalone modules live in the `miner` library (see `src/lib.rs`); the
+// binary's own modules reach them through these crate-root bindings.
+use miner::{constants, flat_store, helpers, limits, storage_proof, store};
 
 use anyhow::Result;
 use clap::Parser;
@@ -40,7 +47,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -67,7 +74,7 @@ struct Cli {
     warden_node_id: Option<String>,
 }
 
-#[derive(clap::Subcommand, Debug)]
+#[derive(clap::Subcommand, Debug, Clone)]
 enum Commands {
     /// Backup miner identity to archive
     Backup {
@@ -110,8 +117,46 @@ async fn main() -> Result<()> {
         return handle_subcommand(command).await;
     }
 
-    // Default: run miner service
     run_miner(cli).await
+}
+
+/// Blob store root: `--storage-path`/`STORAGE_PATH`, else a non-default
+/// `storage.path`, else `{data_dir}/blobs`.
+pub(crate) fn resolve_blobs_dir(
+    storage_path: Option<&str>,
+    config: &config::MinerConfig,
+    data_dir: &std::path::Path,
+) -> std::path::PathBuf {
+    if let Some(path) = storage_path {
+        std::path::PathBuf::from(path)
+    } else if config.storage.path != "data/miner/blobs" {
+        std::path::PathBuf::from(&config.storage.path)
+    } else {
+        data_dir.join("blobs")
+    }
+}
+
+/// Validator socket address: `VALIDATOR_ADDR` > first `direct_addrs` entry.
+pub(crate) fn resolve_validator_socket_addr(config: &config::MinerConfig) -> Result<SocketAddr> {
+    config
+        .validator
+        .addr
+        .as_deref()
+        .map(|s| {
+            s.parse().unwrap_or_else(|e| {
+                panic!("VALIDATOR_ADDR '{s}' is not a valid socket address: {e}");
+            })
+        })
+        .or_else(|| {
+            config::parse_direct_addrs(&config.validator.direct_addrs)
+                .into_iter()
+                .next()
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "VALIDATOR_ADDR or VALIDATOR_DIRECT_ADDRS is required for quinn transport"
+            )
+        })
 }
 
 async fn handle_subcommand(command: Commands) -> Result<()> {
@@ -254,6 +299,9 @@ struct MinerContext {
     /// a non-routable address (e.g. `--hostname 0.0.0.0`).
     stun_public_ip: Option<std::net::IpAddr>,
     store: Arc<dyn store::BlobStore>,
+    /// Storage-proof incarnation of this process run, published and
+    /// signed in every registration.
+    storage_proof_incarnation: [u8; 16],
 }
 
 impl MinerContext {
@@ -325,6 +373,16 @@ async fn run_miner(cli: Cli) -> Result<()> {
             config::MinerConfig::default()
         }
     };
+    // The purge knobs are deletion knobs: a switch that does not parse is
+    // fatal here, before anything is bound, never a silent default.
+    let purge_cfg = miner::purge::PurgeConfig::from_env().map_err(|e| {
+        error!(error = %e, "startup: refusing to run with an invalid purge switch");
+        e
+    })?;
+    let backfill_cfg = miner::backfill::BackfillConfig::from_env().map_err(|e| {
+        error!(error = %e, "startup: refusing to run with an invalid backfill switch");
+        e
+    })?;
 
     // STUN-based public IP auto-detection (runs before hostname/bind resolution)
     let stun_ipv4 = if config.network.auto_detect_ip {
@@ -373,8 +431,16 @@ async fn run_miner(cli: Cli) -> Result<()> {
     // 1. Initialize quinn endpoint
     tokio::fs::create_dir_all(&data_dir).await?;
 
-    let signing_key = load_keypair(&data_dir).await?;
+    let signing_key = Arc::new(load_keypair(&data_dir).await?);
     let node_id = common::transport::node_id_from_public_key(&signing_key.verifying_key());
+    // Storage-proof incarnation (protocol v1 §1): random, non-zero, per
+    // process run. Published in every Register message (covered by the
+    // registration signature) so challengers read it from the cluster map.
+    let storage_proof_incarnation = storage_proof::fresh_incarnation();
+    info!(
+        incarnation = %hex::encode(storage_proof_incarnation),
+        "Storage-proof incarnation for this run"
+    );
 
     // Determine bind address
     let bind_ipv4: std::net::Ipv4Addr = config
@@ -472,14 +538,12 @@ async fn run_miner(cli: Cli) -> Result<()> {
 
     info!("Ready for P2P connections");
 
+    // RAM-derived limits (in-flight write budget, handler cap): resolved
+    // once, logged once, before the store and the P2P handler read them.
+    limits::log_once();
+
     // 2. Initialize flat-file blob store for persistent shard storage
-    let blobs_dir = if let Some(path) = cli.storage_path.clone() {
-        std::path::PathBuf::from(path)
-    } else if config.storage.path != "data/miner/blobs" {
-        std::path::PathBuf::from(&config.storage.path)
-    } else {
-        data_dir.join("blobs")
-    };
+    let blobs_dir = resolve_blobs_dir(cli.storage_path.as_deref(), &config, &data_dir);
     // Backend selection. `flat` is the default and the only mode that reads
     // pre-existing per-file blobs; `packed` (append-only volumes + in-RAM
     // index) is for empty data dirs until the flat->packed migrator lands —
@@ -542,7 +606,14 @@ async fn run_miner(cli: Cli) -> Result<()> {
     // heartbeated and stored nothing until they finished. Until reconciliation
     // completes the inventory answers WARMING_UP, so a partial holding is
     // never mistaken for a successful scan.
-    inventory::init_inventory(&data_dir)?;
+    //
+    // A failure here (a full disk: SQLite cannot grow the WAL index) is
+    // fatal, as in 0.1.32: the error is logged and the process exits
+    // non-zero, systemd restarts it, the operator sees it in the journal.
+    if let Err(e) = inventory::init_inventory(&data_dir) {
+        error!(error = %format!("{e:#}"), "startup: inventory index cannot be opened");
+        return Err(e);
+    }
     {
         let store_bg = Arc::clone(&store);
         let blobs_bg = blobs_dir.clone();
@@ -594,25 +665,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
     })?;
 
     // Resolve validator socket address: VALIDATOR_ADDR > first direct_addr
-    let validator_socket_addr: SocketAddr = config
-        .validator
-        .addr
-        .as_deref()
-        .map(|s| {
-            s.parse().unwrap_or_else(|e| {
-                panic!("VALIDATOR_ADDR '{s}' is not a valid socket address: {e}");
-            })
-        })
-        .or_else(|| {
-            config::parse_direct_addrs(&config.validator.direct_addrs)
-                .into_iter()
-                .next()
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "VALIDATOR_ADDR or VALIDATOR_DIRECT_ADDRS is required for quinn transport"
-            )
-        })?;
+    let validator_socket_addr = resolve_validator_socket_addr(&config)?;
 
     info!(
         validator_addr = %validator_socket_addr,
@@ -652,6 +705,15 @@ async fn run_miner(cli: Cli) -> Result<()> {
         pos_sem: Arc::new(tokio::sync::Semaphore::new(pos_concurrency)),
         validator_node_id: Some(validator_node_id_str.clone()),
         trash_enabled: config.storage.trash_enabled,
+        // Own pool, same size as the legacy PoS pool (clamped to the
+        // protocol bound of 16 by the service): neither protocol can
+        // starve the other of proof permits.
+        storage_proof: Arc::new(storage_proof::StorageProofService::new(
+            Arc::clone(&store),
+            Arc::clone(&signing_key),
+            storage_proof_incarnation,
+            pos_concurrency,
+        )),
     };
 
     // Trash retention: purge blobs past the TTL, keep total trash under the
@@ -669,6 +731,42 @@ async fn run_miner(cli: Cli) -> Result<()> {
             config.storage.trash_ttl_secs,
             cap,
         ));
+    }
+
+    // Obligation-list purge: deletes blobs outside the published lists of
+    // the PGs this miner owns. Off unless PURGE_ENABLED=true; dry-run by
+    // default. Uses the same validator key as Store/Delete authorization
+    // to verify the list manifests.
+    tokio::spawn(pg_purge::run_loop(
+        Arc::clone(&store),
+        validator_node_id_str.clone(),
+        purge_cfg.clone(),
+        config.storage.trash_enabled,
+    ));
+
+    // Obligation-list backfill: the mirror of the purge. Fetches from
+    // peer miners the listed blobs of owned PGs that the local inventory
+    // lacks. Off unless BACKFILL_ENABLED=true; same signed lists. Not in
+    // the release binary (see `mod pg_backfill`): the switch is parsed
+    // strictly above so a typo still fails startup, but enabling it here
+    // only says so.
+    #[cfg(feature = "backfill")]
+    tokio::spawn(pg_backfill::run_loop(
+        Arc::clone(&store),
+        validator_node_id_str.clone(),
+        purge_cfg,
+        backfill_cfg,
+        endpoint.clone(),
+        blobs_dir.clone(),
+    ));
+    #[cfg(not(feature = "backfill"))]
+    {
+        drop(purge_cfg);
+        if backfill_cfg.enabled {
+            warn!(
+                "BACKFILL_ENABLED=true ignored: the obligation-list backfill is not compiled into this release"
+            );
+        }
     }
 
     // Spawn quinn accept loop (replaces iroh Router)
@@ -742,8 +840,6 @@ async fn run_miner(cli: Cli) -> Result<()> {
         }
     });
 
-    let signing_key = Arc::new(signing_key);
-
     let ctx = MinerContext {
         endpoint: endpoint.clone(),
         signing_key: signing_key.clone(),
@@ -756,6 +852,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
         config: config.clone(),
         stun_public_ip: stun_ipv4.map(|r| r.ip),
         store: store.clone(),
+        storage_proof_incarnation,
     };
 
     // 5. Register with Validator via P2P
@@ -1176,9 +1273,23 @@ fn spawn_heartbeat_loop(
                     )
                     .await
                     {
+                        // The transport does not enforce the expected node
+                        // id; this reply provisions requester and warden ids,
+                        // so the far end is pinned before a byte is written.
                         Ok(Ok(new_conn)) => {
-                            cached_conn = Some(new_conn.clone());
-                            Ok(new_conn)
+                            match miner::validator_pin::pin(new_conn, &current_validator_node_id) {
+                                Ok(new_conn) => {
+                                    cached_conn = Some(new_conn.clone());
+                                    Ok(new_conn)
+                                }
+                                Err(e) => {
+                                    error!(
+                                        error = %e,
+                                        "Heartbeat connection refused: far end is not the configured validator; keeping the previous requester and warden sets"
+                                    );
+                                    Err(format!("{e}"))
+                                }
+                            }
                         }
                         Ok(Err(e)) => Err(format!("{e}")),
                         Err(_) => Err("connect timeout".to_string()),
@@ -1239,6 +1350,22 @@ fn spawn_heartbeat_loop(
                                         );
                                         *warden_ids = new_ids;
                                     }
+                                }
+                            }
+
+                            // Storage-proof requesters: replaced on every reply
+                            // that carries the field (empty = revoked).
+                            if let Some(new_set) =
+                                storage_proof::parse_storage_proof_requesters(&response)
+                            {
+                                let mut requesters =
+                                    state::get_storage_proof_requesters().write().await;
+                                if *requesters != new_set {
+                                    info!(
+                                        count = new_set.len(),
+                                        "Updated storage-proof requesters from validator heartbeat"
+                                    );
+                                    *requesters = new_set;
                                 }
                             }
 
@@ -1395,8 +1522,11 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<quinn::Conne
         let public_key_str = ctx.node_id.clone();
         let timestamp = now_secs();
 
-        // Sign "REGISTER:{public_key}:{timestamp}"
-        let sign_data = format!("REGISTER:{}:{}", public_key_str, timestamp);
+        // Sign "REGISTER:{public_key}:{timestamp}:{incarnation_hex}" so the
+        // published incarnation is bound to this key and this registration.
+        let incarnation = ctx.storage_proof_incarnation;
+        let sign_data =
+            common::register_sign_payload(&public_key_str, timestamp, Some(&incarnation));
         let signature = ctx.sign(sign_data.as_bytes());
 
         let resolved_ip = ctx.resolve_hostname_ip();
@@ -1435,6 +1565,7 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<quinn::Conne
             signature: signature.to_bytes().to_vec(),
             endpoint_addr: Some(my_endpoint_addr),
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            incarnation: Some(incarnation),
         }
     };
 
@@ -1451,6 +1582,10 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<quinn::Conne
     )
     .await?
     .map_err(|e| anyhow::anyhow!("connect error: {}", e))?;
+    let conn = miner::validator_pin::pin(conn, &ctx.validator_node_id).map_err(|e| {
+        error!(error = %e, "Registration connection refused: far end is not the configured validator");
+        anyhow::anyhow!("{e}")
+    })?;
 
     info!("Registration: P2P connection to validator established");
 

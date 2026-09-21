@@ -335,44 +335,48 @@ impl rustls::server::danger::ClientCertVerifier for ClientNodeIdVerifier {
     }
 }
 
+/// Exact DER encoding of an Ed25519 `SubjectPublicKeyInfo` up to the key
+/// bytes (RFC 8410 §4):
+///
+/// ```text
+///   30 2a                    -- SEQUENCE (42 bytes)
+///     30 05                  -- SEQUENCE (5 bytes) AlgorithmIdentifier
+///       06 03 2b 65 70       -- OID 1.3.101.112 (Ed25519), no parameters
+///     03 21                  -- BIT STRING (33 bytes)
+///       00                   -- unused bits
+///       <32 bytes>           -- Ed25519 public key
+/// ```
+const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+
+/// Total length of an Ed25519 SPKI: the prefix above plus the 32 key bytes.
+const ED25519_SPKI_LEN: usize = ED25519_SPKI_PREFIX.len() + 32;
+
 /// Extract the Ed25519 public key from a DER-encoded X.509 certificate
 /// and return it as a hex-encoded node ID.
+///
+/// The key is read from the parsed `subjectPublicKeyInfo` field of the
+/// certificate, the same field rustls authenticates the TLS 1.3 handshake
+/// signature against (`rustls::crypto::verify_tls13_signature` parses the
+/// certificate with the same webpki parser). Nothing else in the
+/// certificate is consulted: an issuer or subject attribute that happens
+/// to carry a key-shaped byte string cannot stand in for the key that
+/// signed the handshake. Anything but a well-formed X.509 certificate
+/// whose SPKI is exactly an Ed25519 key is refused.
 fn extract_ed25519_node_id(cert_der: &CertificateDer<'_>) -> Result<String> {
-    // The SubjectPublicKeyInfo for Ed25519 has a fixed DER encoding:
-    //
-    //   30 2a                    -- SEQUENCE (42 bytes)
-    //     30 05                  -- SEQUENCE (5 bytes) AlgorithmIdentifier
-    //       06 03 2b 65 70      -- OID 1.3.101.112 (Ed25519)
-    //     03 21                  -- BIT STRING (33 bytes)
-    //       00                   -- unused bits
-    //       <32 bytes>           -- Ed25519 public key
-    //
-    // We search for the byte pattern that uniquely identifies this structure.
-    // The Ed25519 OID appears multiple times in an X.509 cert (signatureAlgorithm,
-    // subjectPublicKeyInfo, etc.), so we match the full AlgorithmIdentifier SEQUENCE
-    // followed by the BIT STRING header.
-    let der_bytes = cert_der.as_ref();
-
-    // Pattern: AlgorithmIdentifier { Ed25519 } + BIT STRING { unused=0, ... }
-    let spki_pattern: [u8; 10] = [
-        0x30, 0x05, // SEQUENCE (5 bytes)
-        0x06, 0x03, 0x2b, 0x65, 0x70, // OID 1.3.101.112
-        0x03, 0x21, // BIT STRING (33 bytes)
-        0x00, // unused bits
-    ];
-
-    let pos = der_bytes
-        .windows(spki_pattern.len())
-        .position(|w| w == spki_pattern)
-        .ok_or_else(|| anyhow::anyhow!("Ed25519 SubjectPublicKeyInfo not found in certificate"))?;
-
-    let key_start = pos + spki_pattern.len();
-    if key_start + 32 > der_bytes.len() {
-        anyhow::bail!("certificate too short to contain Ed25519 public key");
+    let parsed = rustls::server::ParsedCertificate::try_from(cert_der)
+        .map_err(|e| anyhow::anyhow!("certificate does not parse as X.509: {e}"))?;
+    let spki = parsed.subject_public_key_info();
+    let spki = spki.as_ref();
+    if spki.len() != ED25519_SPKI_LEN || spki[..ED25519_SPKI_PREFIX.len()] != ED25519_SPKI_PREFIX {
+        anyhow::bail!(
+            "subjectPublicKeyInfo is not an Ed25519 key ({} bytes, prefix {})",
+            spki.len(),
+            hex::encode(&spki[..spki.len().min(ED25519_SPKI_PREFIX.len())])
+        );
     }
-
-    let pub_key_bytes = &der_bytes[key_start..key_start + 32];
-    Ok(hex::encode(pub_key_bytes))
+    Ok(hex::encode(&spki[ED25519_SPKI_PREFIX.len()..]))
 }
 
 #[cfg(test)]
@@ -437,6 +441,111 @@ mod tests {
         let extracted = extract_ed25519_node_id(&cert_der).unwrap();
 
         assert_eq!(extracted, expected_node_id);
+    }
+
+    /// Self-signed Ed25519 certificate for `secret` whose subject CN is
+    /// `cn`. The CN is arbitrary UTF-8, so a test can place any byte
+    /// string in the subject, ahead of the SPKI in the DER.
+    fn cert_with_cn(secret: &SigningKey, cn: String) -> CertificateDer<'static> {
+        let pkcs8_der = signing_key_to_pkcs8_der(secret);
+        let private_key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8_der));
+        let key_pair = KeyPair::from_der_and_sign_algo(&private_key_der, &PKCS_ED25519).unwrap();
+        let mut cert_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        cert_params.distinguished_name = rcgen::DistinguishedName::new();
+        cert_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, rcgen::DnValue::Utf8String(cn));
+        let cert = cert_params.self_signed(&key_pair).unwrap();
+        CertificateDer::from(cert.der().to_vec())
+    }
+
+    /// A certificate whose subject CN embeds a complete Ed25519 SPKI
+    /// image (algorithm identifier, bit-string header and 32 key bytes)
+    /// for a key that is NOT the one in its SubjectPublicKeyInfo. TLS
+    /// authenticates the SPKI key; the node id must come from there and
+    /// nowhere else, so the decoy in the subject is ignored.
+    #[test]
+    fn test_node_id_ignores_key_bytes_embedded_in_subject() {
+        let real_key = SigningKey::from_bytes(&[101u8; 32]);
+        let real_node_id = node_id_from_public_key(&real_key.verifying_key());
+        // 32 bytes the attacker wants to be taken for: ASCII so it fits a
+        // UTF8String attribute.
+        let decoy_key: [u8; 32] = *b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let decoy_node_id = hex::encode(decoy_key);
+
+        let mut decoy_cn = Vec::with_capacity(ED25519_SPKI_LEN);
+        decoy_cn.extend_from_slice(&ED25519_SPKI_PREFIX[2..]); // inner AlgorithmIdentifier + BIT STRING header
+        decoy_cn.extend_from_slice(&decoy_key);
+        let decoy_cn = String::from_utf8(decoy_cn).unwrap();
+        let cert_der = cert_with_cn(&real_key, decoy_cn);
+
+        // Sanity: the decoy image really is in the DER and precedes the SPKI.
+        let der = cert_der.as_ref();
+        let decoy_pos = der
+            .windows(ED25519_SPKI_LEN - 2)
+            .position(|w| w[..10] == ED25519_SPKI_PREFIX[2..] && w[10..] == decoy_key)
+            .expect("decoy image present in certificate");
+        let real_pos = der
+            .windows(ED25519_SPKI_LEN)
+            .position(|w| {
+                w[..12] == ED25519_SPKI_PREFIX && w[12..] == *real_key.verifying_key().as_bytes()
+            })
+            .expect("real SPKI present in certificate");
+        assert!(
+            decoy_pos < real_pos,
+            "the subject precedes the SPKI in TBSCertificate"
+        );
+
+        // The previous extractor took the first pattern match anywhere in
+        // the DER; this certificate makes it report the decoy.
+        let first_pattern_match = hex::encode(&der[decoy_pos + 10..decoy_pos + 42]);
+        assert_eq!(
+            first_pattern_match, decoy_node_id,
+            "whole-DER scan is fooled"
+        );
+
+        let extracted = extract_ed25519_node_id(&cert_der).unwrap();
+        assert_eq!(extracted, real_node_id, "node id is the SPKI key");
+        assert_ne!(
+            extracted, decoy_node_id,
+            "subject bytes never become the identity"
+        );
+    }
+
+    /// A certificate whose SPKI is not Ed25519 has no node id: refused,
+    /// never a best-effort scan for a key-shaped pattern elsewhere.
+    #[test]
+    fn test_non_ed25519_spki_is_refused() {
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut cert_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        cert_params.distinguished_name = rcgen::DistinguishedName::new();
+        // Even with an Ed25519 SPKI image in the subject.
+        let mut decoy_cn = Vec::new();
+        decoy_cn.extend_from_slice(&ED25519_SPKI_PREFIX[2..]);
+        decoy_cn.extend_from_slice(b"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
+        cert_params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            rcgen::DnValue::Utf8String(String::from_utf8(decoy_cn).unwrap()),
+        );
+        let cert = cert_params.self_signed(&key_pair).unwrap();
+        let cert_der = CertificateDer::from(cert.der().to_vec());
+
+        let err = extract_ed25519_node_id(&cert_der).unwrap_err();
+        assert!(
+            err.to_string().contains("not an Ed25519 key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Bytes that are not an X.509 certificate are refused even when they
+    /// contain a perfect Ed25519 SPKI image.
+    #[test]
+    fn test_unparseable_certificate_is_refused() {
+        let mut fake = Vec::new();
+        fake.extend_from_slice(&ED25519_SPKI_PREFIX);
+        fake.extend_from_slice(&[7u8; 32]);
+        let cert_der = CertificateDer::from(fake);
+        assert!(extract_ed25519_node_id(&cert_der).is_err());
     }
 
     /// Test endpoint creation and bidirectional streaming between two endpoints.

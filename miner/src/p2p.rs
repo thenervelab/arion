@@ -13,7 +13,9 @@
 //!   shard storage — the only supported store path.
 //! - **JSON control:** First byte is `{` (0x7B). The entire message is a
 //!   JSON-encoded [`MinerControlMessage`]. Used for all other control messages
-//!   (Delete, FetchBlob, ClusterMapUpdate, PullFromPeer, PosChallenge, CheckBlob).
+//!   (Delete, FetchBlob, ClusterMapUpdate, PullFromPeer, PosChallenge, CheckBlob,
+//!   StorageProofChallenge — whose reply is a raw protocol v1 frame, see
+//!   [`crate::storage_proof`]).
 //!
 //! # Backpressure
 //!
@@ -31,15 +33,16 @@
 
 use crate::constants::{
     DATA_FRAME_READ_TIMEOUT_SECS, DEFAULT_READ_TIMEOUT_SECS, LOG_STRING_TRUNCATE_LEN,
-    MAX_CLUSTER_MAP_JSON_SIZE, MAX_CONCURRENT_HANDLERS, MAX_EPOCH_JUMP, MAX_FETCH_RESPONSE_SIZE,
-    MAX_MESSAGE_SIZE, MAX_PEER_CACHE_ENTRIES, MAX_V2_DATA_SIZE, PEER_BLOB_DOWNLOAD_TIMEOUT_SECS,
+    MAX_CLUSTER_MAP_JSON_SIZE, MAX_EPOCH_JUMP, MAX_FETCH_RESPONSE_SIZE, MAX_MESSAGE_SIZE,
+    MAX_PEER_CACHE_ENTRIES, MAX_V2_DATA_SIZE, PEER_BLOB_DOWNLOAD_TIMEOUT_SECS,
     PEER_DATA_RECEPTION_TIMEOUT_SECS, PULL_PERMIT_TIMEOUT_SECS, STORE_PERMIT_TIMEOUT_SECS,
 };
 use crate::helpers::{truncate_for_log, verify_signature};
 use crate::state::{
     get_blob_cache, get_cluster_map, get_current_epoch, get_gateway_endpoints,
-    get_last_epoch_change, get_peer_cache, get_warden_node_ids,
+    get_last_epoch_change, get_peer_cache, get_storage_proof_requesters, get_warden_node_ids,
 };
+use crate::storage_proof::{Reply, StorageProofService, WriteError};
 use crate::store::BlobStore;
 use anyhow::Result;
 use pos_circuits::commitment::CommitmentWithTree;
@@ -52,11 +55,18 @@ use std::time::Instant;
 use tracing::{debug, error, info, trace, warn};
 
 /// Global semaphore to limit concurrent P2P stream handlers
-/// Prevents OOM from connection flood attacks spawning unbounded tasks
+/// Prevents OOM from connection flood attacks spawning unbounded tasks.
+/// Sized once at boot from the RAM-derived limit (`crate::limits`,
+/// `MINER_MAX_CONCURRENT_HANDLERS` overrides).
 static HANDLER_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
+fn max_concurrent_handlers() -> usize {
+    crate::limits::get().max_concurrent_handlers
+}
+
 fn get_handler_semaphore() -> &'static Arc<tokio::sync::Semaphore> {
-    HANDLER_SEMAPHORE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HANDLERS)))
+    HANDLER_SEMAPHORE
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(max_concurrent_handlers())))
 }
 
 /// Helper to finish a send stream and wait for remote acknowledgment
@@ -135,6 +145,8 @@ pub struct MinerControlHandler {
     /// Two-phase deletes: Delete moves blobs to the local trash instead of
     /// unlinking, keeping them restorable via RestoreBlob until purge.
     pub trash_enabled: bool,
+    /// Storage chunk proof protocol v1 (`StorageProofChallenge`).
+    pub storage_proof: Arc<StorageProofService>,
 }
 
 /// Handle incoming miner control messages on a quinn connection.
@@ -168,7 +180,7 @@ pub async fn handle_miner_control(
             Err(_) => {
                 warn!(
                     remote = %remote_short,
-                    limit = MAX_CONCURRENT_HANDLERS,
+                    limit = max_concurrent_handlers(),
                     "Handler limit reached, rejecting stream"
                 );
                 let _ = send_response(&mut send, b"ERROR: RATE_LIMITED").await;
@@ -409,11 +421,15 @@ async fn handle_single_stream(
         common::MinerControlMessage::CheckBlob { hash } => {
             handle_check_blob(&mut send, &handler.store, hash).await?;
         }
-        common::MinerControlMessage::ListAllBlobs => {
-            handle_list_all_blobs(&mut send, &handler.store).await?;
+        common::MinerControlMessage::ListAllBlobs
+        | common::MinerControlMessage::ListBlobsPage { .. } => {
+            // Retired: unauthenticated full-store enumeration. Refused at the
+            // protocol level for every peer; see `RETIRED_ENUMERATION_REPLY`.
+            debug!(peer = %remote_node_id, "refusing retired blob enumeration message");
+            send_response(&mut send, RETIRED_ENUMERATION_REPLY).await?;
         }
-        common::MinerControlMessage::ListBlobsPage { after_hash, limit } => {
-            handle_list_blobs_page(&mut send, after_hash.as_deref(), limit).await?;
+        common::MinerControlMessage::StorageProofChallenge { frame } => {
+            handle_storage_proof_challenge(remote_node_id, handler, &mut send, &frame).await?;
         }
         common::MinerControlMessage::StoreV2 { .. } => {
             warn!("Received raw JSON StoreV2 message (not V2-framed), rejecting");
@@ -476,8 +492,31 @@ async fn handle_store(
 
     trace!(hash = %hash, size = data_len, "Receiving blob from validator/gateway");
 
-    let mut data = vec![0u8; data_len];
     let data_timeout = std::time::Duration::from_secs(DATA_FRAME_READ_TIMEOUT_SECS);
+
+    // Write-budget exhaustion answers a structured Busy before the payload
+    // is buffered: the sender learns when to retry instead of its write
+    // stalling behind the admission wait until its ACK timeout. The
+    // payload is drained (bounded buffer, no copy kept) so the sender's
+    // write completes and it reads the reply rather than a STOP_SENDING.
+    if let Some(busy) = store_busy_reply(handler.store.as_ref(), data_len as u64) {
+        let n = STORE_BUSY_REPLIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        debug!(
+            hash = %truncate_for_log(&hash, 16),
+            size = data_len,
+            reply = %String::from_utf8_lossy(&busy.encode()),
+            total = n,
+            "Store: write budget exhausted, answering Busy"
+        );
+        drain_exact(recv, data_len, data_timeout).await?;
+        return send_response(send, &busy.encode()).await;
+    }
+
+    // Exclusive on the hash until the blob is stored and recorded in the
+    // inventory: the obligation-list purge cannot delete it underneath.
+    let _write_lock = crate::state::lock_hash_write(&hash).await;
+
+    let mut data = vec![0u8; data_len];
     tokio::time::timeout(data_timeout, recv.read_exact(&mut data))
         .await
         .map_err(|_| anyhow::anyhow!("StoreV2 data read timed out after 55s"))?
@@ -528,6 +567,47 @@ async fn handle_store(
 
     // Send ACK and wait for remote to receive it
     send_response(send, b"OK").await
+}
+
+/// Store replies answered with a structured Busy since startup.
+pub static STORE_BUSY_REPLIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The Busy reply a Store of `payload_len` bytes gets when the backend's
+/// in-flight write budget cannot admit it now, `None` when it can (or the
+/// backend has no budget). `retry_after_ms` grows with the queue fill:
+/// 500 ms nearly empty, 5000 ms full.
+fn store_busy_reply(
+    store: &dyn BlobStore,
+    payload_len: u64,
+) -> Option<common::store_reply::StoreReply> {
+    let headroom = store.inflight_headroom(payload_len)?;
+    if headroom.admits() {
+        return None;
+    }
+    Some(common::store_reply::StoreReply::busy(
+        headroom.retry_after_ms(),
+    ))
+}
+
+/// Read and discard exactly `len` bytes through a bounded buffer.
+async fn drain_exact(
+    recv: &mut quinn::RecvStream,
+    len: usize,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    const CHUNK: usize = 64 << 10;
+    let mut buf = vec![0u8; CHUNK.min(len.max(1))];
+    let mut left = len;
+    let deadline = tokio::time::Instant::now() + timeout;
+    while left > 0 {
+        let n = buf.len().min(left);
+        tokio::time::timeout_at(deadline, recv.read_exact(&mut buf[..n]))
+            .await
+            .map_err(|_| anyhow::anyhow!("StoreV2 data drain timed out"))?
+            .map_err(|e| anyhow::anyhow!("StoreV2 data drain failed: {}", e))?;
+        left -= n;
+    }
+    Ok(())
 }
 
 async fn handle_delete(
@@ -697,86 +777,26 @@ async fn handle_check_blob(
     }
 }
 
-/// Serve ONE bounded keyset page of blob hashes (resumable inventory scans).
-/// Same wire format as `ListAllBlobs` but for a single page — the miner-side
-/// cost is one indexed SQLite range query, bounded by the clamped limit.
-async fn handle_list_blobs_page(
-    send: &mut quinn::SendStream,
-    after_hash: Option<&str>,
-    limit: u32,
-) -> Result<()> {
-    // A partial inventory must never be served as a complete answer: the
-    // validator would record a successful scan and read the absent blobs as
-    // data loss.
-    if !crate::inventory::is_ready() {
-        return send_response(send, b"WARMING_UP").await;
-    }
-    // Cap a page at ~13 MB of wire data so a single response stays cheap
-    // for the miner regardless of what the caller asks for.
-    const MAX_PAGE: u32 = 200_000;
-    let limit = limit.clamp(1, MAX_PAGE) as usize;
-    let after = after_hash.map(str::to_string);
-    let hashes = tokio::task::spawn_blocking(move || {
-        crate::inventory::list_hashes_page(after.as_deref(), limit)
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("page task join: {e}"))??;
-    let header = format!("{{\"count\":{}}}\n", hashes.len());
-    send.write_all(header.as_bytes()).await?;
-    for hash in hashes {
-        send.write_all(hash.as_bytes()).await?;
-        send.write_all(b"\n").await?;
-    }
-    finish_stream(send).await
-}
-
-/// Stream all stored blob hashes to the requester.
+/// Reply to the retired `ListAllBlobs` / `ListBlobsPage` control messages.
 ///
-/// Wire format:
-///   1. JSON header: `{"count":<N>}\n`
-///   2. One hash per line (lowercase hex BLAKE3), terminated with `\n`
-///   3. Stream finished (EOF)
-async fn handle_list_all_blobs(send: &mut quinn::SendStream, store: &dyn BlobStore) -> Result<()> {
-    if !crate::inventory::is_ready() {
-        return send_response(send, b"WARMING_UP").await;
-    }
-    // Read from persistent SQLite inventory (fast), fall back to FS scan on error.
-    let (tx, mut rx) = tokio::sync::mpsc::channel(10_000);
+/// Those messages let any peer that could open a control stream — the
+/// control ALPN does not authenticate the requester — enumerate every blob
+/// hash a node holds. The validator-side consumer (the `miner_inventory`
+/// scan) is retired, so the miner no longer serves them for anyone. Old
+/// validators still parse the enum variant; they get this one-line error
+/// instead of a `{"count":N}` header and fail their scan immediately.
+/// The SQLite inventory itself stays: `CheckBlob`, rebalance and the
+/// obligation purge read it locally.
+pub(crate) const RETIRED_ENUMERATION_REPLY: &[u8] = b"ERROR: unsupported message";
 
-    match crate::inventory::stream_all_hashes(tx) {
-        Ok(count) => {
-            info!(count, "ListAllBlobs: streaming inventory from DB");
-
-            // Send JSON header
-            let header = format!("{{\"count\":{}}}\n", count);
-            send.write_all(header.as_bytes()).await?;
-
-            // Stream hashes line by line as they arrive from SQLite thread
-            while let Some(hash) = rx.recv().await {
-                send.write_all(hash.as_bytes()).await?;
-                send.write_all(b"\n").await?;
-            }
-        }
-        Err(e) => {
-            warn!(error = %e, "inventory: DB failed, falling back to FS scan");
-            let hashes = store.list_hashes();
-            let count = hashes.len();
-
-            info!(count, "ListAllBlobs: streaming inventory from FS");
-
-            // Send JSON header
-            let header = format!("{{\"count\":{}}}\n", count);
-            send.write_all(header.as_bytes()).await?;
-
-            // Stream hashes line by line
-            for hash in hashes {
-                send.write_all(hash.as_bytes()).await?;
-                send.write_all(b"\n").await?;
-            }
-        }
-    }
-
-    finish_stream(send).await
+/// True for the control messages the miner refuses outright (see
+/// `RETIRED_ENUMERATION_REPLY`).
+pub(crate) fn is_retired_enumeration(message: &common::MinerControlMessage) -> bool {
+    matches!(
+        message,
+        common::MinerControlMessage::ListAllBlobs
+            | common::MinerControlMessage::ListBlobsPage { .. }
+    )
 }
 
 async fn handle_fetch_blob(
@@ -1079,6 +1099,81 @@ async fn handle_pull_from_peer(
 
 /// Pull blob from peer using endpoint address.
 /// Extracts SocketAddr from the EndpointAddr and connects via quinn.
+/// One `FetchBlob` round trip to a peer miner: pooled connection (connect
+/// bounded by `REBALANCE_PEER_CONNECT_TIMEOUT_SECS`), request, `DATA:`
+/// frame read (bounded by `PEER_DATA_RECEPTION_TIMEOUT_SECS` and
+/// `MAX_FETCH_RESPONSE_SIZE`), blake3 checked against `hash`. Returns the
+/// verified bytes; the caller decides where they go. Shared by the
+/// validator-directed `PullFromPeer` and the backfill.
+pub async fn fetch_blob_from_peer(
+    endpoint: &quinn::Endpoint,
+    peer_node_id: &str,
+    socket_addr: std::net::SocketAddr,
+    hash: &str,
+) -> Result<Vec<u8>, miner::backfill::FetchError> {
+    use miner::backfill::FetchError;
+
+    let conn = match tokio::time::timeout(
+        std::time::Duration::from_secs(crate::constants::REBALANCE_PEER_CONNECT_TIMEOUT_SECS),
+        crate::state::get_pooled_connection(endpoint, peer_node_id, socket_addr),
+    )
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return Err(FetchError::Unreachable(e.to_string())),
+        Err(_) => {
+            return Err(FetchError::Unreachable(format!(
+                "connect timeout {}s",
+                crate::constants::REBALANCE_PEER_CONNECT_TIMEOUT_SECS
+            )));
+        }
+    };
+
+    let transport = |e: &dyn std::fmt::Display| FetchError::Transport(e.to_string());
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| transport(&e))?;
+    let request = common::MinerControlMessage::FetchBlob {
+        hash: hash.to_string(),
+    };
+    let request_bytes = serde_json::to_vec(&request).map_err(|e| transport(&e))?;
+    send.write_all(&request_bytes)
+        .await
+        .map_err(|e| transport(&e))?;
+    send.finish().map_err(|e| transport(&e))?;
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(PEER_DATA_RECEPTION_TIMEOUT_SECS),
+        recv.read_to_end(MAX_FETCH_RESPONSE_SIZE),
+    )
+    .await
+    .map_err(|_| FetchError::Transport("read timeout".to_string()))?
+    .map_err(|e| transport(&e))?;
+
+    if !response.starts_with(b"DATA:") {
+        // Every non-DATA answer (NOT_FOUND, ERROR:...) means the peer
+        // cannot serve this blob; the text is kept for the log only.
+        let peer_msg = std::str::from_utf8(&response)
+            .unwrap_or("<non-utf8>")
+            .chars()
+            .take(LOG_STRING_TRUNCATE_LEN)
+            .collect::<String>();
+        debug!(
+            hash = %truncate_for_log(hash, 16),
+            peer = %truncate_for_log(peer_node_id, 8),
+            response = %peer_msg,
+            "FetchBlob: peer did not return DATA"
+        );
+        return Err(FetchError::NotFound);
+    }
+    let data = response[5..].to_vec();
+    if data.is_empty() {
+        return Err(FetchError::NotFound);
+    }
+    if blake3::hash(&data).to_hex().as_str() != hash {
+        return Err(FetchError::HashMismatch);
+    }
+    Ok(data)
+}
+
 pub async fn pull_blob_from_peer(
     store: Arc<dyn BlobStore>,
     endpoint: quinn::Endpoint,
@@ -1087,6 +1182,9 @@ pub async fn pull_blob_from_peer(
 ) -> Result<()> {
     trace!(hash = %truncate_for_log(&hash, 16), "Pulling blob from peer");
 
+    // Exclusive on the hash while the pulled blob lands (see handle_store).
+    let _write_lock = crate::state::lock_hash_write(&hash).await;
+
     let peer_node_id = peer_addr.id.to_string();
     let id_prefix = truncate_for_log(&peer_node_id, 8);
 
@@ -1094,91 +1192,29 @@ pub async fn pull_blob_from_peer(
     let socket_addr = crate::state::socket_addr_from_endpoint(&peer_addr)
         .ok_or_else(|| anyhow::anyhow!("Peer {} has no direct IP address", id_prefix))?;
 
-    // Quick connectivity check: fail fast if peer is unreachable (3s timeout)
-    let conn = match tokio::time::timeout(
-        std::time::Duration::from_secs(crate::constants::REBALANCE_PEER_CONNECT_TIMEOUT_SECS),
-        crate::state::get_pooled_connection(&endpoint, &peer_node_id, socket_addr),
-    )
-    .await
-    {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
+    let data = match fetch_blob_from_peer(&endpoint, &peer_node_id, socket_addr, &hash).await {
+        Ok(data) => data,
+        Err(e @ miner::backfill::FetchError::Unreachable(_)) => {
             warn!(
-                "[REBALANCE] Peer {} unreachable, skipping (connect error: {})",
+                "[REBALANCE] Peer {} unreachable, skipping ({})",
                 id_prefix, e
             );
-            return Err(anyhow::anyhow!("Peer {} unreachable: {}", id_prefix, e));
+            return Err(anyhow::anyhow!("Peer {} {}", id_prefix, e));
         }
-        Err(_) => {
-            warn!(
-                "[REBALANCE] Peer {} unreachable, skipping (connect timeout {}s)",
-                id_prefix,
-                crate::constants::REBALANCE_PEER_CONNECT_TIMEOUT_SECS,
-            );
+        Err(e) => {
             return Err(anyhow::anyhow!(
-                "Peer {} unreachable: connect timeout",
-                id_prefix
+                "FetchBlob {} from peer {}: {}",
+                truncate_for_log(&hash, 16),
+                id_prefix,
+                e
             ));
         }
     };
-
-    let (mut send, mut recv) = conn.open_bi().await?;
-
-    // Send FetchBlob request
-    let request = common::MinerControlMessage::FetchBlob { hash: hash.clone() };
-    let request_bytes = serde_json::to_vec(&request)?;
-    send.write_all(&request_bytes).await?;
-    send.finish()?;
-
-    // Read response with timeout
-    let response = tokio::time::timeout(
-        std::time::Duration::from_secs(PEER_DATA_RECEPTION_TIMEOUT_SECS),
-        recv.read_to_end(MAX_FETCH_RESPONSE_SIZE),
-    )
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "Timeout reading FetchBlob response for {} from peer {}",
-            truncate_for_log(&hash, 16),
-            id_prefix
-        )
-    })??;
-
-    if !response.starts_with(b"DATA:") {
-        let peer_msg = std::str::from_utf8(&response)
-            .unwrap_or("<non-utf8>")
-            .chars()
-            .take(LOG_STRING_TRUNCATE_LEN)
-            .collect::<String>();
-        return Err(anyhow::anyhow!(
-            "Peer did not return DATA for {} (response: {})",
-            truncate_for_log(&hash, 16),
-            peer_msg
-        ));
-    }
-
-    // Skip the "DATA:" prefix (5 bytes)
-    let data = &response[5..];
-    if data.is_empty() {
-        return Err(anyhow::anyhow!("Empty DATA payload from peer"));
-    }
-
     let pull_size = data.len();
-
-    // Verify blake3 hash before storing
-    let computed = blake3::hash(data);
-    let computed_hex = computed.to_hex();
-    if computed_hex.as_str() != hash {
-        return Err(anyhow::anyhow!(
-            "Hash mismatch: requested {} stored {}",
-            truncate_for_log(&hash, 16),
-            truncate_for_log(computed_hex.as_str(), 16)
-        ));
-    }
 
     // Store blob as flat file
     store
-        .store(&hash, data)
+        .store(&hash, &data)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to store blob: {}", e))?;
 
@@ -1350,6 +1386,75 @@ async fn handle_pos_challenge(
     Ok(())
 }
 
+/// Issuer keys allowed to challenge this miner under the storage-proof
+/// protocol: the configured validator plus the warden ids and the
+/// storage-proof requesters distributed by it (both refreshed from
+/// heartbeat replies). Legacy PoS authorization does not consult the
+/// requester set.
+async fn storage_proof_issuers(
+    validator_node_id: Option<&str>,
+) -> Vec<common::storage_proof::sig::PublicKey> {
+    let warden_ids = get_warden_node_ids().read().await;
+    let requester_ids = get_storage_proof_requesters().read().await;
+    crate::storage_proof::authorized_issuers(validator_node_id, &warden_ids, &requester_ids)
+}
+
+/// Handle a storage chunk proof challenge (protocol v1): admit, prove and
+/// write exactly one response frame (PROOF or BUSY) on the same stream,
+/// then FIN. Refused challenges are closed without any bytes.
+async fn handle_storage_proof_challenge(
+    remote_node_id: &str,
+    handler: &MinerControlHandler,
+    send: &mut quinn::SendStream,
+    frame: &[u8],
+) -> Result<()> {
+    let issuers = storage_proof_issuers(handler.validator_node_id.as_deref()).await;
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0)
+    };
+    // The answer carries the requester's in-flight token: it is dropped
+    // only after the frame is written and the flow finished or reset.
+    let answer = handler
+        .storage_proof
+        .handle(remote_node_id, &issuers, frame, &now_ms)
+        .await;
+    let remote = truncate_for_log(remote_node_id, 8);
+    // The write is bounded by the challenge expiry: a requester that keeps
+    // the connection but withholds receive credit cannot pin this handler
+    // (and its permit from the shared pool) beyond the window.
+    let result = match handler
+        .storage_proof
+        .write_answer(send, &answer, now_ms())
+        .await
+    {
+        Ok(()) => {
+            match &answer.reply {
+                Reply::Proof(bytes) => {
+                    debug!(remote = %remote, len = bytes.len(), "storage-proof PROOF sent")
+                }
+                Reply::Busy(_, reason) => {
+                    debug!(remote = %remote, ?reason, "storage-proof BUSY sent")
+                }
+                Reply::Close(reason) => {
+                    debug!(remote = %remote, ?reason, "storage-proof challenge closed without response")
+                }
+            }
+            finish_stream(send).await
+        }
+        Err(e @ WriteError::Timeout) => {
+            warn!(remote = %remote, "storage-proof response not drained by the peer before expiry, stream reset");
+            let _ = send.reset(quinn::VarInt::from_u32(0));
+            Err(e.into())
+        }
+        Err(e) => Err(e.into()),
+    };
+    drop(answer);
+    result
+}
+
 // --- P2P State Sync ---
 
 use common::P2PStateSyncRequest;
@@ -1441,4 +1546,156 @@ pub fn get_state_sync_client_endpoint() -> anyhow::Result<&'static quinn::Endpoi
 
     let _ = STATE_SYNC_ENDPOINT.set(endpoint);
     Ok(STATE_SYNC_ENDPOINT.get().unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RETIRED_ENUMERATION_REPLY, is_retired_enumeration};
+    use common::MinerControlMessage;
+
+    /// The exact JSON an older validator puts on the wire must still parse
+    /// into the retired variants — that is what routes it to the refusal
+    /// arm instead of a serde error that closes the stream silently.
+    #[test]
+    fn legacy_enumeration_wire_messages_reach_the_refusal_arm() {
+        let full: MinerControlMessage = serde_json::from_str(
+            &serde_json::to_string(&MinerControlMessage::ListAllBlobs).unwrap(),
+        )
+        .unwrap();
+        assert!(is_retired_enumeration(&full));
+
+        let page: MinerControlMessage = serde_json::from_str(
+            &serde_json::to_string(&MinerControlMessage::ListBlobsPage {
+                after_hash: Some("ab".repeat(32)),
+                limit: 200_000,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(is_retired_enumeration(&page));
+    }
+
+    /// Single-blob presence checks stay served: the refusal is scoped to
+    /// whole-store enumeration only.
+    #[test]
+    fn check_blob_is_not_refused() {
+        assert!(!is_retired_enumeration(&MinerControlMessage::CheckBlob {
+            hash: "00".repeat(32),
+        }));
+    }
+
+    /// A legacy scanner reads the first line as a `{"count":N}` header. The
+    /// refusal must not be mistakable for one, so the scan fails at once.
+    #[test]
+    fn refusal_reply_is_not_an_inventory_header() {
+        let reply = std::str::from_utf8(RETIRED_ENUMERATION_REPLY).unwrap();
+        assert!(reply.starts_with("ERROR:"));
+        assert!(serde_json::from_str::<serde_json::Value>(reply).is_err());
+    }
+
+    /// The Store handler's Busy decision against a real packed store with
+    /// a tiny budget: a payload that fits is admitted (no reply), one the
+    /// remaining budget cannot take gets a Busy whose delay grows with the
+    /// fill, and the budget freeing up reopens admission. A backend without
+    /// a budget (flat) never answers Busy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_busy_reply_follows_the_write_budget() {
+        use super::store_busy_reply;
+        use crate::store::BlobStore;
+        use common::store_reply::StoreReply;
+
+        const BUDGET: u64 = 64 << 10; // 64 KiB
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::packed_store::PackedStore::open_with_limits(dir.path(), 1 << 30, BUDGET)
+            .unwrap();
+
+        // Empty queue: a 16 KiB payload fits.
+        assert_eq!(store_busy_reply(store.as_ref(), 16 << 10), None);
+        // A payload larger than the whole budget costs the whole budget and
+        // is still admissible when the queue is empty (never deadlocks).
+        assert_eq!(store_busy_reply(store.as_ref(), 10 << 20), None);
+
+        // Hold most of the budget the way queued writes do, then ask.
+        let held = std::sync::Arc::clone(&store.admission)
+            .acquire_many_owned((BUDGET - (8 << 10)) as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            store_busy_reply(store.as_ref(), 4 << 10),
+            None,
+            "4 KiB + 512 fits in 8 KiB"
+        );
+        let Some(StoreReply::Busy { retry_after_ms }) = store_busy_reply(store.as_ref(), 16 << 10)
+        else {
+            panic!("expected Busy");
+        };
+        // 7/8 full: ~500 + 0.875 * 4500 = ~4438 ms.
+        assert!((4300..=4600).contains(&retry_after_ms), "{retry_after_ms}");
+
+        // A fuller queue advertises a longer delay.
+        let more = std::sync::Arc::clone(&store.admission)
+            .acquire_many_owned(7 << 10)
+            .await
+            .unwrap();
+        let Some(StoreReply::Busy {
+            retry_after_ms: fuller,
+        }) = store_busy_reply(store.as_ref(), 16 << 10)
+        else {
+            panic!("expected Busy");
+        };
+        assert!(fuller > retry_after_ms, "{fuller} > {retry_after_ms}");
+        assert!(fuller <= common::store_reply::RETRY_AFTER_MS_MAX);
+        // The reply is a RATE_LIMITED line for senders that predate it.
+        let wire = StoreReply::busy(fuller).encode();
+        assert!(wire.starts_with(b"RATE_LIMITED "));
+        assert!(wire.len() <= common::store_reply::MAX_WIRE_LEN);
+
+        // Budget released: admission reopens and a real store goes through.
+        drop(more);
+        drop(held);
+        assert_eq!(store_busy_reply(store.as_ref(), 16 << 10), None);
+        let data = vec![7u8; 16 << 10];
+        let name = blake3::hash(&data).to_hex().to_string();
+        store.store(&name, &data).await.unwrap();
+        assert!(store.has(&name));
+
+        // Flat backend: no budget, never Busy.
+        let flat_dir = tempfile::tempdir().unwrap();
+        let flat = crate::flat_store::FlatBlobStore::new(flat_dir.path()).unwrap();
+        assert_eq!(store_busy_reply(&flat, 100 << 20), None);
+        assert_eq!(flat.inflight_headroom(1), None);
+    }
+
+    #[test]
+    fn retry_after_grows_with_fill_and_stays_in_bounds() {
+        use crate::store::InflightHeadroom;
+        let h = |available: u64| InflightHeadroom {
+            available,
+            budget: 1000,
+            cost: 2000,
+        };
+        assert!(!h(0).admits());
+        assert_eq!(h(1000).retry_after_ms(), 500);
+        assert_eq!(h(500).retry_after_ms(), 2750);
+        assert_eq!(h(0).retry_after_ms(), 5000);
+        // Available above the budget (cannot happen, defensive) is empty.
+        assert_eq!(h(5000).retry_after_ms(), 500);
+        assert!(
+            InflightHeadroom {
+                available: 10,
+                budget: 1000,
+                cost: 10
+            }
+            .admits()
+        );
+        assert_eq!(
+            InflightHeadroom {
+                available: 0,
+                budget: 0,
+                cost: 1
+            }
+            .retry_after_ms(),
+            5000
+        );
+    }
 }

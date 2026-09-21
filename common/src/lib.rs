@@ -30,10 +30,14 @@
 //! - **Deterministic ordering**: Miners sorted by UID before placement to avoid HashMap shuffle
 
 pub mod attestation_bundle;
+pub mod manifest;
 pub mod merkle;
 pub mod middleware;
+pub mod obligation_list;
 #[cfg(feature = "redb")]
 pub mod redb_utils;
+pub mod storage_proof;
+pub mod store_reply;
 pub mod stun;
 pub mod telemetry;
 pub mod tls;
@@ -197,6 +201,15 @@ pub struct MinerNode {
     /// Default is 1.0 (no penalty/bonus).
     #[serde(default = "default_balancer_reweight")]
     pub balancer_reweight: f32,
+
+    /// Storage-proof incarnation (protocol v1 §1) published by the miner in
+    /// its `Register` message and authenticated by the registration
+    /// signature. A challenger addresses the miner with this exact value.
+    /// `None` = the miner predates the field: it registers and is placed
+    /// normally but is not eligible for storage-proof challenges. Never a
+    /// ban condition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<[u8; 16]>,
 }
 
 fn default_balancer_reweight() -> f32 {
@@ -453,7 +466,20 @@ pub type ShardCommitment = (String, [u32; 8], u32, u32, iroh::EndpointAddr);
 pub struct UploadFinalizeRequest {
     pub manifest: FileManifest,
     pub warden_commitments: Vec<ShardCommitment>,
+    /// Explicit re-creation of a previously DELETED file (same hash). The
+    /// validator refuses a manifest for a deleted file with 410 unless this
+    /// is set, because a retried publication of the deleted manifest is
+    /// indistinguishable from a new upload of the same content. Admin-only
+    /// on the validator side; must never be set on a retry, only on a
+    /// request the client knows to be a fresh upload. No client sets it
+    /// today.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub revive: bool,
 }
+
+/// `FileManifest::shard_holders` value meaning "holder not known". Not `0`:
+/// UID 0 is a real miner on a Bittensor subnet.
+pub const HOLDER_UNKNOWN: u32 = u32::MAX;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FileManifest {
@@ -481,6 +507,16 @@ pub struct FileManifest {
     /// MIME content type (optional, for HTTP Content-Type header)
     #[serde(default)]
     pub content_type: Option<String>,
+    /// Provenance: miner UID that held `shards[i]` when the manifest was
+    /// written, [`HOLDER_UNKNOWN`] where nothing is known (`0` is a valid
+    /// UID). Parallel to `shards` (same length) or empty
+    /// when the writer knew nothing (every legacy row decodes to empty).
+    /// Kept out of [`ShardInfo`] on purpose: `ShardInfo` is part of the
+    /// bincode-framed [`DocManifest`] whose layout must not move, and the
+    /// legacy JSON encoding must stay byte-identical when nothing is known.
+    /// Informational only — no read path consumes it yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shard_holders: Vec<u32>,
 }
 
 fn default_manifest_placement_version() -> u8 {
@@ -532,6 +568,7 @@ impl From<DocManifest> for FileManifest {
             shards: d.shards,
             filename: None,
             content_type: None,
+            shard_holders: Vec::new(),
         }
     }
 }
@@ -563,9 +600,16 @@ pub fn doc_manifest_from_bytes(b: &[u8]) -> anyhow::Result<DocManifest> {
     bincode::deserialize(b).map_err(|e| anyhow::anyhow!(e))
 }
 
-/// Serialize a [`ClusterMap`] to bincode bytes for iroh-doc storage.
+/// Serialize a [`ClusterMap`] for on-disk retention (the gateway's historical
+/// `epoch_<N>.bin` cache).
+///
+/// JSON, not bincode: `ClusterMap` and `MinerNode` carry
+/// `skip_serializing_if` fields (`previous_hash`, `signature`, `placement_hold`,
+/// `incarnation`, ...), and bincode cannot read back a struct whose fields were
+/// skipped on write (`InvalidTagEncoding`). JSON honours `#[serde(default)]`
+/// and the skips, so a map written by one release stays readable by the next.
 pub fn cluster_map_to_bytes(m: &ClusterMap) -> anyhow::Result<Vec<u8>> {
-    bincode::serialize(m).map_err(|e| anyhow::anyhow!(e))
+    serde_json::to_vec(m).map_err(|e| anyhow::anyhow!(e))
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
@@ -661,6 +705,7 @@ impl LegacyMinerNode {
             placement_hold: false,
             placement_hold_base_hb: 0,
             p2p_reliability_score: self.p2p_reliability_score,
+            incarnation: None,
             balancer_reweight: 1.0,
         }
     }
@@ -693,14 +738,21 @@ impl LegacyClusterMap {
     }
 }
 
-/// Deserialize a [`ClusterMap`] from bincode bytes.
+/// Deserialize a [`ClusterMap`] written by [`cluster_map_to_bytes`].
+///
+/// Reads the JSON form first, then the two bincode layouts earlier releases
+/// wrote (current struct, then the legacy V1 struct) so existing cache files
+/// stay usable.
 pub fn cluster_map_from_bytes(b: &[u8]) -> anyhow::Result<ClusterMap> {
+    if let Ok(map) = serde_json::from_slice::<ClusterMap>(b) {
+        return Ok(map);
+    }
     if let Ok(map) = bincode::deserialize::<ClusterMap>(b) {
         return Ok(map);
     }
 
     let legacy: LegacyClusterMap = bincode::deserialize(b)
-        .map_err(|e| anyhow::anyhow!("Failed both V2 and V1 deserialization: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed JSON, V2 and V1 deserialization: {}", e))?;
     Ok(legacy.into_current())
 }
 
@@ -859,7 +911,12 @@ pub enum MinerControlMessage {
     CheckBlob { hash: String },
     /// Request a full inventory of all blob hashes stored by this miner.
     ///
-    /// Wire protocol for the response:
+    /// Retired: miners refuse this message for every peer with a one-line
+    /// `ERROR: unsupported message` reply (the control ALPN does not
+    /// authenticate the requester, and the validator-side consumer is gone).
+    /// The variant is kept so older senders still parse and get that reply.
+    ///
+    /// Historical wire protocol for the response:
     ///   1. A JSON header line: `{"count":<N>}\n`
     ///   2. N lines, each containing one lowercase hex BLAKE3 hash followed by `\n`
     ///   3. Stream closed (EOF)
@@ -868,13 +925,28 @@ pub enum MinerControlMessage {
     /// may hold millions of blobs).
     ListAllBlobs,
     /// Request ONE bounded keyset page of blob hashes (resumable inventory
-    /// scans). Response uses the same wire format as `ListAllBlobs`
+    /// scans). Retired like `ListAllBlobs`: refused by miners. Response used the same wire format as `ListAllBlobs`
     /// (`{"count":N}` header + N hash lines + EOF) but for a single page:
     /// hashes strictly greater than `after_hash`, ascending, at most
     /// `limit` (server-clamped). An empty page means the scan is complete.
     ListBlobsPage {
         after_hash: Option<String>,
         limit: u32,
+    },
+    /// Storage chunk proof challenge, protocol v1
+    /// (`docs/storage-proof-protocol.md` §1, §2). Distinct from the legacy
+    /// `PosChallenge`, which stays unchanged.
+    ///
+    /// `frame` is the exact framed challenge emitted by the verifier
+    /// (`body_length:u32 LE || body`, 376 bytes); the miner admits it with
+    /// `storage_proof::prover::admit_challenge`, never with a re-modelled
+    /// struct. The response is NOT a `MinerControlMessage`: the miner writes
+    /// the raw v1 response frame (`ResponseHeader || records || signature`,
+    /// framed; PROOF or the 200-byte BUSY) on the same bidirectional stream
+    /// and then FINs, exactly as the verifier's `feed`/`fin` consume it.
+    StorageProofChallenge {
+        /// Framed v1 challenge bytes, as issued.
+        frame: Vec<u8>,
     },
 }
 
@@ -920,7 +992,8 @@ pub enum ValidatorControlMessage {
         family_id: String,
         /// Unix timestamp for replay protection (rejects if >5min old)
         timestamp: u64,
-        /// Ed25519 signature of "REGISTER:{public_key}:{timestamp}"
+        /// Ed25519 signature over [`register_sign_payload`]: the public
+        /// key, the timestamp and, when published, the incarnation.
         signature: Vec<u8>,
         /// Miner's full EndpointAddr including relay hints for NAT traversal
         #[serde(default)]
@@ -928,6 +1001,12 @@ pub enum ValidatorControlMessage {
         /// Miner software version
         #[serde(default)]
         version: Option<String>,
+        /// Storage-proof incarnation (protocol v1 §1) of this process run,
+        /// covered by `signature`. Absent from miners that predate it: they
+        /// register normally and are not eligible for storage-proof
+        /// challenges (`MinerNode::incarnation` stays `None`).
+        #[serde(default)]
+        incarnation: Option<[u8; 16]>,
     },
     /// Periodic heartbeat to maintain online status (sent every 30 seconds).
     /// Miners are marked offline after 2 minutes without heartbeat.
@@ -2530,6 +2609,25 @@ pub fn compute_miner_uid(public_key: &str) -> u32 {
     (hasher.finish() as u32) & 0x7FFF_FFFF
 }
 
+/// Payload signed by a miner's `Register` message and verified by the
+/// validator.
+///
+/// `REGISTER:{public_key}:{timestamp}` for a miner that publishes no
+/// storage-proof incarnation, `REGISTER:{public_key}:{timestamp}:{hex}`
+/// (32 lowercase hex digits) when it does. Covering the incarnation binds
+/// it to the key holder: a captured registration cannot be replayed with
+/// another incarnation, and a relay cannot strip or swap it.
+pub fn register_sign_payload(
+    public_key: &str,
+    timestamp: u64,
+    incarnation: Option<&[u8; 16]>,
+) -> String {
+    match incarnation {
+        None => format!("REGISTER:{public_key}:{timestamp}"),
+        Some(inc) => format!("REGISTER:{public_key}:{timestamp}:{}", hex::encode(inc)),
+    }
+}
+
 // ============================================================================
 // Placement Group (PG) Functions
 // ============================================================================
@@ -2597,26 +2695,6 @@ pub fn calculate_pg_placement(
     calculate_placement_for_stripe(&pg_seed, 0, shards_per_file, map)
 }
 
-/// PG-based stripe placement (placement_version=2).
-///
-/// Algorithm:
-/// 1. Map file_hash → PG_ID via xxhash
-/// 2. Calculate PG's miner set via CRUSH
-/// 3. Rotate miner list by stripe_index for per-stripe spreading
-///
-/// The rotation ensures that shards from different stripes of the same file
-/// are distributed across different starting points in the miner set, improving
-/// parallel fetch performance.
-///
-/// # Arguments
-/// * `file_hash` - BLAKE3 hash of the file
-/// * `stripe_index` - Zero-based stripe index
-/// * `shards_per_stripe` - Number of shards per stripe (k + m)
-/// * `map` - Current cluster map
-///
-/// # Returns
-/// - `Ok(Vec<MinerNode>)` with miners for this stripe (rotated by stripe_index)
-/// - `Err(String)` if insufficient miners
 /// Index into a PG's ordered uid list for a shard's expected holder.
 ///
 /// The write path rotates the miner list by `stripe_index % len` before
@@ -2638,6 +2716,26 @@ pub fn expected_uid_index_for_shard(
     (stripe % len + offset) % len
 }
 
+/// PG-based stripe placement (placement_version=2).
+///
+/// Algorithm:
+/// 1. Map file_hash → PG_ID via xxhash
+/// 2. Calculate PG's miner set via CRUSH
+/// 3. Rotate miner list by stripe_index for per-stripe spreading
+///
+/// The rotation ensures that shards from different stripes of the same file
+/// are distributed across different starting points in the miner set, improving
+/// parallel fetch performance.
+///
+/// # Arguments
+/// * `file_hash` - BLAKE3 hash of the file
+/// * `stripe_index` - Zero-based stripe index
+/// * `shards_per_stripe` - Number of shards per stripe (k + m)
+/// * `map` - Current cluster map
+///
+/// # Returns
+/// - `Ok(Vec<MinerNode>)` with miners for this stripe (rotated by stripe_index)
+/// - `Err(String)` if insufficient miners
 pub fn calculate_pg_placement_for_stripe(
     file_hash: &str,
     stripe_index: u64,
@@ -2840,7 +2938,9 @@ pub fn calculate_stripe_placement_with_fallbacks(
     let mut pool: Vec<&MinerNode> = cluster_map
         .miners
         .iter()
-        .filter(|m| !primary_uids.contains(&m.uid) && m.weight > 0 && !m.draining && !m.placement_hold)
+        .filter(|m| {
+            !primary_uids.contains(&m.uid) && m.weight > 0 && !m.draining && !m.placement_hold
+        })
         .collect();
     pool.sort_by_key(|m| m.uid);
 
@@ -4790,6 +4890,7 @@ mod tests {
                     placement_hold: false,
                     placement_hold_base_hb: 0,
                     p2p_reliability_score: 1.0,
+                    incarnation: None,
                     is_historical_seeder: false,
                 }
             })
@@ -4925,6 +5026,7 @@ mod tests {
                     placement_hold: false,
                     placement_hold_base_hb: 0,
                     p2p_reliability_score: 1.0,
+                    incarnation: None,
                     is_historical_seeder: false,
                 }
             })
@@ -5217,6 +5319,7 @@ mod tests {
                     placement_hold: false,
                     placement_hold_base_hb: 0,
                     p2p_reliability_score: 1.0,
+                    incarnation: None,
                     is_historical_seeder: false,
                 });
                 uid_counter += 1;
@@ -5373,7 +5476,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod placement_hold_tests {
     use super::*;
@@ -5382,43 +5484,44 @@ mod placement_hold_tests {
         let i = uid;
         let sk = iroh::SecretKey::from_bytes(&[i as u8 + 1; 32]);
         let mut n = MinerNode {
-                    uid: uid,
-                    weight: 100,
-                    balancer_reweight: 1.0,
-                    family_id: format!("family-{}", i % 10),
-                    endpoint: iroh::EndpointAddr::from(sk.public()),
-                    ip_subnet: String::new(),
-                    ip_address: None,
-                    http_addr: format!("http://10.0.0.{}:3001", i),
-                    public_key: format!("{:064x}", i),
-                    total_storage: 1_000_000,
-                    available_storage: 500_000,
-                    strikes: 0,
-                    last_seen: 0,
-                    heartbeat_count: 0,
-                    registration_time: 0,
-                    bandwidth_total: 0,
-                    bandwidth_window_start: 0,
-                    weight_manual_override: false,
-                    reputation: 0.0,
-                    consecutive_audit_passes: 0,
-                    integrity_fails: 0,
-                    version: String::new(),
-                    base_weight: 0,
-                    warden_challenges_total: 0,
-                    warden_challenges_passed: 0,
-                    fetch_timeout_count: 0,
-                    expected_shards: 0,
-                    actual_shards: 0,
-                    trust_score: 0.0,
-                    earned_capacity_bytes: 0,
-                    draining: false,
-                    drained_for_offline: false,
-                    placement_hold: false,
-                    placement_hold_base_hb: 0,
-                    p2p_reliability_score: 1.0,
-                    is_historical_seeder: false,
-                };
+            uid: uid,
+            weight: 100,
+            balancer_reweight: 1.0,
+            family_id: format!("family-{}", i % 10),
+            endpoint: iroh::EndpointAddr::from(sk.public()),
+            ip_subnet: String::new(),
+            ip_address: None,
+            http_addr: format!("http://10.0.0.{}:3001", i),
+            public_key: format!("{:064x}", i),
+            total_storage: 1_000_000,
+            available_storage: 500_000,
+            strikes: 0,
+            last_seen: 0,
+            heartbeat_count: 0,
+            registration_time: 0,
+            bandwidth_total: 0,
+            bandwidth_window_start: 0,
+            weight_manual_override: false,
+            reputation: 0.0,
+            consecutive_audit_passes: 0,
+            integrity_fails: 0,
+            version: String::new(),
+            base_weight: 0,
+            warden_challenges_total: 0,
+            warden_challenges_passed: 0,
+            fetch_timeout_count: 0,
+            expected_shards: 0,
+            actual_shards: 0,
+            trust_score: 0.0,
+            earned_capacity_bytes: 0,
+            draining: false,
+            drained_for_offline: false,
+            placement_hold: false,
+            placement_hold_base_hb: 0,
+            p2p_reliability_score: 1.0,
+            incarnation: None,
+            is_historical_seeder: false,
+        };
         n.placement_hold = hold;
         n
     }
@@ -5442,5 +5545,125 @@ mod placement_hold_tests {
         assert!(!js.contains("placement_hold"), "{js}");
         let hj = serde_json::to_string(&node(8, true)).unwrap();
         assert!(hj.contains(r#""placement_hold":true"#), "{hj}");
+    }
+}
+
+#[cfg(test)]
+mod register_payload_tests {
+    use super::*;
+
+    #[test]
+    fn payload_without_incarnation_is_the_legacy_form() {
+        assert_eq!(
+            register_sign_payload("abcd", 1_700_000_000, None),
+            "REGISTER:abcd:1700000000"
+        );
+    }
+
+    #[test]
+    fn payload_with_incarnation_appends_its_hex() {
+        let inc = [0xA5u8; 16];
+        assert_eq!(
+            register_sign_payload("abcd", 1_700_000_000, Some(&inc)),
+            "REGISTER:abcd:1700000000:a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
+        );
+    }
+
+    #[test]
+    fn register_without_incarnation_field_deserializes_to_none() {
+        // A miner that predates the field: the key is absent on the wire.
+        let json = serde_json::json!({
+            "Register": {
+                "public_key": "ab",
+                "http_addr": "http://127.0.0.1:1",
+                "total_storage": 1,
+                "available_storage": 1,
+                "family_id": "f",
+                "timestamp": 1,
+                "signature": [],
+            }
+        });
+        let msg: ValidatorControlMessage = serde_json::from_value(json).unwrap();
+        let ValidatorControlMessage::Register { incarnation, .. } = msg else {
+            panic!("expected Register");
+        };
+        assert_eq!(incarnation, None);
+    }
+
+    #[test]
+    fn register_incarnation_round_trips() {
+        let msg = ValidatorControlMessage::Register {
+            public_key: "ab".into(),
+            http_addr: "http://127.0.0.1:1".into(),
+            total_storage: 1,
+            available_storage: 1,
+            family_id: "f".into(),
+            timestamp: 1,
+            signature: vec![],
+            endpoint_addr: None,
+            version: None,
+            incarnation: Some([7u8; 16]),
+        };
+        let bytes = serde_json::to_vec(&msg).unwrap();
+        let back: ValidatorControlMessage = serde_json::from_slice(&bytes).unwrap();
+        let ValidatorControlMessage::Register { incarnation, .. } = back else {
+            panic!("expected Register");
+        };
+        assert_eq!(incarnation, Some([7u8; 16]));
+    }
+
+    #[test]
+    fn miner_node_incarnation_is_optional_on_the_wire() {
+        let key = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+        let mut node = MinerNode {
+            uid: 1,
+            endpoint: iroh::EndpointAddr::new(key),
+            weight: 1,
+            balancer_reweight: 1.0,
+            ip_subnet: String::new(),
+            ip_address: None,
+            http_addr: String::new(),
+            public_key: hex::encode(key.as_bytes()),
+            total_storage: 0,
+            available_storage: 0,
+            family_id: "f".into(),
+            strikes: 0,
+            last_seen: 0,
+            is_historical_seeder: false,
+            heartbeat_count: 0,
+            registration_time: 0,
+            bandwidth_total: 0,
+            bandwidth_window_start: 0,
+            weight_manual_override: false,
+            reputation: 0.0,
+            consecutive_audit_passes: 0,
+            integrity_fails: 0,
+            version: String::new(),
+            base_weight: 0,
+            warden_challenges_total: 0,
+            warden_challenges_passed: 0,
+            fetch_timeout_count: 0,
+            expected_shards: 0,
+            actual_shards: 0,
+            trust_score: 0.0,
+            earned_capacity_bytes: 0,
+            draining: false,
+            drained_for_offline: false,
+            placement_hold: false,
+            placement_hold_base_hb: 0,
+            p2p_reliability_score: 1.0,
+            incarnation: None,
+        };
+        // Old maps (and old miners) carry no key at all.
+        let mut json = serde_json::to_value(&node).unwrap();
+        assert!(json.get("incarnation").is_none());
+        json.as_object_mut().unwrap().remove("incarnation");
+        let back: MinerNode = serde_json::from_value(json).unwrap();
+        assert_eq!(back.incarnation, None);
+
+        node.incarnation = Some([9u8; 16]);
+        let json = serde_json::to_value(&node).unwrap();
+        let back: MinerNode = serde_json::from_value(json).unwrap();
+        assert_eq!(back.incarnation, Some([9u8; 16]));
     }
 }
