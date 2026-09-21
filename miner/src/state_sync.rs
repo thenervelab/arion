@@ -395,6 +395,7 @@ mod tests {
             placement_hold: false,
             placement_hold_base_hb: 0,
             p2p_reliability_score: 1.0,
+            incarnation: None,
             balancer_reweight: 1.0,
         }
     }

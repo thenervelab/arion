@@ -88,6 +88,11 @@ static NEEDS_REREGISTRATION: OnceLock<Arc<std::sync::atomic::AtomicBool>> = Once
 /// Dynamic warden node IDs for PoS challenge authorization (hex strings)
 static WARDEN_NODE_IDS: OnceLock<Arc<RwLock<Vec<String>>>> = OnceLock::new();
 
+/// Node IDs allowed to issue storage-proof challenges on top of the
+/// validator and the wardens (hex strings), replaced on every heartbeat
+/// reply that carries `storage_proof_requesters`.
+static STORAGE_PROOF_REQUESTERS: OnceLock<Arc<RwLock<Vec<String>>>> = OnceLock::new();
+
 /// Whether the validator is currently reachable (set by heartbeat loop, read by rebalance loop)
 static VALIDATOR_REACHABLE: OnceLock<AtomicBool> = OnceLock::new();
 
@@ -136,6 +141,12 @@ static GATEWAY_ENDPOINTS: OnceLock<DashMap<String, common::GatewayEndpoint>> = O
 /// Whether the miner has fully synchronized the historical Hash Chain.
 static IS_HISTORICAL_SEEDER: OnceLock<AtomicBool> = OnceLock::new();
 
+/// Per-hash write locks (hex hash -> mutex). Held by Store and
+/// PullFromPeer for the whole write, and by the obligation-list purge
+/// across its final check and delete, so a write and a purge of the same
+/// hash never interleave. Entries are removed when the last holder drops.
+static HASH_WRITE_LOCKS: OnceLock<DashMap<String, Arc<tokio::sync::Mutex<()>>>> = OnceLock::new();
+
 pub fn get_peer_cache() -> &'static DashMap<String, iroh::EndpointAddr> {
     PEER_MINER_CACHE.get_or_init(DashMap::new)
 }
@@ -180,6 +191,10 @@ pub fn get_needs_reregistration() -> &'static Arc<std::sync::atomic::AtomicBool>
 
 pub fn get_warden_node_ids() -> &'static Arc<RwLock<Vec<String>>> {
     WARDEN_NODE_IDS.get_or_init(|| Arc::new(RwLock::new(Vec::new())))
+}
+
+pub fn get_storage_proof_requesters() -> &'static Arc<RwLock<Vec<String>>> {
+    STORAGE_PROOF_REQUESTERS.get_or_init(|| Arc::new(RwLock::new(Vec::new())))
 }
 
 pub fn get_validator_reachable() -> &'static AtomicBool {
@@ -249,6 +264,105 @@ pub fn get_gateway_endpoints() -> &'static DashMap<String, common::GatewayEndpoi
 
 pub fn get_is_historical_seeder() -> &'static AtomicBool {
     IS_HISTORICAL_SEEDER.get_or_init(|| AtomicBool::new(false))
+}
+
+fn hash_write_locks() -> &'static DashMap<String, Arc<tokio::sync::Mutex<()>>> {
+    HASH_WRITE_LOCKS.get_or_init(DashMap::new)
+}
+
+fn hash_write_mutex(hash_hex: &str) -> Arc<tokio::sync::Mutex<()>> {
+    hash_write_locks()
+        .entry(hash_hex.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Exclusive hold on a hash for the duration of a write (or a purge
+/// delete). Dropping it releases the hash and frees the map entry when
+/// nobody else is waiting on it.
+pub struct HashWriteLock {
+    hash_hex: String,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for HashWriteLock {
+    fn drop(&mut self) {
+        // Release first, then drop the entry only if we were the last
+        // holder (the map's own Arc is the single remaining reference).
+        self.guard.take();
+        hash_write_locks().remove_if(&self.hash_hex, |_, m| Arc::strong_count(m) == 1);
+    }
+}
+
+/// Wait for and take the write lock of `hash_hex` (writers: Store,
+/// PullFromPeer).
+pub async fn lock_hash_write(hash_hex: &str) -> HashWriteLock {
+    /// A waiter cancelled mid-wait (connection dropped) must not leave a
+    /// free entry behind: run the same last-holder cleanup on drop.
+    struct WaitCleanup<'a>(&'a str, bool);
+    impl Drop for WaitCleanup<'_> {
+        fn drop(&mut self) {
+            if !self.1 {
+                hash_write_locks().remove_if(self.0, |_, m| Arc::strong_count(m) == 1);
+            }
+        }
+    }
+    let mutex = hash_write_mutex(hash_hex);
+    let mut cleanup = WaitCleanup(hash_hex, false);
+    let guard = mutex.lock_owned().await;
+    cleanup.1 = true;
+    HashWriteLock {
+        hash_hex: hash_hex.to_string(),
+        guard: Some(guard),
+    }
+}
+
+/// Take the write lock of `hash_hex` only if nobody holds it (the purge:
+/// a busy hash is skipped, never waited for).
+pub fn try_lock_hash_write(hash_hex: &str) -> Option<HashWriteLock> {
+    let mutex = hash_write_mutex(hash_hex);
+    match mutex.try_lock_owned() {
+        Ok(guard) => Some(HashWriteLock {
+            hash_hex: hash_hex.to_string(),
+            guard: Some(guard),
+        }),
+        Err(_) => None,
+    }
+}
+
+/// A purge pass is walking the inventory and deleting. The backfill reads
+/// this and waits: the two loops touch disjoint blobs (unlisted vs
+/// listed) but share the disk, and a purge pass must not race a fill for
+/// I/O on a node that is already reclaiming space.
+static PURGE_PASS_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark a purge pass running for the lifetime of the returned guard.
+pub fn mark_purge_pass_active() -> PurgePassGuard {
+    PURGE_PASS_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
+    PurgePassGuard(())
+}
+
+/// Whether a purge pass is running right now. Read by the backfill loop,
+/// which is not compiled into the release binary.
+#[cfg_attr(not(any(test, feature = "backfill")), allow(dead_code))]
+pub fn purge_pass_active() -> bool {
+    PURGE_PASS_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Clears the purge-pass flag on drop, whichever way the pass ends.
+pub struct PurgePassGuard(());
+
+impl Drop for PurgePassGuard {
+    fn drop(&mut self) {
+        PURGE_PASS_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Whether a write for `hash_hex` is currently in progress.
+pub fn is_write_inflight(hash_hex: &str) -> bool {
+    hash_write_locks()
+        .get(hash_hex)
+        .is_some_and(|m| m.try_lock().is_err())
 }
 
 /// Get a pooled quinn connection or create a new one.

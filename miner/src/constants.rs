@@ -111,11 +111,10 @@ pub const MAX_BATCH_PG_RESPONSE_SIZE: usize = 20 * 1024 * 1024;
 /// With ~30 shards/file and ~800KB/shard, 1000 files = ~24GB potential memory
 pub const REBALANCE_MAX_FILES_PER_CYCLE: usize = 1000;
 
-/// Maximum concurrent P2P stream handlers to prevent connection flood attacks.
-/// This bounds task spawning in handle_miner_control() to prevent OOM.
-/// Must exceed store_concurrency (1024) + pull + fetch + pos to avoid
-/// Store operations starving FetchBlob and other handler types.
-pub const MAX_CONCURRENT_HANDLERS: usize = 2048;
+// The cap on concurrent P2P stream handlers (formerly the constant
+// `MAX_CONCURRENT_HANDLERS` = 2048) is derived at boot from the total RAM
+// since 0.1.34: see `crate::limits` (`MINER_MAX_CONCURRENT_HANDLERS`
+// overrides it).
 
 // ============================================================================
 // QUIC Transport

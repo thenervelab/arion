@@ -32,10 +32,17 @@ subtle = "2.5"
 # For attestation bundle SCALE encoding
 parity-scale-codec = { version = "3.6", features = ["derive"] }
 scale-info = { version = "2.11", features = ["derive"] }
-# For merkle tree hashing
+# For merkle tree hashing and storage-proof Bao slices
 blake3 = "1.5"
+# Storage-proof protocol v1: Bao slices over BLAKE3 (pinned, see docs/storage-proof-protocol.md §7)
+bao-tree = { workspace = true }
 # Ed25519 keys — used by transport module and optionally for attestation verification
 ed25519-dalek = { workspace = true }
+# Explicit canonical-point / torsion checks and the streamed cofactorless
+# equation of the strict Ed25519 profile (both already compiled transitively
+# through ed25519-dalek)
+curve25519-dalek = "4"
+sha2 = { workspace = true }
 # Optional: redb database helpers (enabled with "redb" feature)
 redb = { version = "3", optional = true }
 # Quinn transport foundation (coexists with iroh during migration)
@@ -57,3 +64,6 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

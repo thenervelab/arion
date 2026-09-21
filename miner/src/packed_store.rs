@@ -60,8 +60,9 @@
 //!   ~840 KB, so a message cap is either too loose for big blobs (512 x
 //!   840 KB is still 430 MB) or starves tiny ones for nothing. Peak heap
 //!   for pending writes is ~2x the budget (queued payloads + the writer's
-//!   batch buffer). `PACKED_INFLIGHT_MAX_BYTES` overrides the 128 MiB
-//!   default.
+//!   batch buffer). The default is derived at boot from the total RAM
+//!   (`crate::limits`: total/8 clamped to 256 MiB..4 GiB);
+//!   `PACKED_INFLIGHT_MAX_BYTES` overrides it.
 //!
 //! Trashed and overwritten payloads remain in their volumes as dead bytes
 //! until a future compaction pass; per-volume dead-byte counters are already
@@ -93,9 +94,6 @@ const DEFAULT_VOLUME_TARGET: u64 = 1 << 30;
 /// Snapshot is rewritten after this many index mutations since the last one.
 const SNAPSHOT_EVERY_OPS: u64 = 500_000;
 
-/// Default byte budget for writes queued to the writer (see module docs).
-const DEFAULT_INFLIGHT_BUDGET: u64 = 128 << 20;
-
 /// Fixed per-request admission overhead on top of the payload: the queued
 /// `StoreReq` itself, its name String, channel node and oneshot. Also the
 /// floor cost of a tiny blob, which bounds the message COUNT a budget can
@@ -110,14 +108,11 @@ fn volume_target_bytes() -> u64 {
         .unwrap_or(DEFAULT_VOLUME_TARGET)
 }
 
-/// In-flight write budget in bytes. Clamped so `acquire_many(u32)` and the
-/// semaphore permit ceiling can never be exceeded.
+/// In-flight write budget in bytes: the process-wide limit resolved once
+/// at boot (`crate::limits`, RAM-derived or `PACKED_INFLIGHT_MAX_BYTES`),
+/// bounded so `acquire_many(u32)` and the semaphore ceiling hold.
 fn inflight_budget_bytes() -> u64 {
-    std::env::var("PACKED_INFLIGHT_MAX_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_INFLIGHT_BUDGET)
-        .clamp(8 << 20, 2 << 30)
+    crate::limits::get().inflight_budget_bytes
 }
 
 /// Truncated 16-byte digest of a blob name — the in-RAM index key. The full
@@ -196,7 +191,7 @@ pub struct PackedStore {
     writer_tx: tokio::sync::mpsc::UnboundedSender<StoreReq>,
     /// Byte-permits gating writer admission (see module docs). The mpsc
     /// stays unbounded because this semaphore IS the bound.
-    admission: Arc<tokio::sync::Semaphore>,
+    pub(crate) admission: Arc<tokio::sync::Semaphore>,
     inflight_budget: u64,
     /// Bytes currently admitted (gauge; exact upper bound = budget).
     inflight_bytes: Arc<AtomicU64>,
@@ -270,6 +265,18 @@ impl PackedStore {
     /// journal, truncates any torn tail, and spawns the writer task.
     pub fn open(root: impl AsRef<Path>) -> std::io::Result<Arc<Self>> {
         Self::open_with_limits(root, volume_target_bytes(), inflight_budget_bytes())
+    }
+
+    /// Permits one payload takes from the admission budget: payload plus
+    /// the fixed per-request overhead, capped at the budget so one
+    /// oversized blob is still admissible (alone). Bounded by `u32::MAX`
+    /// for `acquire_many(u32)`: a 4 GiB budget
+    /// (`crate::limits::MAX_INFLIGHT_BUDGET`) is one permit past it.
+    fn admission_cost(&self, payload_len: u64) -> u64 {
+        payload_len
+            .saturating_add(REQ_OVERHEAD_BYTES)
+            .min(self.inflight_budget)
+            .min(u32::MAX as u64)
     }
 
     /// [`open`](Self::open) with an explicit volume-roll threshold (tests).
@@ -608,6 +615,14 @@ impl PackedStore {
         Ok(Bytes::from(payload))
     }
 
+    /// Live index entry of `hash_hex`, `NotFound` when absent.
+    fn live_loc(&self, hash_hex: &str) -> std::io::Result<Loc> {
+        let idx = self.idx.read().unwrap();
+        idx.live
+            .get(name_key(hash_hex))
+            .ok_or_else(|| std::io::ErrorKind::NotFound.into())
+    }
+
     fn read_at(&self, loc: Loc, want_name: &str) -> std::io::Result<Bytes> {
         match Self::read_at_with(self.fd(loc.vol)?.as_ref(), loc, want_name) {
             Ok(b) => Ok(b),
@@ -885,7 +900,7 @@ impl crate::store::BlobStore for PackedStore {
         // producers wait here holding only their caller-owned slice, not a
         // queued duplicate. Cost is capped at the budget so one oversized
         // blob can still be admitted (alone) instead of deadlocking.
-        let cost = (data.len() as u64 + REQ_OVERHEAD_BYTES).min(self.inflight_budget) as u32;
+        let cost = self.admission_cost(data.len() as u64) as u32;
         let permit = Arc::clone(&self.admission)
             .acquire_many_owned(cost)
             .await
@@ -910,15 +925,31 @@ impl crate::store::BlobStore for PackedStore {
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?
     }
 
+    fn inflight_headroom(&self, payload_len: u64) -> Option<crate::store::InflightHeadroom> {
+        Some(crate::store::InflightHeadroom {
+            available: self.admission.available_permits() as u64,
+            budget: self.inflight_budget,
+            cost: self.admission_cost(payload_len),
+        })
+    }
+
     async fn read(&self, hash_hex: &str) -> std::io::Result<Bytes> {
-        let loc = {
-            let idx = self.idx.read().unwrap();
-            idx.live
-                .get(name_key(hash_hex))
-                .ok_or(std::io::ErrorKind::NotFound)?
-        };
+        let loc = self.live_loc(hash_hex)?;
         // Payloads are small (median ~100B, p99 < 1 MiB): a blocking pread
         // here is cheaper than a spawn_blocking round-trip.
+        self.read_at(loc, hash_hex)
+    }
+
+    async fn read_at_most(&self, hash_hex: &str, max_len: u64) -> std::io::Result<Bytes> {
+        let loc = self.live_loc(hash_hex)?;
+        // The index knows the payload length: refuse before the pread
+        // allocates the record buffer.
+        if u64::from(loc.payload_len) > max_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!("blob longer than the {max_len}-byte bound"),
+            ));
+        }
         self.read_at(loc, hash_hex)
     }
 
@@ -928,6 +959,15 @@ impl crate::store::BlobStore for PackedStore {
             .unwrap()
             .live
             .contains_key(name_key(hash_hex))
+    }
+
+    fn blob_len(&self, hash_hex: &str) -> Option<u64> {
+        self.idx
+            .read()
+            .unwrap()
+            .live
+            .get(name_key(hash_hex))
+            .map(|loc| loc.payload_len as u64)
     }
 
     async fn delete(&self, hash_hex: &str) -> std::io::Result<()> {
@@ -1113,6 +1153,34 @@ mod tests {
 
     fn open_small(dir: &Path) -> Arc<PackedStore> {
         PackedStore::open_with_target(dir, 1 << 20).unwrap()
+    }
+
+    /// `read_at_most` refuses a longer payload from the index alone, before
+    /// the record is read.
+    #[tokio::test]
+    async fn read_at_most_refuses_oversized_payloads_from_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_small(dir.path());
+        let data = vec![0x33u8; 64 << 10];
+        store.store(H1, &data).await.unwrap();
+
+        let err = store.read_at_most(H1, 16).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+        let err = store
+            .read_at_most(H1, data.len() as u64 - 1)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+        assert_eq!(
+            store
+                .read_at_most(H1, data.len() as u64)
+                .await
+                .unwrap()
+                .as_ref(),
+            &data[..]
+        );
+        let err = store.read_at_most(H2, 16).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     /// Regression test for the production RSS blow-up: producers flooding

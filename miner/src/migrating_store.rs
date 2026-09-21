@@ -94,12 +94,33 @@ impl BlobStore for MigratingStore {
         Ok(())
     }
 
+    fn inflight_headroom(&self, payload_len: u64) -> Option<crate::store::InflightHeadroom> {
+        self.packed.inflight_headroom(payload_len)
+    }
+
     async fn read(&self, hash_hex: &str) -> std::io::Result<Bytes> {
         read_across(|| self.packed.read(hash_hex), || self.flat.read(hash_hex)).await
     }
 
+    async fn read_at_most(&self, hash_hex: &str, max_len: u64) -> std::io::Result<Bytes> {
+        read_across(
+            || self.packed.read_at_most(hash_hex, max_len),
+            || self.flat.read_at_most(hash_hex, max_len),
+        )
+        .await
+    }
+
     fn has(&self, hash_hex: &str) -> bool {
         has_across(|| self.packed.has(hash_hex), || self.flat.has(hash_hex))
+    }
+
+    fn blob_len(&self, hash_hex: &str) -> Option<u64> {
+        // Same race as `has`: a blob mid-move may vanish from flat after
+        // the packed miss, so look at packed once more before giving up.
+        self.packed
+            .blob_len(hash_hex)
+            .or_else(|| self.flat.blob_len(hash_hex))
+            .or_else(|| self.packed.blob_len(hash_hex))
     }
 
     async fn delete(&self, hash_hex: &str) -> std::io::Result<()> {

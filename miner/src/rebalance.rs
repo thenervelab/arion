@@ -1736,20 +1736,39 @@ where
 
 /// Write a verified shard and record its inventory row. Only the store
 /// failure is surfaced: a missing inventory row is logged, as before.
+///
+/// Exclusive on the hash from before the store until the inventory row
+/// is written (the same lock as `Store` and `PullFromPeer`): the
+/// obligation-list purge skips a hash whose lock is held and re-reads
+/// `stored_at` under the lock before deleting, so a repair target that
+/// lands during a pass is never deleted between its bytes and its row.
 async fn persist_fetched_shard(
     store: &dyn BlobStore,
     blob_hash_hex: &str,
     data: Vec<u8>,
 ) -> std::io::Result<()> {
-    store.store(blob_hash_hex, &data).await?;
-    if let Err(e) = crate::inventory::insert_shard(blob_hash_hex) {
-        warn!(
-            shard = %&blob_hash_hex[..12.min(blob_hash_hex.len())],
-            error = %e,
-            "inventory: failed to insert rebalance-fetched shard"
-        );
-    }
-    Ok(())
+    persist_under_write_lock(blob_hash_hex, async {
+        store.store(blob_hash_hex, &data).await?;
+        if let Err(e) = crate::inventory::insert_shard(blob_hash_hex) {
+            warn!(
+                shard = %&blob_hash_hex[..12.min(blob_hash_hex.len())],
+                error = %e,
+                "inventory: failed to insert rebalance-fetched shard"
+            );
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Run `persist` while holding the per-hash write lock of `blob_hash_hex`
+/// (`state::lock_hash_write`), releasing it once `persist` has returned.
+async fn persist_under_write_lock<F, T>(blob_hash_hex: &str, persist: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let _write_lock = crate::state::lock_hash_write(blob_hash_hex).await;
+    persist.await
 }
 
 /// Fetch a single manifest from the local iroh-doc replica.
@@ -1898,7 +1917,7 @@ async fn fetch_manifest_on_conn(
         return Err(anyhow::anyhow!("Validator still warming up"));
     }
 
-    let manifest: common::FileManifest = serde_json::from_slice(&response_bytes)?;
+    let manifest: common::FileManifest = common::manifest::decode_any(&response_bytes)?;
     Ok(Some(manifest))
 }
 
@@ -2161,18 +2180,22 @@ pub async fn reconstruct_shard(
         return Ok(false);
     }
 
-    store
-        .store(&shard_hash_hex, &reconstructed)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to store reconstructed shard: {}", e))?;
+    persist_under_write_lock(&shard_hash_hex, async {
+        store
+            .store(&shard_hash_hex, &reconstructed)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to store reconstructed shard: {}", e))?;
 
-    if let Err(e) = crate::inventory::insert_shard(&shard_hash_hex) {
-        warn!(
-            shard = %&shard_hash_hex[..12],
-            error = %e,
-            "inventory: failed to insert reconstructed shard"
-        );
-    }
+        if let Err(e) = crate::inventory::insert_shard(&shard_hash_hex) {
+            warn!(
+                shard = %&shard_hash_hex[..12],
+                error = %e,
+                "inventory: failed to insert reconstructed shard"
+            );
+        }
+        anyhow::Ok(())
+    })
+    .await?;
 
     // 6. Return Ok(true) if successful
     warn!(
@@ -2372,7 +2395,7 @@ async fn perform_erasure_recovery(
 mod tests {
     use super::{
         PgSweep, ShardOutcome, ShardSource, fetch_under_deadline_then_persist, manifest_is_gapped,
-        manifest_stripe_count, repair_placement_versions_to_try,
+        manifest_stripe_count, persist_under_write_lock, repair_placement_versions_to_try,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2457,6 +2480,27 @@ mod tests {
         .await;
         assert!(matches!(outcome, ShardOutcome::DeadlineExpired));
         assert!(!persisted.load(Ordering::SeqCst));
+    }
+
+    /// The rebalance writer holds the hash's write lock for the whole
+    /// persist (store + inventory row) and releases it after: the purge
+    /// sees the hash as in flight exactly while it is being written, and
+    /// its own `try_lock_hash_write` fails during that window.
+    #[tokio::test]
+    async fn persist_holds_the_hash_write_lock_until_the_row_is_written() {
+        let hash = "rebalance-persist-lock-test";
+        assert!(!crate::state::is_write_inflight(hash));
+        let seen_inflight = Arc::new(AtomicBool::new(false));
+        let seen = seen_inflight.clone();
+        persist_under_write_lock(hash, async move {
+            seen.store(crate::state::is_write_inflight(hash), Ordering::SeqCst);
+            assert!(crate::state::try_lock_hash_write(hash).is_none());
+            tokio::task::yield_now().await;
+        })
+        .await;
+        assert!(seen_inflight.load(Ordering::SeqCst));
+        assert!(!crate::state::is_write_inflight(hash));
+        assert!(crate::state::try_lock_hash_write(hash).is_some());
     }
 
     #[tokio::test]
