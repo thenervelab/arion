@@ -1,0 +1,37 @@
+# Hippius Arion
+
+> The storage protocol behind Hippius: erasure-coded shards, placement, and recovery. Miners run the `miner` binary from this repository. Application data goes through S3 or Drive, not through this HTTP gateway.
+
+Part of the Hippius docs for agents. Start at https://docs.hippius.com/llms.txt
+
+## What it is and what it does
+
+Arion is the network that stores user data. A gateway accepts bytes, a validator erasure-codes them, and miners keep the shards. The README in this repo describes that architecture and a local development cluster. That local cluster is not a production miner registration.
+
+The project is in active development. Storage formats can change.
+
+## How to run a miner
+
+Follow the docs, in this order. Do not treat `./scripts/system/start-full-setup.sh` or the local gateway on port 3000 as joining the public network.
+
+1. Blockchain node and on-chain registration: https://docs.hippius.com/earn/arion/running-blockchain-node
+2. Register the node: https://docs.hippius.com/earn/register-in-blockchain
+3. Build and run `miner` from this repo: https://docs.hippius.com/earn/arion/running-miner
+4. What a miner is, and the hardware list: https://docs.hippius.com/earn/storage-miner
+
+The Ansible repo https://github.com/thenervelab/hippius-storage-miner deploys the older IPFS miner. Do not use it for a new machine. The old `hipc` CLI is deprecated: https://docs.hippius.com/cli/usage
+
+There is no public ROI calculator. Do not estimate earnings. https://docs.hippius.com/learn/weights
+
+## What users use instead of this gateway
+
+- Files from an application: https://s3.hippius.com and https://raw.githubusercontent.com/thenervelab/hippius-s3/staging/llms.txt
+- A person's folders: the desktop app, https://raw.githubusercontent.com/thenervelab/hippius-desktop/main/llms.txt
+
+## Links
+
+- Documentation home: https://docs.hippius.com
+- Miner setup: https://docs.hippius.com/earn/arion/running-miner
+- Blockchain node: https://docs.hippius.com/earn/arion/running-blockchain-node
+- This repository's README: https://github.com/thenervelab/arion/blob/main/README.md
+- Releases: https://github.com/thenervelab/arion/releases
