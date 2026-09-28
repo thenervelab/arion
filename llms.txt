@@ -26,12 +26,12 @@ There is no public ROI calculator. Do not estimate earnings. https://docs.hippiu
 ## What users use instead of this gateway
 
 - Files from an application: https://s3.hippius.com and https://raw.githubusercontent.com/thenervelab/hippius-s3/staging/llms.txt
-- A person's folders: the desktop app, https://raw.githubusercontent.com/thenervelab/hippius-desktop/main/llms.txt
+- A person's folders: the desktop app, https://raw.githubusercontent.com/thenervelab/hippius-desktop/staging/llms.txt
 
 ## Links
 
 - Documentation home: https://docs.hippius.com
 - Miner setup: https://docs.hippius.com/earn/arion/running-miner
 - Blockchain node: https://docs.hippius.com/earn/arion/running-blockchain-node
-- This repository's README: https://github.com/thenervelab/arion/blob/main/README.md
+- This repository's README: https://raw.githubusercontent.com/thenervelab/arion/main/README.md
 - Releases: https://github.com/thenervelab/arion/releases
