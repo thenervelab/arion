@@ -5,58 +5,78 @@
 //! ## Purge rule
 //!
 //! A live blob is purgeable iff, in this order:
-//! 0. this miner owns at least one PG ([`PurgeGate::ownership_nonempty`]).
-//!    A miner with CRUSH weight 0 (connectivity quarantine, declared
-//!    full, duplicate address, absence) owns NO PG, and an empty owned
-//!    set makes every later clause vacuous: coverage is trivially
-//!    complete, the filter is empty, every blob is a filter miss. Such a
-//!    pass would empty the store of a node that gets its weight back an
-//!    hour later. The pass is refused, logged once per generation with
-//!    the map epoch and this miner's weight, and counted
-//!    (`purge_refused_empty_ownership_total`),
+//! 0. this miner's uid is listed in the map it holds, and not as
+//!    draining nor under a placement hold ([`PurgeGate::miner_eligible`]):
+//!    a map that does not list it says nothing about what it owns, and a
+//!    draining or held miner is in a state that lasts until an operator
+//!    lifts it, not a weight the network assigns; nothing is decided
+//!    (logged once per generation, counted in
+//!    `purge_refused_not_in_map_total` / `purge_refused_not_placeable_total`).
+//!    A miner
+//!    that IS listed with CRUSH weight 0 (connectivity quarantine,
+//!    declared full, duplicate address) owns no PG now and follows the
+//!    same rule as every other miner: the PGs it lost stay protected for
+//!    `ownership_stable_secs` (clause 4), and once they have left the
+//!    window its protected set may be empty, so every clause applies to
+//!    nothing listed and its old, unlisted blobs are orphans. Refusing it
+//!    instead left nodes declared full with weight 0 forever: no weight,
+//!    no PG, no purge, still full. The other guards stay: the window must
+//!    have been tracked for `ownership_stable_secs` (a restarted or
+//!    unreadable window state purges nothing for one window), the signed
+//!    cut of the view must be fresh even with no list loaded, the age
+//!    clause keeps every blob written less than `min_age_secs` before the
+//!    snapshot bound, and the per-delete epoch gate applies,
 //! 1. a valid generation is loaded ([`PurgeGate::generation_loaded`]),
 //! 2. that generation is not stale ([`PurgeGate::generation_fresh`]): its
 //!    `created_at` is at most `generation_max_age_secs` in the past — a
 //!    bucket nobody publishes to any more must not drive deletions,
-//! 3. that generation covers EVERY PG this miner owns
-//!    ([`PurgeGate::coverage_complete`]) — an unknown PG means nothing is
-//!    purged, because its blobs cannot be told apart from stray ones,
-//! 4. the set of PGs this miner owns has been IDENTICAL for
-//!    `ownership_stable_secs` ([`PurgeGate::ownership_stable`], tracked by
-//!    [`OwnershipStability`], persisted across restarts) — what the gate
-//!    protects is a PG this miner just lost or just gained (its
-//!    obligations changed), which is a property of its own owned set,
-//!    not of the global epoch counter (on a live network an epoch moves
-//!    every few minutes without touching most miners' ownership; a gate
-//!    on epoch quiet never opened there). The same period applies to
-//!    the owned set's adoption ([`OwnershipHysteresis`]): an ownership
-//!    that SHRINKS by more than half between two consecutive polls (9000
-//!    → 0, 9000 → 3000) is not adopted for purge decisions until it has
-//!    held for `ownership_stable_secs`; the previous owned set stays in
-//!    force meanwhile, so a flap (9000 → 0 → 9000) never widens what may
-//!    be purged,
-//! 5. the blob hash is in none of the owned PGs' lists (filter miss; a
-//!    filter hit is a keep even when it is a false positive),
-//! 6. **moved class**: if the hash is listed in an owned PG under
-//!    ANOTHER holder (the "others" filter, a second Bloom over the
-//!    records that are not this miner's; a false positive is a keep) the
-//!    blob is a live shard of a live file that some other miner is
-//!    obliged to hold, and this copy is RETAINED: nothing in the lists
+//! 3. that generation covers EVERY PG of the protected set (clause 4)
+//!    ([`PurgeGate::coverage_complete`], its delta chain whole) — an
+//!    unknown PG means nothing is purged, because its blobs cannot be
+//!    told apart from stray ones; a pass re-checks this before every
+//!    delete and stops as soon as it no longer holds,
+//! 4. the ownership window is tracked
+//!    ([`PurgeGate::ownership_window_tracked`], [`OwnershipWindow`],
+//!    persisted across restarts): this miner has recorded, per PG, when it
+//!    first and last owned it for at least `ownership_stable_secs`, so the
+//!    **protected set** — the PGs owned now plus every PG owned at any time
+//!    within the last `ownership_stable_secs` — is known. Ownership here is
+//!    the v3 (straw2) placement only ([`calculate_purge_pgs`]): v2 data is
+//!    no longer readable network-wide and v2 placement reshuffles most of a
+//!    node's PGs at every epoch, so it neither protects nor gates anything.
+//!    The lists of every protected PG are loaded and clause 3 applies to the
+//!    protected set: a blob listed (this miner's or another holder's) in a
+//!    PG this miner lost within the window is kept, and a PG just gained is
+//!    protected at once (its list must be loaded before any pass deletes;
+//!    its incoming blobs are also young and in flight). An owned-set change
+//!    never resets a clock and never aborts a pass; only a loss of coverage
+//!    for the protected set does. The window replaces the former
+//!    whole-set stability clock, which never opened on a live network: the
+//!    validator publishes an epoch about every 15 minutes and every epoch
+//!    changes some PGs of a node's owned set,
+//! 5. the blob hash is not this miner's: its key is in neither this
+//!    miner's holder set of the generation nor a delta record naming it
+//!    (a hit is a keep even when it is a 64-bit prefix collision),
+//! 6. **moved class**: if the hash may be listed under ANOTHER holder (the
+//!    generation's live filter, a Bloom over every hash of every list plus
+//!    the shards the base withholds from the lists, or the key of a delta
+//!    record naming another holder in an enforced PG; a false positive is
+//!    a keep) the blob is a live shard of a live file that some other
+//!    miner is obliged to hold, and this copy is RETAINED: nothing in the lists
 //!    proves the other holder actually has it, and the only proof source
 //!    this rule may ever take is the storage-proof observation stream
 //!    (not wired in this release). The class exists so the
 //!    tombstone and orphan classes never apply to such a blob; it is
 //!    switched off by `PURGE_MOVED_CLASS=false` only (back to clause 7/8
-//!    behaviour); a generation whose others filter would exceed
-//!    `PURGE_OTHERS_FILTER_MAX_BYTES` is REFUSED at load (logged,
-//!    counted in `miner_purge_others_filter_cap_refusals_total`), never
-//!    enforced with the class silently off,
-//! 7. **tombstone class**: if the hash is in an owned PG's `.deleted`
+//!    behaviour: a listed blob of another holder, or a withheld one,
+//!    is then an orphan),
+//! 7. **tombstone class**: if the hash is in a protected PG's `.deleted`
 //!    (the writer saw its file deleted inside the generation's window;
-//!    exact set, no false positive) AND no record of the enforced lists
-//!    names it (this miner's or another holder's, any owned PG: the
-//!    load removes such hashes from the tombstone set exactly, see
-//!    `pg_lists::LoadedGeneration::tombstones_retained_live_ref`) AND
+//!    exact set, no false positive) AND the live filter does not name it
+//!    and no delta record of the enforced PGs does (the load removes such
+//!    hashes from the tombstone set, see
+//!    `pg_lists::LoadedGeneration::tombstones_retained_live_ref`; a live
+//!    filter false positive only sends the blob back to clause 8) AND
 //!    the blob's last write is before the generation's snapshot bound
 //!    ([`Candidate::stored_after_snapshot`] false: a Store after the
 //!    scan start is a live reference the writer could not have seen —
@@ -99,6 +119,7 @@
 //! compiled, and `PURGE_DRY_RUN=false` is answered with a warning and the
 //! census. Only a build with the feature carries `Enforce`.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -182,12 +203,18 @@ impl Mode {
     }
 }
 
+/// Public bucket root of the obligation lists, used when
+/// `PG_LISTS_BASE_URL` is not set.
+pub const DEFAULT_PG_LISTS_BASE_URL: &str = "https://s3.hippius.com/pg-inventory";
+
 /// Purge knobs, all environment-driven (`PURGE_*`, `PG_LISTS_*`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PurgeConfig {
-    /// `PG_LISTS_BASE_URL`: public bucket root; purge stays off without it.
+    /// `PG_LISTS_BASE_URL`: public bucket root, [`DEFAULT_PG_LISTS_BASE_URL`]
+    /// when unset; set but empty, there is no source and the purge stays off.
     pub base_url: Option<String>,
-    /// `PURGE_ENABLED` (default false).
+    /// `PURGE_ENABLED` (default true). With the default `PURGE_DRY_RUN=true`
+    /// this runs the census only: blobs are classified, nothing is deleted.
     pub enabled: bool,
     /// `PURGE_DRY_RUN` (default true) as a [`Mode`]: `Census` logs
     /// candidates and deletes nothing; `Enforce` only exists in a build
@@ -205,26 +232,24 @@ pub struct PurgeConfig {
     pub max_bytes_per_sec: u64,
     /// `PG_LISTS_POLL_SECS` (default 600): `current.json` poll cadence.
     pub poll_secs: u64,
-    /// `PURGE_OWNERSHIP_STABLE_SECS` (default 21 600 = 6 h): how long the
-    /// set of PGs this miner owns must have been IDENTICAL before a pass
-    /// may run. A PG this miner just lost is "not owned" under the new
-    /// map and its blobs are filter misses, yet gateways still read them
-    /// through the placement_epoch map and the rebalance may not have
-    /// copied them to the new owners: a weight drop must not turn into a
-    /// mass delete half an hour later. The clock is this miner's own
-    /// obligations, not the global epoch counter: on a live network an epoch
-    /// changes every ~15 min (quarantines, heartbeats) while most miners'
-    /// owned set does not move, so a gate on epoch quiet never opened.
-    /// `PURGE_EPOCH_STABLE_SECS` is accepted, warned about and ignored.
+    /// `PURGE_OWNERSHIP_STABLE_SECS` (default 21 600 = 6 h): the per-PG
+    /// ownership window ([`OwnershipWindow`]). A PG owned at any time in
+    /// the last `ownership_stable_secs` stays protected: its list is
+    /// loaded and a blob it names (under this holder or another) is kept.
+    /// A PG this miner just lost is "not owned" under the new map, yet
+    /// gateways still read it through the placement_epoch map and the
+    /// rebalance may not have copied it to the new owners: a weight drop
+    /// must not turn into a mass delete half an hour later. The window is
+    /// per PG, not a clock on the whole owned set: the validator publishes
+    /// an epoch about every 15 minutes and each one moves some PGs of every
+    /// node, so a whole-set clock never ran out. A pass also waits until
+    /// the window has been tracked for this long (after a first start or
+    /// an unreadable state file). `PURGE_EPOCH_STABLE_SECS` is accepted,
+    /// warned about and ignored.
     pub ownership_stable_secs: u64,
-    /// `PURGE_FILTER_FP` (default 0.01): Bloom false-positive target.
-    pub filter_fp: f64,
     /// `PG_LISTS_FETCH_CONCURRENCY` (default 4, at most 8: each list body
     /// is buffered whole, up to 256 MiB).
     pub fetch_concurrency: usize,
-    /// `PURGE_FILTER_MAX_BYTES` (default 1 GiB): a generation whose
-    /// filter would be larger is refused (nothing purged).
-    pub filter_max_bytes: u64,
     /// `PURGE_PASS_INTERVAL_SECS` (default 3600): pause between full
     /// passes over the inventory.
     pub pass_interval_secs: u64,
@@ -232,37 +257,42 @@ pub struct PurgeConfig {
     /// generation whose `created_at` is older than this is refused
     /// (nothing purged) until a newer one is published.
     pub generation_max_age_secs: u64,
+    /// `PURGE_VIEW_MAX_LAG_SECS` (default 7 200 = 2 h): a pass deletes only
+    /// while the newest signed cut folded into the view (the last applied
+    /// delta's `until`, else the base's signed `base_cut`, never a
+    /// `current.json` field) is at most this old. Deltas are published
+    /// hourly, so a healthy view lags by up to about an hour plus the
+    /// publication delay; the purge is built to tolerate that (14-day age
+    /// clause, moved class, trash). A stale or replayed pointer is just an
+    /// older view: past this bound it deletes nothing.
+    pub view_max_lag_secs: u64,
     /// `PURGE_MOVED_CLASS` (default true): classify blobs listed in an
     /// owned PG under another holder as moved and retain them. `false` is
     /// the rollback to the two-class rule (such a blob is an orphan).
     pub moved_class: bool,
-    /// `PURGE_OTHERS_FILTER_MAX_BYTES` (default 256 MiB): cap on the
-    /// Bloom filter over the other holders' records that backs the moved
-    /// class. A generation whose others filter would be larger loads
-    /// without it: the class is disabled for that generation (logged,
-    /// gauge `miner_purge_moved_class_enforced`=0), the load itself
-    /// never fails on it.
-    pub others_filter_max_bytes: u64,
+    /// Where the holder sets and live filter shards of the loaded
+    /// generation are cached (`gen-<g>/` below it). `None` (the default):
+    /// `<data_dir>/pg-lists-cache`. Not read from the environment.
+    pub lists_cache_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for PurgeConfig {
     fn default() -> Self {
         Self {
-            base_url: None,
-            enabled: false,
+            base_url: Some(DEFAULT_PG_LISTS_BASE_URL.to_string()),
+            enabled: true,
             mode: Mode::Census,
             min_age_secs: 14 * 86_400,
             rate_per_sec: 50,
             max_bytes_per_sec: 50 * 1024 * 1024,
             poll_secs: 600,
             ownership_stable_secs: 21_600,
-            filter_fp: 0.01,
             fetch_concurrency: 4,
-            filter_max_bytes: 1 << 30,
             pass_interval_secs: 3600,
             generation_max_age_secs: 7 * 86_400,
+            view_max_lag_secs: 7_200,
             moved_class: true,
-            others_filter_max_bytes: 256 << 20,
+            lists_cache_dir: None,
         }
     }
 }
@@ -302,9 +332,9 @@ impl PurgeConfig {
                 }
             }
         }
-        cfg.base_url = lookup("PG_LISTS_BASE_URL")
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        if let Some(raw) = lookup("PG_LISTS_BASE_URL") {
+            cfg.base_url = Some(raw.trim().to_string()).filter(|s| !s.is_empty());
+        }
         if let Some(v) = lookup_bool(&lookup, "PURGE_ENABLED")? {
             cfg.enabled = v;
         }
@@ -327,16 +357,27 @@ impl PurgeConfig {
         if let Some(raw) = lookup("PURGE_EPOCH_STABLE_SECS") {
             tracing::warn!(
                 value = %raw,
-                "purge: PURGE_EPOCH_STABLE_SECS is deprecated and ignored (an epoch changes every few minutes on a live network, the gate never opened); the pass is gated on PURGE_OWNERSHIP_STABLE_SECS, the time this miner's owned PG set has been unchanged"
+                "purge: PURGE_EPOCH_STABLE_SECS is deprecated and ignored (an epoch changes every few minutes on a live network, the gate never opened); PURGE_OWNERSHIP_STABLE_SECS is the per-PG ownership window"
             );
         }
-        parse(&lookup, "PURGE_FILTER_FP", &mut cfg.filter_fp);
+        for removed in [
+            "PURGE_FILTER_FP",
+            "PURGE_FILTER_MAX_BYTES",
+            "PURGE_OTHERS_FILTER_MAX_BYTES",
+        ] {
+            if let Some(raw) = lookup(removed) {
+                tracing::warn!(
+                    knob = removed,
+                    value = %raw,
+                    "purge: knob removed and ignored (membership comes from the published holder sets and live filter, no filter is built locally)"
+                );
+            }
+        }
         parse(
             &lookup,
             "PG_LISTS_FETCH_CONCURRENCY",
             &mut cfg.fetch_concurrency,
         );
-        parse(&lookup, "PURGE_FILTER_MAX_BYTES", &mut cfg.filter_max_bytes);
         parse(
             &lookup,
             "PURGE_PASS_INTERVAL_SECS",
@@ -347,14 +388,14 @@ impl PurgeConfig {
             "PURGE_GENERATION_MAX_AGE_SECS",
             &mut cfg.generation_max_age_secs,
         );
+        parse(
+            &lookup,
+            "PURGE_VIEW_MAX_LAG_SECS",
+            &mut cfg.view_max_lag_secs,
+        );
         if let Some(v) = lookup_bool(&lookup, "PURGE_MOVED_CLASS")? {
             cfg.moved_class = v;
         }
-        parse(
-            &lookup,
-            "PURGE_OTHERS_FILTER_MAX_BYTES",
-            &mut cfg.others_filter_max_bytes,
-        );
         cfg.rate_per_sec = cfg.rate_per_sec.max(1);
         cfg.max_bytes_per_sec = cfg.max_bytes_per_sec.max(1);
         cfg.poll_secs = cfg.poll_secs.max(10);
@@ -370,234 +411,384 @@ impl PurgeConfig {
 /// Global preconditions, evaluated once per pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PurgeGate {
-    /// This miner owns at least one PG under the map the pass runs on.
-    /// False for a weight-0 miner: an empty owned set makes every other
-    /// clause vacuous (coverage trivially complete, filter empty, every
-    /// blob a miss), so it is checked first and closes the gate alone.
-    pub ownership_nonempty: bool,
+    /// This miner's uid is listed in the map the pass runs on, not
+    /// draining and not under a placement hold (clause 0).
+    /// A listed miner with weight 0 and an empty protected set passes:
+    /// it follows the same window rule as every other miner.
+    pub miner_eligible: bool,
     pub generation_loaded: bool,
     /// The loaded generation is at most `generation_max_age_secs` old.
     pub generation_fresh: bool,
     pub coverage_complete: bool,
-    /// The owned PG set has been identical for `ownership_stable_secs`.
-    pub ownership_stable: bool,
+    /// The per-PG ownership window has been tracked for at least
+    /// `ownership_stable_secs`, so the protected set is complete.
+    pub ownership_window_tracked: bool,
 }
 
 impl PurgeGate {
     pub fn open(&self) -> bool {
-        self.ownership_nonempty
+        self.miner_eligible
             && self.generation_loaded
             && self.generation_fresh
             && self.coverage_complete
-            && self.ownership_stable
+            && self.ownership_window_tracked
     }
 }
 
-/// Whether an owned set of `owned` PGs may drive purge decisions at all:
-/// the clause 0 of the purge rule. Pure, so the gate cannot be computed
-/// any other way by a caller.
-pub fn ownership_nonempty(owned: &[u32]) -> bool {
-    !owned.is_empty()
+/// PGs this miner owns for the purge under `map`: those whose v3 (straw2)
+/// placement, on the placement-filtered map (draining and held miners
+/// removed, like the write path), includes `miner_uid`. v2 placement is
+/// deliberately left out: v2 data is no longer readable network-wide, new
+/// uploads are v3, and the v2 placement moves about 90 % of a node's v2
+/// PGs at every epoch (measured on two consecutive live-network epochs,
+/// against 3-8 % for straw2), so a union with it made a node's owned set
+/// change by roughly half at every epoch. `common::calculate_my_pgs` (the
+/// v2 ∪ v3 union) stays what rebalance and backfill use. Sorted.
+pub fn calculate_purge_pgs(miner_uid: u32, map: &common::ClusterMap) -> Vec<u32> {
+    let filtered;
+    let map_ref = if map.miners.iter().any(|m| m.draining || m.placement_hold) {
+        filtered = common::filter_map_for_placement(map);
+        &filtered
+    } else {
+        map
+    };
+    let shards_per_file = map.ec_k + map.ec_m;
+    (0..map_ref.pg_count)
+        .filter(|&pg_id| {
+            common::calculate_pg_placement_straw2(pg_id, shards_per_file, map_ref)
+                .map(|miners| miners.iter().any(|m| m.uid == miner_uid))
+                .unwrap_or(false)
+        })
+        .collect()
 }
 
-/// Whether `next` is a shrink of more than half against `held` (strictly
-/// fewer than half the PGs remain). An empty `held` never shrinks.
-pub fn ownership_shrank_by_half(held: usize, next: usize) -> bool {
-    next * 2 < held
+/// Slack added to the ownership window when deciding whether a PG is
+/// still protected: the window state is persisted at most this often
+/// while membership does not change, so after a crash a `last_owned_at`
+/// read back may be up to this much older than the truth.
+pub const OWNERSHIP_PERSIST_INTERVAL_SECS: u64 = 60;
+
+/// Longest gap between two observations of the ownership window that is
+/// still continuous observation: the state is persisted at least every
+/// [`OWNERSHIP_PERSIST_INTERVAL_SECS`] and the loop ticks every 10 s, so
+/// three persist intervals plus slack cover a normal restart. A longer
+/// gap (downtime, a wall clock jumping forward) is a period in which PGs
+/// were owned or lost unseen: [`OwnershipWindow::restart_after_gap`].
+pub const OWNERSHIP_OBSERVATION_GAP_SECS: u64 = 3 * OWNERSHIP_PERSIST_INTERVAL_SECS + 30;
+
+/// A wall-clock step backwards larger than this between two loop ticks
+/// (measured against the monotonic clock) restarts the tracking.
+pub const WALL_CLOCK_BACKWARD_TOLERANCE_SECS: u64 = 5;
+
+/// Whether the wall clock jumped between two loop ticks: the wall-clock
+/// delta minus the monotonic delta is above
+/// [`OWNERSHIP_OBSERVATION_GAP_SECS`] (forward) or below
+/// `-WALL_CLOCK_BACKWARD_TOLERANCE_SECS` (backwards). A loop stalled for
+/// minutes moves both clocks alike and is not a jump.
+pub fn wall_clock_jumped(prev_wall_secs: u64, now_wall_secs: u64, mono_elapsed_secs: u64) -> bool {
+    let skew = now_wall_secs as i128 - prev_wall_secs as i128 - mono_elapsed_secs as i128;
+    skew > OWNERSHIP_OBSERVATION_GAP_SECS as i128
+        || skew < -(WALL_CLOCK_BACKWARD_TOLERANCE_SECS as i128)
 }
 
-/// Outcome of one [`OwnershipHysteresis::observe`].
+/// What one [`OwnershipWindow::observe`] changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WindowObservation {
+    /// PGs owned now that the window did not hold (newly owned, or owned
+    /// again after they expired).
+    pub gained: usize,
+    /// PGs held by the window but not owned now (still protected while
+    /// inside the window).
+    pub lost: usize,
+    /// PGs dropped from the window: not owned for longer than the window.
+    pub expired: usize,
+}
+
+impl WindowObservation {
+    /// The window's membership changed (a PG entered or left it).
+    pub fn membership_changed(&self) -> bool {
+        self.gained > 0 || self.expired > 0
+    }
+}
+
+/// Clause 4 of the purge rule: per PG, the wall-clock time (Unix seconds)
+/// this miner first and last owned it, plus the time since which the
+/// record is complete (`tracking_since`: the first observation of a fresh
+/// or unreadable state). Persisted next to the generation watermark so a
+/// restart keeps the window; a missing or unreadable file restarts the
+/// tracking, and a pass then waits a full window (a PG lost just before
+/// would otherwise be forgotten).
+///
+/// The protected set at `now` is every PG owned at the last observation
+/// plus every PG whose `last_owned_at` is at most `window_secs`
+/// (+ [`OWNERSHIP_PERSIST_INTERVAL_SECS`]) old.
+///
+/// The record is only as good as the observation was continuous: the
+/// time of the last observation is persisted too, and a gap (downtime
+/// longer than [`OWNERSHIP_OBSERVATION_GAP_SECS`], a wall clock that
+/// jumped forward or went back) makes every PG of the record owned until
+/// now and restarts the tracking ([`Self::restart_after_gap`]): nothing
+/// the window held can expire during the unseen period, and no pass runs
+/// before a full window of observation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OwnershipDecision {
-    /// The observed set is the one purge decisions run on (adopted now,
-    /// or already held).
-    Adopted,
-    /// The observed set shrank by more than half against the held one and
-    /// has not been stable for `stable_secs` yet: decisions keep running
-    /// on the held set. `pending_for_secs` is how long the shrunken set
-    /// has been observed unchanged.
-    Held { pending_for_secs: u64 },
-}
-
-/// Clause 4 of the purge rule applied to the owned set itself: a set that
-/// shrinks by more than half between two consecutive observations is
-/// only adopted for purge decisions once it has held unchanged for
-/// `stable_secs`. Growth, and shrinks of at most half, are adopted at
-/// once (the map-epoch quiet period covers those). Feed it every poll;
-/// read [`OwnershipHysteresis::held`] for the set to decide on.
-#[derive(Debug, Default)]
-pub struct OwnershipHysteresis {
-    /// `(epoch, owned)` purge decisions run on.
-    held: Option<(u64, Vec<u32>)>,
-    /// A shrunken set waiting out its quiet period: `(epoch, owned,
-    /// first observed at)`.
-    pending: Option<(u64, Vec<u32>, Instant)>,
-}
-
-impl OwnershipHysteresis {
-    /// Observe the owned set computed on the map of `epoch` at `now`.
-    pub fn observe(
-        &mut self,
-        epoch: u64,
-        owned: Vec<u32>,
-        now: Instant,
-        stable_secs: u64,
-    ) -> OwnershipDecision {
-        let Some((_, held)) = self.held.as_ref() else {
-            self.held = Some((epoch, owned));
-            return OwnershipDecision::Adopted;
-        };
-        if !ownership_shrank_by_half(held.len(), owned.len()) {
-            self.pending = None;
-            self.held = Some((epoch, owned));
-            return OwnershipDecision::Adopted;
-        }
-        match self.pending.as_mut() {
-            Some((pending_epoch, pending, since)) if *pending == owned => {
-                *pending_epoch = epoch;
-                let pending_for = now.saturating_duration_since(*since).as_secs();
-                if pending_for >= stable_secs {
-                    self.pending = None;
-                    self.held = Some((epoch, owned));
-                    OwnershipDecision::Adopted
-                } else {
-                    OwnershipDecision::Held {
-                        pending_for_secs: pending_for,
-                    }
-                }
-            }
-            _ => {
-                self.pending = Some((epoch, owned, now));
-                OwnershipDecision::Held {
-                    pending_for_secs: 0,
-                }
-            }
-        }
-    }
-
-    /// `(epoch, owned)` purge decisions run on; `None` before the first
-    /// observation.
-    pub fn held(&self) -> Option<(u64, &[u32])> {
-        self.held.as_ref().map(|(e, o)| (*e, o.as_slice()))
-    }
-
-    /// The shrunken set waiting out its quiet period, if any.
-    pub fn pending(&self) -> Option<&[u32]> {
-        self.pending.as_ref().map(|(_, o, _)| o.as_slice())
-    }
-}
-
-/// Outcome of one [`OwnershipStability::observe`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StabilityObservation {
-    /// Same set as last time; `stable_for_secs` since it last changed.
-    Unchanged { stable_for_secs: u64 },
-    /// The set differs from the last observation: the clock is reset.
-    Changed { added: usize, removed: usize },
-}
-
-/// Clause 4 of the purge rule: the owned PG set and the wall-clock time
-/// it last changed. Wall clock (Unix seconds) on purpose: the state is
-/// persisted next to the generation watermark so a restart does not
-/// reset the clock; when nothing is persisted the clock starts at the
-/// first observation. Sets compare as sorted, deduplicated lists.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnershipStability {
+pub struct OwnershipWindow {
+    /// `pg -> (first_owned_at, last_owned_at)`.
+    pgs: BTreeMap<u32, (u64, u64)>,
+    /// PGs owned at the last observation (sorted).
     owned: Vec<u32>,
-    changed_at_secs: u64,
+    tracking_since: u64,
+    /// Wall-clock time of the last observation (or of the creation).
+    last_observed: u64,
 }
 
-impl OwnershipStability {
-    /// First observation: the clock starts now.
-    pub fn first(owned: &[u32], now_secs: u64) -> Self {
+/// How [`OwnershipWindow::decode`] read a persisted state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowDecoded {
+    /// The current format (`v3`).
+    Current,
+    /// The previous per-PG format (`v2`, no observation time): every PG
+    /// of it is owned until the load, and tracking restarts at the load.
+    MigratedFromV2,
+    /// The former whole-set stability state (`v1 <changed_at>` + the set):
+    /// its PGs are imported as owned from `changed_at` until the load, and
+    /// tracking restarts at the load (the v1 file does not say which PGs
+    /// were lost before `changed_at`).
+    MigratedFromV1,
+}
+
+impl OwnershipWindow {
+    /// Empty window whose tracking starts at `now_secs`.
+    pub fn new(now_secs: u64) -> Self {
         Self {
-            owned: Self::normalize(owned),
-            changed_at_secs: now_secs,
+            pgs: BTreeMap::new(),
+            owned: Vec::new(),
+            tracking_since: now_secs,
+            last_observed: now_secs,
         }
     }
 
-    fn normalize(owned: &[u32]) -> Vec<u32> {
-        let mut v = owned.to_vec();
-        v.sort_unstable();
-        v.dedup();
-        v
+    /// Wall-clock time of the last observation.
+    pub fn last_observed(&self) -> u64 {
+        self.last_observed
     }
 
-    /// The set purge decisions are timed against.
+    /// Whether the record was not observed continuously up to `now_secs`:
+    /// the last observation is more than [`OWNERSHIP_OBSERVATION_GAP_SECS`]
+    /// old, or in the future (the clock went back).
+    pub fn has_gap_until(&self, now_secs: u64) -> bool {
+        now_secs
+            > self
+                .last_observed
+                .saturating_add(OWNERSHIP_OBSERVATION_GAP_SECS)
+            || now_secs < self.last_observed
+    }
+
+    /// After a period this record did not see: every PG it holds is owned
+    /// until `now_secs` (so each stays protected a full window from now),
+    /// and tracking restarts at `now_secs` (no pass for a full window).
+    pub fn restart_after_gap(&mut self, now_secs: u64) {
+        for (_, last) in self.pgs.values_mut() {
+            *last = (*last).max(now_secs);
+        }
+        self.tracking_since = now_secs;
+        self.last_observed = now_secs;
+    }
+
+    /// Unix seconds since which the record is complete.
+    pub fn tracking_since(&self) -> u64 {
+        self.tracking_since
+    }
+
+    /// Seconds the window has been tracked at `now_secs`.
+    pub fn tracked_for_secs(&self, now_secs: u64) -> u64 {
+        now_secs.saturating_sub(self.tracking_since)
+    }
+
+    /// Tracked for at least `window_secs`: every PG owned within the
+    /// window is in the record.
+    pub fn is_tracked(&self, now_secs: u64, window_secs: u64) -> bool {
+        self.tracked_for_secs(now_secs) >= window_secs
+    }
+
+    /// PGs owned at the last observation.
     pub fn owned(&self) -> &[u32] {
         &self.owned
     }
 
-    /// Unix seconds of the last change (or of the first observation).
-    pub fn changed_at_secs(&self) -> u64 {
-        self.changed_at_secs
+    /// `(first_owned_at, last_owned_at)` of `pg`, if in the window.
+    pub fn entry(&self, pg: u32) -> Option<(u64, u64)> {
+        self.pgs.get(&pg).copied()
     }
 
-    /// Feed the owned set computed from the current map. An identical set
-    /// leaves the clock alone; a different one resets it to `now_secs`.
-    pub fn observe(&mut self, observed: &[u32], now_secs: u64) -> StabilityObservation {
-        let observed = Self::normalize(observed);
-        if observed == self.owned {
-            return StabilityObservation::Unchanged {
-                stable_for_secs: self.stable_for_secs(now_secs),
-            };
+    /// Number of PGs in the window (owned now or within it).
+    pub fn len(&self) -> usize {
+        self.pgs.len()
+    }
+
+    /// Whether the window holds no PG.
+    pub fn is_empty(&self) -> bool {
+        self.pgs.is_empty()
+    }
+
+    fn inside(last_owned_at: u64, now_secs: u64, window_secs: u64) -> bool {
+        now_secs.saturating_sub(last_owned_at)
+            <= window_secs.saturating_add(OWNERSHIP_PERSIST_INTERVAL_SECS)
+    }
+
+    /// Fold the owned set computed from the current map at `now_secs`:
+    /// every owned PG gets `last_owned_at = now` (and `first_owned_at =
+    /// now` if new), PGs not owned for longer than the window are dropped.
+    /// A clock step backwards never shortens a PG's protection.
+    pub fn observe(&mut self, owned: &[u32], now_secs: u64, window_secs: u64) -> WindowObservation {
+        let mut owned = owned.to_vec();
+        owned.sort_unstable();
+        owned.dedup();
+        let mut obs = WindowObservation::default();
+        for pg in &owned {
+            match self.pgs.get_mut(pg) {
+                Some((_, last)) => *last = (*last).max(now_secs),
+                None => {
+                    self.pgs.insert(*pg, (now_secs, now_secs));
+                    obs.gained += 1;
+                }
+            }
         }
-        let added = observed
+        let before = self.pgs.len();
+        self.pgs.retain(|pg, (_, last)| {
+            owned.binary_search(pg).is_ok() || Self::inside(*last, now_secs, window_secs)
+        });
+        obs.expired = before - self.pgs.len();
+        obs.lost = self.pgs.len() - owned.len();
+        self.owned = owned;
+        self.last_observed = now_secs;
+        obs
+    }
+
+    /// The protected set at `now_secs` (sorted): owned at the last
+    /// observation, or owned at any time within the window.
+    pub fn protected(&self, now_secs: u64, window_secs: u64) -> Vec<u32> {
+        self.pgs
             .iter()
-            .filter(|pg| self.owned.binary_search(pg).is_err())
-            .count();
-        let removed = self
-            .owned
-            .iter()
-            .filter(|pg| observed.binary_search(pg).is_err())
-            .count();
-        self.owned = observed;
-        self.changed_at_secs = now_secs;
-        StabilityObservation::Changed { added, removed }
+            .filter(|(pg, (_, last))| {
+                self.owned.binary_search(pg).is_ok() || Self::inside(*last, now_secs, window_secs)
+            })
+            .map(|(pg, _)| *pg)
+            .collect()
     }
 
-    /// Seconds the current set has been unchanged at `now_secs` (0 when
-    /// the clock is ahead of `now_secs`).
-    pub fn stable_for_secs(&self, now_secs: u64) -> u64 {
-        now_secs.saturating_sub(self.changed_at_secs)
-    }
-
-    /// Clause 4: unchanged for at least `required_secs`.
-    pub fn is_stable(&self, now_secs: u64, required_secs: u64) -> bool {
-        self.stable_for_secs(now_secs) >= required_secs
-    }
-
-    /// Persisted form: `v1 <changed_at_secs>` then the sorted PG ids,
-    /// space-separated, on the second line.
+    /// Persisted form: `v3 <tracking_since> <last_observed>`, then one
+    /// `<pg> <first> <last>` line per PG in the window, then `owned`
+    /// followed by the PGs owned at the last observation. A binary that
+    /// predates `v3` reads it as unreadable and restarts its own tracking
+    /// (the safe side).
     pub fn encode(&self) -> String {
-        let pgs: Vec<String> = self.owned.iter().map(u32::to_string).collect();
-        format!("v1 {}\n{}\n", self.changed_at_secs, pgs.join(" "))
+        let mut out = format!("v3 {} {}\n", self.tracking_since, self.last_observed);
+        for (pg, (first, last)) in &self.pgs {
+            out.push_str(&format!("{pg} {first} {last}\n"));
+        }
+        let owned: Vec<String> = self.owned.iter().map(u32::to_string).collect();
+        out.push_str(&format!("owned {}\n", owned.join(" ")));
+        out
     }
 
-    /// Inverse of [`encode`](Self::encode); `None` on any malformed
-    /// input (the caller then starts the clock at first observation).
-    pub fn decode(text: &str) -> Option<Self> {
+    /// Inverse of [`encode`](Self::encode), also accepting the former
+    /// `v2` per-PG and `v1` whole-set states (migrated, see
+    /// [`WindowDecoded`]); `None` on anything malformed (the caller then
+    /// starts a fresh window at `now_secs`, and a pass waits a full
+    /// window). A `v3` state is returned as persisted: the caller checks
+    /// [`Self::has_gap_until`].
+    pub fn decode(text: &str, now_secs: u64) -> Option<(Self, WindowDecoded)> {
         let mut lines = text.lines();
         let header = lines.next()?;
         let mut parts = header.split_whitespace();
-        if parts.next()? != "v1" {
-            return None;
+        match parts.next()? {
+            version @ ("v3" | "v2") => {
+                let tracking_since = parts.next()?.parse::<u64>().ok()?;
+                let last_observed = if version == "v3" {
+                    parts.next()?.parse::<u64>().ok()?
+                } else {
+                    now_secs
+                };
+                if parts.next().is_some() {
+                    return None;
+                }
+                let mut pgs = BTreeMap::new();
+                let mut owned: Option<Vec<u32>> = None;
+                for line in lines {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    if owned.is_some() {
+                        return None;
+                    }
+                    let mut fields = line.split_whitespace();
+                    let first_tok = fields.next()?;
+                    if first_tok == "owned" {
+                        let mut set = Vec::new();
+                        for tok in fields {
+                            set.push(tok.parse::<u32>().ok()?);
+                        }
+                        set.sort_unstable();
+                        set.dedup();
+                        owned = Some(set);
+                        continue;
+                    }
+                    let pg = first_tok.parse::<u32>().ok()?;
+                    let first = fields.next()?.parse::<u64>().ok()?;
+                    let last = fields.next()?.parse::<u64>().ok()?;
+                    if fields.next().is_some()
+                        || first > last
+                        || pgs.insert(pg, (first, last)).is_some()
+                    {
+                        return None;
+                    }
+                }
+                let owned = owned?;
+                if owned.iter().any(|pg| !pgs.contains_key(pg)) {
+                    return None;
+                }
+                let mut w = Self {
+                    pgs,
+                    owned,
+                    tracking_since,
+                    last_observed,
+                };
+                if version == "v2" {
+                    // No observation time: the downtime before this load
+                    // is unknown, so the gap rule applies.
+                    w.restart_after_gap(now_secs);
+                    return Some((w, WindowDecoded::MigratedFromV2));
+                }
+                Some((w, WindowDecoded::Current))
+            }
+            "v1" => {
+                let changed_at = parts.next()?.parse::<u64>().ok()?;
+                if parts.next().is_some() {
+                    return None;
+                }
+                let mut owned = Vec::new();
+                for tok in lines.next().unwrap_or("").split_whitespace() {
+                    owned.push(tok.parse::<u32>().ok()?);
+                }
+                if lines.next().is_some_and(|l| !l.trim().is_empty()) {
+                    return None;
+                }
+                owned.sort_unstable();
+                owned.dedup();
+                let first = changed_at.min(now_secs);
+                let pgs = owned.iter().map(|pg| (*pg, (first, now_secs))).collect();
+                Some((
+                    Self {
+                        pgs,
+                        owned,
+                        tracking_since: now_secs,
+                        last_observed: now_secs,
+                    },
+                    WindowDecoded::MigratedFromV1,
+                ))
+            }
+            _ => None,
         }
-        let changed_at_secs = parts.next()?.parse::<u64>().ok()?;
-        if parts.next().is_some() {
-            return None;
-        }
-        let mut owned = Vec::new();
-        for tok in lines.next().unwrap_or("").split_whitespace() {
-            owned.push(tok.parse::<u32>().ok()?);
-        }
-        if lines.next().is_some_and(|l| !l.trim().is_empty()) {
-            return None;
-        }
-        Some(Self {
-            owned: Self::normalize(&owned),
-            changed_at_secs,
-        })
     }
 }
 
@@ -633,12 +824,13 @@ pub enum Verdict {
     /// Tombstoned: unlisted and the writer saw its file deleted; the age
     /// clause does not apply.
     PurgeTombstoned,
-    /// This miner owns no PG under the current map (weight 0): clause 0.
-    KeepEmptyOwnership,
+    /// Absent from the held map, draining or held: clause 0.
+    KeepMinerNotEligible,
     KeepNoGeneration,
     KeepGenerationStale,
     KeepCoverageIncomplete,
-    KeepOwnershipUnstable,
+    /// The ownership window has not been tracked long enough yet.
+    KeepOwnershipWindowUntracked,
     KeepInList,
     /// Moved: listed in an owned PG under another holder; retained until
     /// a proof source other than the lists exists (module docs, clause 6).
@@ -653,8 +845,8 @@ pub enum Verdict {
 /// The purge rule (see module docs). Clauses are checked in order so the
 /// cheapest global gates short-circuit before per-blob facts matter.
 pub fn decide(gate: PurgeGate, candidate: Candidate, min_age_secs: u64) -> Verdict {
-    if !gate.ownership_nonempty {
-        return Verdict::KeepEmptyOwnership;
+    if !gate.miner_eligible {
+        return Verdict::KeepMinerNotEligible;
     }
     if !gate.generation_loaded {
         return Verdict::KeepNoGeneration;
@@ -665,8 +857,8 @@ pub fn decide(gate: PurgeGate, candidate: Candidate, min_age_secs: u64) -> Verdi
     if !gate.coverage_complete {
         return Verdict::KeepCoverageIncomplete;
     }
-    if !gate.ownership_stable {
-        return Verdict::KeepOwnershipUnstable;
+    if !gate.ownership_window_tracked {
+        return Verdict::KeepOwnershipWindowUntracked;
     }
     classify(candidate, min_age_secs)
 }
@@ -801,31 +993,39 @@ pub struct PurgeMetrics {
     pub kept_moved: AtomicU64,
     pub skipped_young: AtomicU64,
     pub skipped_inflight: AtomicU64,
-    /// Rows whose hash is not 32 hex bytes, or whose delete failed.
-    pub skipped_invalid: AtomicU64,
+    /// Blobs a pass left because the view stayed write-locked while it
+    /// held their hash lock. Exposed as `purge_skipped_view_busy_total`.
+    pub skipped_view_busy: AtomicU64,
+    /// Rows whose hash is not 64 hex characters. Exposed as
+    /// `miner_purge_invalid_hash_total`.
+    pub invalid_hash: AtomicU64,
+    /// Live rows whose blob the store does not hold. Exposed as
+    /// `miner_purge_absent_from_store_total`.
+    pub absent_from_store: AtomicU64,
+    /// Of those, rows dropped because the store confirmed the blob absent.
+    /// Exposed as `miner_purge_absent_rows_dropped_total`.
+    pub absent_rows_dropped: AtomicU64,
+    /// Rows gone or trashed between the page read and the delete. Exposed
+    /// as `miner_purge_vanished_total`.
+    pub vanished: AtomicU64,
     pub delete_errors: AtomicU64,
-    /// Gauge: owned PGs listed by the loaded generation.
+    /// Gauge: protected PGs listed by the loaded generation.
     pub coverage_pgs_listed: AtomicU64,
-    /// Gauge: PGs this miner owns.
+    /// Gauge: PGs in the protected set (owned now or within the window).
     pub coverage_pgs_owned: AtomicU64,
-    /// Gauge: 1 when every owned PG is listed.
+    /// Gauge: 1 when the loaded lists cover every protected PG (delta
+    /// chain whole).
     pub coverage_complete: AtomicBool,
     /// Gauge: loaded generation (0 = none).
     pub generation: AtomicU64,
-    /// Gauge: hashes folded into the filter.
+    /// Gauge: keys in this miner's holder set plus its delta records.
     pub filter_hashes: AtomicU64,
+    /// Gauge: bytes mapped from the local cache (this miner's holder set
+    /// parts and the 256 live filter shards).
     pub filter_bytes: AtomicU64,
-    /// Gauge: 1 when the loaded generation carries an others filter and
+    /// Gauge: 1 when the loaded generation carries a live filter and
     /// `PURGE_MOVED_CLASS` is on, i.e. the moved class is enforced.
     pub moved_class_enforced: AtomicBool,
-    /// Gauge: hashes folded into the others filter (0 when not built).
-    pub others_filter_hashes: AtomicU64,
-    pub others_filter_bytes: AtomicU64,
-    /// Gauge: 1 when the loaded generation was loaded without an others
-    /// filter because it would have exceeded
-    /// `PURGE_OTHERS_FILTER_MAX_BYTES` (the moved class is then off for
-    /// it whatever `PURGE_MOVED_CLASS` says).
-    pub others_filter_cap_refusals: AtomicU64,
     /// Full passes completed.
     pub passes: AtomicU64,
     /// Passes that ran with the heartbeat epoch ahead of the map epoch by
@@ -837,15 +1037,33 @@ pub struct PurgeMetrics {
     /// Passes refused before their first page because the filter was not
     /// built from the enforced generation's lists.
     pub filter_generation_refusals: AtomicU64,
-    /// Passes refused because this miner owns no PG under the current map
-    /// (weight 0): clause 0 of the purge rule. Exposed as
-    /// `purge_refused_empty_ownership_total`.
-    pub refused_empty_ownership: AtomicU64,
-    /// Polls at which the owned set had shrunk by more than half and the
-    /// previous set was kept for purge decisions
-    /// ([`OwnershipHysteresis`]). Exposed as
-    /// `purge_ownership_shrink_held_total`.
-    pub ownership_shrink_held: AtomicU64,
+    /// Loop ticks refused because this miner's uid is not in the held
+    /// map: clause 0 of the purge rule. Exposed as
+    /// `purge_refused_not_in_map_total`.
+    pub refused_not_in_map: AtomicU64,
+    /// Loop ticks refused because the held map lists this miner as
+    /// draining or under a placement hold: clause 0. Exposed as
+    /// `purge_refused_not_placeable_total`.
+    pub refused_not_placeable: AtomicU64,
+    /// Passes stopped because the loaded lists no longer covered the
+    /// protected set (a PG gained, a generation dropped, a delta chain
+    /// broken). Exposed as `purge_coverage_lost_aborts_total`.
+    pub coverage_lost_aborts: AtomicU64,
+    /// Passes refused or stopped because the view's newest signed cut was
+    /// older than `PURGE_VIEW_MAX_LAG_SECS`. Exposed as
+    /// `purge_view_stale_refusals_total`.
+    pub view_stale_refusals: AtomicU64,
+    /// Gauge: PGs in the protected set (owned now or within the ownership
+    /// window). Exposed as `purge_protected_pgs`.
+    pub protected_pgs: AtomicU64,
+    /// Gauge: 1 once the ownership window has been tracked for
+    /// `PURGE_OWNERSHIP_STABLE_SECS`. Exposed as
+    /// `purge_ownership_window_tracked`.
+    pub ownership_window_tracked: AtomicBool,
+    /// Gauge: 1 once the ownership observer task has ended (it never ends
+    /// in normal operation: a panic or a bug). The purge is then closed.
+    /// Exposed as `purge_ownership_observer_down`.
+    pub ownership_observer_down: AtomicBool,
     /// Highest delta seq folded into the loaded generation (0 = base only).
     pub delta_seq: AtomicU64,
     /// 1 while the loaded generation's delta chain has a link that failed
@@ -875,7 +1093,9 @@ pub struct CensusGauges {
     pub orphan_gated_bytes: AtomicU64,
     pub orphan_pending_blobs: AtomicU64,
     pub orphan_pending_bytes: AtomicU64,
-    pub skipped_invalid: AtomicU64,
+    pub invalid_hash: AtomicU64,
+    pub absent_from_store: AtomicU64,
+    pub absent_rows_dropped: AtomicU64,
     /// 1 when the last census read every inventory page (no epoch abort,
     /// no filter refusal); 0 while running or when it stopped early.
     pub complete: AtomicBool,
@@ -909,7 +1129,11 @@ impl PurgeMetrics {
              miner_purge_kept_moved_total {}\n\
              miner_purge_skipped_young_total {}\n\
              miner_purge_skipped_inflight_total {}\n\
-             miner_purge_skipped_invalid_total {}\n\
+             purge_skipped_view_busy_total {}\n\
+             miner_purge_invalid_hash_total {}\n\
+             miner_purge_absent_from_store_total {}\n\
+             miner_purge_absent_rows_dropped_total {}\n\
+             miner_purge_vanished_total {}\n\
              miner_purge_delete_errors_total {}\n\
              miner_purge_coverage_pgs_listed {}\n\
              miner_purge_coverage_pgs_owned {}\n\
@@ -918,15 +1142,17 @@ impl PurgeMetrics {
              miner_purge_filter_hashes {}\n\
              miner_purge_filter_bytes {}\n\
              miner_purge_moved_class_enforced {}\n\
-             miner_purge_others_filter_hashes {}\n\
-             miner_purge_others_filter_bytes {}\n\
-             miner_purge_others_filter_cap_refusals_total {}\n\
              miner_purge_passes_total {}\n\
              miner_purge_epoch_skew_tolerated_total {}\n\
              miner_purge_epoch_skew_aborts_total {}\n\
              miner_purge_filter_generation_refusals_total {}\n\
-             purge_refused_empty_ownership_total {}\n\
-             purge_ownership_shrink_held_total {}\n\
+             purge_refused_not_in_map_total {}\n\
+             purge_refused_not_placeable_total {}\n\
+             purge_coverage_lost_aborts_total {}\n\
+             purge_view_stale_refusals_total {}\n\
+             purge_protected_pgs {}\n\
+             purge_ownership_window_tracked {}\n\
+             purge_ownership_observer_down {}\n\
              miner_purge_delta_seq {}\n\
              miner_purge_delta_chain_broken {}\n\
              purge_census_generation {}\n\
@@ -941,7 +1167,9 @@ impl PurgeMetrics {
              purge_census_orphan_gated_bytes {}\n\
              purge_census_orphan_pending_blobs {}\n\
              purge_census_orphan_pending_bytes {}\n\
-             purge_census_skipped_invalid {}\n\
+             purge_census_invalid_hash {}\n\
+             purge_census_absent_from_store {}\n\
+             purge_census_absent_rows_dropped {}\n\
              purge_census_complete {}\n",
             g(&self.candidates),
             g(&self.purged),
@@ -958,7 +1186,11 @@ impl PurgeMetrics {
             g(&self.kept_moved),
             g(&self.skipped_young),
             g(&self.skipped_inflight),
-            g(&self.skipped_invalid),
+            g(&self.skipped_view_busy),
+            g(&self.invalid_hash),
+            g(&self.absent_from_store),
+            g(&self.absent_rows_dropped),
+            g(&self.vanished),
             g(&self.delete_errors),
             g(&self.coverage_pgs_listed),
             g(&self.coverage_pgs_owned),
@@ -967,15 +1199,17 @@ impl PurgeMetrics {
             g(&self.filter_hashes),
             g(&self.filter_bytes),
             u8::from(self.moved_class_enforced.load(Ordering::Relaxed)),
-            g(&self.others_filter_hashes),
-            g(&self.others_filter_bytes),
-            g(&self.others_filter_cap_refusals),
             g(&self.passes),
             g(&self.epoch_skew_tolerated),
             g(&self.epoch_skew_aborts),
             g(&self.filter_generation_refusals),
-            g(&self.refused_empty_ownership),
-            g(&self.ownership_shrink_held),
+            g(&self.refused_not_in_map),
+            g(&self.refused_not_placeable),
+            g(&self.coverage_lost_aborts),
+            g(&self.view_stale_refusals),
+            g(&self.protected_pgs),
+            u8::from(self.ownership_window_tracked.load(Ordering::Relaxed)),
+            u8::from(self.ownership_observer_down.load(Ordering::Relaxed)),
             g(&self.delta_seq),
             u8::from(self.delta_chain_broken.load(Ordering::Relaxed)),
             g(&self.census.generation),
@@ -990,7 +1224,9 @@ impl PurgeMetrics {
             g(&self.census.orphan_gated_bytes),
             g(&self.census.orphan_pending_blobs),
             g(&self.census.orphan_pending_bytes),
-            g(&self.census.skipped_invalid),
+            g(&self.census.invalid_hash),
+            g(&self.census.absent_from_store),
+            g(&self.census.absent_rows_dropped),
             u8::from(self.census.complete.load(Ordering::Relaxed)),
         )
     }
@@ -1002,20 +1238,18 @@ mod tests {
     use std::collections::HashMap;
 
     const OPEN: PurgeGate = PurgeGate {
-        ownership_nonempty: true,
+        miner_eligible: true,
         generation_loaded: true,
         generation_fresh: true,
         coverage_complete: true,
-        ownership_stable: true,
+        ownership_window_tracked: true,
     };
 
-    /// Clause 0: a weight-0 miner owns no PG; the gate is closed before any
-    /// other clause is consulted, and an otherwise obviously stray blob is
-    /// kept.
+    /// Clause 0: a miner absent from the held map closes the gate before
+    /// any other clause is consulted, and an otherwise obviously stray
+    /// blob is kept.
     #[test]
-    fn empty_ownership_closes_the_gate_before_every_other_clause() {
-        assert!(!ownership_nonempty(&[]));
-        assert!(ownership_nonempty(&[7]));
+    fn miner_absent_from_the_map_closes_the_gate_before_every_other_clause() {
         let stray = Candidate {
             age_secs: 86_400 * 30,
             in_filter: false,
@@ -1025,106 +1259,32 @@ mod tests {
             inflight: false,
         };
         let empty = PurgeGate {
-            ownership_nonempty: false,
+            miner_eligible: false,
             ..OPEN
         };
         assert!(!empty.open());
-        assert_eq!(decide(empty, stray, 3600), Verdict::KeepEmptyOwnership);
+        assert_eq!(decide(empty, stray, 3600), Verdict::KeepMinerNotEligible);
         // Wins over every other closed clause too.
         assert_eq!(
             decide(
                 PurgeGate {
-                    ownership_nonempty: false,
+                    miner_eligible: false,
                     generation_loaded: false,
                     generation_fresh: false,
                     coverage_complete: false,
-                    ownership_stable: false,
+                    ownership_window_tracked: false,
                 },
                 stray,
                 3600
             ),
-            Verdict::KeepEmptyOwnership
+            Verdict::KeepMinerNotEligible
         );
         let m = PurgeMetrics::default();
-        m.refused_empty_ownership.fetch_add(1, Ordering::Relaxed);
+        m.refused_not_in_map.fetch_add(1, Ordering::Relaxed);
         assert!(
             m.render_prometheus()
-                .contains("purge_refused_empty_ownership_total 1\n")
+                .contains("purge_refused_not_in_map_total 1\n")
         );
-    }
-
-    /// 9000 → 0 → 9000 inside the quiet period: the held set is 9000 at
-    /// every step, the empty set is never adopted, and a shrink that does
-    /// hold for the whole period is adopted at its end.
-    #[test]
-    fn ownership_shrink_is_held_until_stable() {
-        let big: Vec<u32> = (0..9000).collect();
-        let small: Vec<u32> = (0..3000).collect();
-        let mut h = OwnershipHysteresis::default();
-        let t0 = Instant::now();
-        assert_eq!(
-            h.observe(1, big.clone(), t0, 100),
-            OwnershipDecision::Adopted
-        );
-        assert_eq!(h.held(), Some((1, big.as_slice())));
-        // 9000 -> 0: held.
-        assert_eq!(
-            h.observe(2, Vec::new(), t0 + Duration::from_secs(10), 100),
-            OwnershipDecision::Held {
-                pending_for_secs: 0
-            }
-        );
-        assert_eq!(h.held(), Some((1, big.as_slice())));
-        assert_eq!(h.pending(), Some(&[][..]));
-        assert_eq!(
-            h.observe(2, Vec::new(), t0 + Duration::from_secs(50), 100),
-            OwnershipDecision::Held {
-                pending_for_secs: 40
-            }
-        );
-        // 0 -> 9000 before the period elapsed: back to the held set, no
-        // pending left.
-        assert_eq!(
-            h.observe(3, big.clone(), t0 + Duration::from_secs(60), 100),
-            OwnershipDecision::Adopted
-        );
-        assert_eq!(h.held(), Some((3, big.as_slice())));
-        assert_eq!(h.pending(), None);
-        // 9000 -> 3000 (more than half lost): held, then adopted once it
-        // has held for the period. 9000 -> 4500 (exactly half) is adopted
-        // at once.
-        assert_eq!(
-            h.observe(4, small.clone(), t0 + Duration::from_secs(70), 100),
-            OwnershipDecision::Held {
-                pending_for_secs: 0
-            }
-        );
-        assert_eq!(h.held(), Some((3, big.as_slice())));
-        assert_eq!(
-            h.observe(4, small.clone(), t0 + Duration::from_secs(170), 100),
-            OwnershipDecision::Adopted
-        );
-        assert_eq!(h.held(), Some((4, small.as_slice())));
-        let half: Vec<u32> = (0..1500).collect();
-        assert_eq!(
-            h.observe(5, half.clone(), t0 + Duration::from_secs(171), 100),
-            OwnershipDecision::Adopted
-        );
-        assert_eq!(h.held(), Some((5, half.as_slice())));
-        // A different shrunken set restarts the period.
-        let mut h2 = OwnershipHysteresis::default();
-        h2.observe(1, big.clone(), t0, 100);
-        h2.observe(2, small.clone(), t0 + Duration::from_secs(10), 100);
-        assert_eq!(
-            h2.observe(3, Vec::new(), t0 + Duration::from_secs(120), 100),
-            OwnershipDecision::Held {
-                pending_for_secs: 0
-            }
-        );
-        assert_eq!(h2.held(), Some((1, big.as_slice())));
-        assert!(!ownership_shrank_by_half(0, 0));
-        assert!(ownership_shrank_by_half(9000, 4499));
-        assert!(!ownership_shrank_by_half(9000, 4500));
     }
 
     #[test]
@@ -1140,7 +1300,7 @@ mod tests {
         let stale = PurgeGate {
             generation_fresh: false,
             coverage_complete: false,
-            ownership_stable: false,
+            ownership_window_tracked: false,
             ..OPEN
         };
         assert_eq!(decide(stale, c, 3600), Verdict::KeepGenerationStale);
@@ -1216,7 +1376,7 @@ mod tests {
                 false,
                 86_400,
                 false,
-                Verdict::KeepOwnershipUnstable,
+                Verdict::KeepOwnershipWindowUntracked,
             ),
             // Per-blob clauses.
             (true, true, true, true, 86_400, false, Verdict::KeepInList),
@@ -1247,11 +1407,11 @@ mod tests {
         ];
         for &(loaded, covered, stable, in_filter, age, inflight, want) in table {
             let gate = PurgeGate {
-                ownership_nonempty: true,
+                miner_eligible: true,
                 generation_loaded: loaded,
                 generation_fresh: true,
                 coverage_complete: covered,
-                ownership_stable: stable,
+                ownership_window_tracked: stable,
             };
             let candidate = Candidate {
                 age_secs: age,
@@ -1360,12 +1520,12 @@ mod tests {
             Verdict::KeepYoung
         );
         let closed = PurgeGate {
-            ownership_stable: false,
+            ownership_window_tracked: false,
             ..OPEN
         };
         assert_eq!(
             decide(closed, young_tombstoned, 14 * 86_400),
-            Verdict::KeepOwnershipUnstable
+            Verdict::KeepOwnershipWindowUntracked
         );
     }
 
@@ -1445,16 +1605,22 @@ mod tests {
     }
 
     #[test]
-    fn moved_class_config_flag_and_cap() {
+    fn moved_class_config_flag() {
         let cfg = PurgeConfig::from_lookup(|_| None).unwrap();
         assert!(cfg.moved_class, "on by default: retaining is the safe side");
-        assert_eq!(cfg.others_filter_max_bytes, 256 << 20);
+        assert_eq!(cfg.lists_cache_dir, None, "not read from the environment");
         let mut env = HashMap::new();
         env.insert("PURGE_MOVED_CLASS", "off");
-        env.insert("PURGE_OTHERS_FILTER_MAX_BYTES", "1048576");
+        // A removed knob is warned about and ignored, never an error.
+        env.insert("PURGE_OTHERS_FILTER_MAX_BYTES", "0");
         let cfg = PurgeConfig::from_lookup(|k| env.get(k).map(|v| v.to_string())).unwrap();
         assert!(!cfg.moved_class);
-        assert_eq!(cfg.others_filter_max_bytes, 1 << 20);
+        env.insert("PURGE_MOVED_CLASS", "on");
+        assert!(
+            PurgeConfig::from_lookup(|k| env.get(k).map(|v| v.to_string()))
+                .unwrap()
+                .moved_class
+        );
         env.insert("PURGE_MOVED_CLASS", "maybe");
         assert!(
             PurgeConfig::from_lookup(|k| env.get(k).map(|v| v.to_string())).is_err(),
@@ -1463,12 +1629,12 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults_are_off_and_dry() {
+    fn config_defaults_are_a_census_on_the_public_bucket() {
         let cfg = PurgeConfig::from_lookup(|_| None).unwrap();
         assert_eq!(cfg, PurgeConfig::default());
-        assert!(!cfg.enabled);
-        assert!(cfg.mode.is_census());
-        assert_eq!(cfg.base_url, None);
+        assert!(cfg.enabled);
+        assert!(cfg.mode.is_census(), "nothing is deleted by default");
+        assert_eq!(cfg.base_url.as_deref(), Some(DEFAULT_PG_LISTS_BASE_URL));
         assert_eq!(
             cfg.min_age_secs,
             14 * 86_400,
@@ -1476,11 +1642,21 @@ mod tests {
         );
         assert_eq!(
             cfg.ownership_stable_secs, 21_600,
-            "6 h of identical owned set before a pass"
+            "6 h per-PG ownership window"
         );
         assert_eq!(cfg.rate_per_sec, 50);
         assert_eq!(cfg.max_bytes_per_sec, 50 * 1024 * 1024);
         assert_eq!(cfg.generation_max_age_secs, 7 * 86_400);
+    }
+
+    #[test]
+    fn config_empty_base_url_or_disabled_turns_the_purge_off() {
+        let cfg =
+            PurgeConfig::from_lookup(|n| (n == "PG_LISTS_BASE_URL").then(|| " ".into())).unwrap();
+        assert_eq!(cfg.base_url, None, "an empty URL leaves no source");
+        let cfg =
+            PurgeConfig::from_lookup(|n| (n == "PURGE_ENABLED").then(|| "false".into())).unwrap();
+        assert!(!cfg.enabled);
     }
 
     #[test]
@@ -1520,9 +1696,7 @@ mod tests {
             cfg.ownership_stable_secs, 21_600,
             "garbage keeps the default; the deprecated epoch knob is ignored"
         );
-        assert_eq!(cfg.filter_fp, 0.001);
         assert_eq!(cfg.fetch_concurrency, 8, "concurrency ceiling");
-        assert_eq!(cfg.filter_max_bytes, 4096);
         assert_eq!(cfg.pass_interval_secs, 30);
         assert_eq!(cfg.generation_max_age_secs, 600);
     }
@@ -1642,89 +1816,187 @@ mod tests {
         assert!(text.contains("miner_purge_coverage_complete 1\n"));
         m.kept_moved.fetch_add(2, Ordering::Relaxed);
         m.moved_class_enforced.store(true, Ordering::Relaxed);
-        m.others_filter_cap_refusals.store(1, Ordering::Relaxed);
         let text = m.render_prometheus();
         assert!(text.contains("miner_purge_kept_moved_total 2\n"));
         assert!(text.contains("miner_purge_moved_class_enforced 1\n"));
-        assert!(text.contains("miner_purge_others_filter_cap_refusals_total 1\n"));
+        assert!(!text.contains("others_filter"), "series removed");
     }
 
     #[test]
-    fn ownership_stability_gate_closed_while_set_changes_opens_after_required() {
-        let required = 21_600;
-        let mut st = OwnershipStability::first(&[3, 1, 2], 1_000);
-        assert_eq!(st.owned(), &[1, 2, 3], "sets are sorted");
-        assert!(!st.is_stable(1_000, required), "clock starts at zero");
-        // Identical set (any order): the clock runs.
+    fn ownership_window_protects_lost_pgs_for_the_window_only() {
+        let window = 6 * 3600;
+        let t0 = 1_700_000_000u64;
+        let mut w = OwnershipWindow::new(t0);
+        assert!(!w.is_tracked(t0, window), "a fresh window is not tracked");
+        let obs = w.observe(&[3, 1, 2, 2], t0, window);
         assert_eq!(
-            st.observe(&[2, 3, 1], 1_000 + 3_600),
-            StabilityObservation::Unchanged {
-                stable_for_secs: 3_600
+            obs,
+            WindowObservation {
+                gained: 3,
+                lost: 0,
+                expired: 0
             }
         );
-        assert!(!st.is_stable(1_000 + 3_600, required));
-        // A lost PG and a gained one reset the clock.
-        assert_eq!(
-            st.observe(&[1, 2, 4], 1_000 + 7_200),
-            StabilityObservation::Changed {
-                added: 1,
-                removed: 1
-            }
-        );
-        assert_eq!(st.changed_at_secs(), 8_200);
-        assert!(!st.is_stable(8_200 + required - 1, required));
-        assert_eq!(
-            st.observe(&[1, 2, 4], 8_200 + required - 1),
-            StabilityObservation::Unchanged {
-                stable_for_secs: required - 1
-            }
-        );
-        assert!(!st.is_stable(8_200 + required - 1, required));
-        assert!(st.is_stable(8_200 + required, required), "opens at M");
-        // Any further change closes it again for a full period.
-        assert_eq!(
-            st.observe(&[], 8_200 + required),
-            StabilityObservation::Changed {
-                added: 0,
-                removed: 3
-            }
-        );
-        assert!(!st.is_stable(8_200 + required, required));
+        assert_eq!(w.owned(), &[1, 2, 3]);
+        assert_eq!(w.protected(t0, window), vec![1, 2, 3]);
+
+        // PG 2 lost at t0 + 60 (last owned at t0).
+        let obs = w.observe(&[1, 3], t0 + 60, window);
+        assert_eq!((obs.gained, obs.lost, obs.expired), (0, 1, 0));
+        assert!(!obs.membership_changed(), "a loss inside the window");
+        assert_eq!(w.entry(2), Some((t0, t0)));
+        // Five hours later: still protected, though not owned.
+        let t5h = t0 + 5 * 3600;
+        w.observe(&[1, 3], t5h, window);
+        assert_eq!(w.protected(t5h, window), vec![1, 2, 3]);
+        // Seven hours later: out of the window, dropped.
+        let t7h = t0 + 7 * 3600;
+        let obs = w.observe(&[1, 3], t7h, window);
+        assert_eq!(obs.expired, 1);
+        assert!(obs.membership_changed());
+        assert_eq!(w.protected(t7h, window), vec![1, 3]);
+        assert_eq!(w.entry(2), None);
+
+        // A PG gained is protected at once, with its own first_owned_at.
+        let obs = w.observe(&[1, 3, 9], t7h + 10, window);
+        assert_eq!(obs.gained, 1);
+        assert_eq!(w.protected(t7h + 10, window), vec![1, 3, 9]);
+        assert_eq!(w.entry(9), Some((t7h + 10, t7h + 10)));
+        assert_eq!(w.entry(1), Some((t0, t7h + 10)), "first kept, last moves");
+
+        // The window is a set of per-PG clocks: churn at every observation
+        // never resets the tracking, which opened after one window.
+        assert!(w.is_tracked(t0 + window, window));
+        for i in 0..50u32 {
+            w.observe(&[1, 3, 100 + i], t7h + 100 + u64::from(i) * 900, window);
+        }
+        assert!(w.is_tracked(t7h + 100 + 49 * 900, window));
+        assert_eq!(w.tracking_since(), t0);
+
+        // A clock step backwards does not shorten a PG's protection.
+        let before = w.entry(1).unwrap().1;
+        w.observe(&[1], before - 3600, window);
+        assert_eq!(w.entry(1).unwrap().1, before);
     }
 
     #[test]
-    fn ownership_stability_round_trips_and_refuses_garbage() {
-        let st = OwnershipStability::first(&[7, 5, 5, 9], 1_700_000_000);
-        let text = st.encode();
-        assert_eq!(text, "v1 1700000000\n5 7 9\n");
-        let back = OwnershipStability::decode(&text).unwrap();
-        assert_eq!(back, st);
-        // Restart-shaped use: the same set observed later keeps the old
-        // clock; a different set starts a new one.
-        let mut back2 = back.clone();
+    fn ownership_window_round_trips_migrates_v1_and_refuses_garbage() {
+        let window = 21_600;
+        let t0 = 1_700_000_000u64;
+        let mut w = OwnershipWindow::new(t0);
+        w.observe(&[5, 7, 9], t0, window);
+        w.observe(&[5, 9], t0 + 100, window);
+        let text = w.encode();
         assert_eq!(
-            back2.observe(&[5, 7, 9], 1_700_000_000 + 21_600),
-            StabilityObservation::Unchanged {
-                stable_for_secs: 21_600
-            }
+            text,
+            format!(
+                "v3 {t0} {}\n5 {t0} {}\n7 {t0} {t0}\n9 {t0} {}\nowned 5 9\n",
+                t0 + 100,
+                t0 + 100,
+                t0 + 100
+            )
         );
-        assert!(back2.is_stable(1_700_000_000 + 21_600, 21_600));
-        // Empty set encodes and decodes.
-        let empty = OwnershipStability::first(&[], 5);
-        assert_eq!(OwnershipStability::decode(&empty.encode()).unwrap(), empty);
+        let (back, how) = OwnershipWindow::decode(&text, t0 + 200).unwrap();
+        assert_eq!(how, WindowDecoded::Current);
+        assert_eq!(back, w);
+        // Restart: the lost PG keeps its clock, it is not re-timed.
+        assert_eq!(back.protected(t0 + window, window), vec![5, 7, 9]);
+        assert_eq!(back.protected(t0 + window + 3600, window), vec![5, 9]);
+
+        // The former whole-set state: every PG is protected for a full
+        // window from the load, and the tracking restarts (the file does
+        // not say what was lost before `changed_at`).
+        let load_at = t0 + 50_000;
+        let (m, how) = OwnershipWindow::decode(&format!("v1 {t0}\n1 2 3\n"), load_at).unwrap();
+        assert_eq!(how, WindowDecoded::MigratedFromV1);
+        assert_eq!(m.owned(), &[1, 2, 3]);
+        assert_eq!(m.entry(2), Some((t0, load_at)));
+        assert_eq!(m.tracking_since(), load_at);
+        assert!(!m.is_tracked(load_at + window - 1, window));
+        assert!(m.is_tracked(load_at + window, window));
+        // The migrated PGs stay protected for the window after the load
+        // even when the next observation owns none of them.
+        let mut m2 = m.clone();
+        m2.observe(&[4], load_at + 60, window);
+        assert_eq!(m2.protected(load_at + 60, window), vec![1, 2, 3, 4]);
+        // An empty v1 set migrates too.
+        let (e, _) = OwnershipWindow::decode(&format!("v1 {t0}\n\n"), load_at).unwrap();
+        assert!(e.is_empty());
+
+        let empty = OwnershipWindow::new(5);
+        assert_eq!(
+            OwnershipWindow::decode(&empty.encode(), 5).unwrap().0,
+            empty
+        );
+        // The previous per-PG format: owned until the load, tracking
+        // restarted there.
+        let v2 = format!("v2 {t0}\n5 {t0} {}\n7 {t0} {t0}\nowned 5\n", t0 + 100);
+        let (m, how) = OwnershipWindow::decode(&v2, load_at).unwrap();
+        assert_eq!(how, WindowDecoded::MigratedFromV2);
+        assert_eq!(m.entry(7), Some((t0, load_at)));
+        assert_eq!(m.tracking_since(), load_at);
+        assert_eq!(m.protected(load_at + window, window), vec![5, 7]);
+
         for bad in [
             "",
-            "v2 1\n1 2\n",
-            "v1\n1\n",
+            "v3 1\nowned\n",
+            "v3 1 x\nowned\n",
+            "v3 1 2 3\nowned\n",
+            "v4 1 2\nowned\n",
+            "v2\nowned\n",
+            "v2 x\nowned\n",
+            "v2 1\n1 2\nowned 1\n",
+            "v2 1\n1 5 4\nowned 1\n",
+            "v2 1\n1 2 3\n1 2 3\nowned 1\n",
+            "v2 1\n1 2 3\n",
+            "v2 1\n1 2 3\nowned 2\n",
+            "v2 1\n1 2 3\nowned 1\n2 3 4\n",
             "v1 x\n1\n",
             "v1 1 2\n1\n",
             "v1 1\n1 two\n",
             "v1 1\n1\nextra\n",
         ] {
             assert!(
-                OwnershipStability::decode(bad).is_none(),
+                OwnershipWindow::decode(bad, 10).is_none(),
                 "{bad:?} must not decode"
             );
         }
+    }
+
+    /// Purge ownership is the straw2 placement alone; the union
+    /// `calculate_my_pgs` also counts the v2 placement.
+    #[test]
+    fn purge_ownership_is_v3_only() {
+        let map = crate::backfill::tests::test_map(40);
+        let shards = map.ec_k + map.ec_m;
+        for uid in [0u32, 7, 39] {
+            let purge_pgs = calculate_purge_pgs(uid, &map);
+            let union = common::calculate_my_pgs(uid, &map);
+            let v3: Vec<u32> = (0..map.pg_count)
+                .filter(|pg| {
+                    common::calculate_pg_placement_straw2(*pg, shards, &map)
+                        .unwrap()
+                        .iter()
+                        .any(|m| m.uid == uid)
+                })
+                .collect();
+            let v2_only: Vec<u32> = union
+                .iter()
+                .copied()
+                .filter(|pg| v3.binary_search(pg).is_err())
+                .collect();
+            assert_eq!(purge_pgs, v3, "uid {uid}");
+            assert!(!purge_pgs.is_empty());
+            assert!(
+                !v2_only.is_empty(),
+                "uid {uid}: the fixture must own some PG under v2 alone"
+            );
+            assert!(purge_pgs.iter().all(|pg| union.contains(pg)));
+            assert!(purge_pgs.len() < union.len());
+        }
+        // A draining miner is filtered out like on the write path.
+        let mut draining = map.clone();
+        draining.miners[7].draining = true;
+        assert!(calculate_purge_pgs(7, &draining).is_empty());
     }
 }

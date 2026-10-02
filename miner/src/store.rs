@@ -96,6 +96,16 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug {
     /// (index or one `stat`), never reads the payload.
     fn blob_len(&self, hash_hex: &str) -> Option<u64>;
 
+    /// Whether the store positively knows it holds no copy of the blob,
+    /// live or trashed. Unlike a `None` from [`blob_len`](Self::blob_len)
+    /// (which also covers an I/O error on the lookup), only a definite
+    /// answer counts: every probed path missing (`NotFound`) or an index
+    /// miss. The obligation purge drops the inventory row of such a blob.
+    /// The default, `false`, never lets a row go.
+    fn confirmed_absent(&self, _hash_hex: &str) -> bool {
+        false
+    }
+
     /// Two-phase delete: move the blob to the trash (quota freed, blob no
     /// longer listed or served) while staying restorable.
     async fn delete(&self, hash_hex: &str) -> std::io::Result<()>;
@@ -160,6 +170,9 @@ impl<T: BlobStore + ?Sized> BlobStore for std::sync::Arc<T> {
     }
     fn blob_len(&self, hash_hex: &str) -> Option<u64> {
         (**self).blob_len(hash_hex)
+    }
+    fn confirmed_absent(&self, hash_hex: &str) -> bool {
+        (**self).confirmed_absent(hash_hex)
     }
     async fn delete(&self, hash_hex: &str) -> std::io::Result<()> {
         (**self).delete(hash_hex).await

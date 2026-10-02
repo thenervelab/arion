@@ -208,23 +208,51 @@ impl FlatBlobStore {
 
     /// Where the blob actually lives right now, if anywhere.
     ///
+    /// The lookups run in [`crate::helpers::blocking`]: the flat path is
+    /// in the store root, a directory that held every blob before the
+    /// sharded layout and whose lookup can take seconds on a busy disk;
+    /// async callers (every handler) must not hold a runtime worker there.
+    ///
     /// Re-checks the sharded path after a flat miss for the same reason `read`
     /// does: a concurrent `migrate_legacy_layout` rename between the two
     /// `exists` calls would otherwise report a present blob as absent, and
     /// `has()` feeds "do you hold this shard?" answers.
     fn locate(&self, hash_hex: &str) -> Option<PathBuf> {
-        let sharded = self.blob_path(hash_hex);
-        if sharded.exists() {
-            return Some(sharded);
-        }
-        let flat = self.blob_path_flat(hash_hex);
-        if flat != sharded && flat.exists() {
-            return Some(flat);
-        }
-        if sharded.exists() {
-            return Some(sharded);
-        }
-        None
+        crate::helpers::blocking(|| {
+            let sharded = self.blob_path(hash_hex);
+            if sharded.exists() {
+                return Some(sharded);
+            }
+            let flat = self.blob_path_flat(hash_hex);
+            if flat != sharded && flat.exists() {
+                return Some(flat);
+            }
+            if sharded.exists() {
+                return Some(sharded);
+            }
+            None
+        })
+    }
+
+    /// [`locate`](Self::locate) and the blob's length in one go: one
+    /// `metadata` per candidate path (same order, same migration-race
+    /// retry) instead of an `exists` followed by a second `metadata` of
+    /// the path found. The purge calls it on every candidate and the
+    /// delete again right after.
+    fn locate_with_len(&self, hash_hex: &str) -> Option<(PathBuf, u64)> {
+        crate::helpers::blocking(|| {
+            let sharded = self.blob_path(hash_hex);
+            if let Ok(m) = std::fs::metadata(&sharded) {
+                return Some((sharded, m.len()));
+            }
+            let flat = self.blob_path_flat(hash_hex);
+            if flat != sharded
+                && let Ok(m) = std::fs::metadata(&flat)
+            {
+                return Some((flat, m.len()));
+            }
+            std::fs::metadata(&sharded).ok().map(|m| (sharded, m.len()))
+        })
     }
 
     /// Preferred (sharded) trash path.
@@ -240,19 +268,21 @@ impl FlatBlobStore {
     }
 
     fn locate_trashed(&self, hash_hex: &str) -> Option<PathBuf> {
-        let sharded = self.trash_path(hash_hex);
-        if sharded.exists() {
-            return Some(sharded);
-        }
-        let flat = self.trash_path_flat(hash_hex);
-        if flat != sharded && flat.exists() {
-            return Some(flat);
-        }
-        // `migrate_legacy_layout` walks the trash root too — same race as `locate`.
-        if sharded.exists() {
-            return Some(sharded);
-        }
-        None
+        crate::helpers::blocking(|| {
+            let sharded = self.trash_path(hash_hex);
+            if sharded.exists() {
+                return Some(sharded);
+            }
+            let flat = self.trash_path_flat(hash_hex);
+            if flat != sharded && flat.exists() {
+                return Some(flat);
+            }
+            // `migrate_legacy_layout` walks the trash root too — same race as `locate`.
+            if sharded.exists() {
+                return Some(sharded);
+            }
+            None
+        })
     }
 
     /// Store blob data. Atomic via temp-file + rename into the sharded tree.
@@ -273,7 +303,7 @@ impl FlatBlobStore {
 
         // A legacy flat copy is superseded by the sharded write.
         let flat = self.blob_path_flat(hash_hex);
-        if flat != target && flat.exists() {
+        if flat != target && crate::helpers::blocking(|| flat.exists()) {
             tokio::fs::remove_file(&flat).await.ok();
         }
 
@@ -342,23 +372,37 @@ impl FlatBlobStore {
         self.locate(hash_hex).is_some()
     }
 
-    /// Length of a live blob from its file metadata (one `stat`).
+    /// Length of a live blob from its file metadata (one `stat` when the
+    /// blob is in the sharded layout).
     pub fn blob_len(&self, hash_hex: &str) -> Option<u64> {
-        self.locate(hash_hex)
-            .and_then(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len())
+        self.locate_with_len(hash_hex).map(|(_, len)| len)
+    }
+
+    /// Whether no copy of the blob exists, live or trashed, in either
+    /// layout: every candidate path answers `NotFound`. Any other answer
+    /// (the file, or an I/O error) is not proof of absence. The sharded
+    /// paths are probed again last, as in [`locate`](Self::locate): the
+    /// legacy-layout migration may move a blob between the two probes.
+    pub fn confirmed_absent(&self, hash_hex: &str) -> bool {
+        let missing = |path: &Path| matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+        crate::helpers::blocking(|| {
+            let live = self.blob_path(hash_hex);
+            let trash = self.trash_path(hash_hex);
+            missing(&live)
+                && missing(&self.blob_path_flat(hash_hex))
+                && missing(&live)
+                && missing(&trash)
+                && missing(&self.trash_path_flat(hash_hex))
+                && missing(&trash)
+        })
     }
 
     /// Two-phase delete: move the blob (wherever it lives) into the sharded
     /// trash, freeing its quota while staying restorable.
     pub async fn delete(&self, hash_hex: &str) -> std::io::Result<()> {
-        let Some(path) = self.locate(hash_hex) else {
+        let Some((path, size)) = self.locate_with_len(hash_hex) else {
             return Ok(());
         };
-        let size = tokio::fs::metadata(&path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
         let target = self.trash_path(hash_hex);
 
         // A full disk traps the node: parking a blob in the trash needs a new
@@ -414,13 +458,9 @@ impl FlatBlobStore {
 
     /// Permanently delete a live blob, bypassing the trash.
     pub async fn remove(&self, hash_hex: &str) -> std::io::Result<()> {
-        let Some(path) = self.locate(hash_hex) else {
+        let Some((path, size)) = self.locate_with_len(hash_hex) else {
             return Ok(());
         };
-        let size = tokio::fs::metadata(&path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
         match tokio::fs::remove_file(path).await {
             Ok(()) => {
                 self.sub_used(size);
@@ -536,36 +576,28 @@ impl FlatBlobStore {
 
     /// Migrate legacy flat-layout entries (live and trash) into the sharded
     /// tree. Pure `rename(2)` on the same filesystem — metadata-only moves.
-    /// Throttled and resumable: the flat directory only ever shrinks.
+    /// Throttled and resumable: one streamed pass over each root, an entry
+    /// that could not be moved is left for the next start.
     /// Returns the number of entries moved.
     pub async fn migrate_legacy_layout(&self, batch: usize, pause: std::time::Duration) -> u64 {
         let mut moved = 0u64;
         for (root, is_trash) in [(&self.data_dir, false), (&self.trash_dir, true)] {
+            // One readdir cursor per root, held across pages and read off
+            // the runtime (`BinPager`): the root is enumerated once per
+            // pass. Re-opening it for every page read the directory from
+            // its start again each time, on a runtime worker: on ZFS a
+            // directory never shrinks, so a root that once held tens of
+            // millions of entries costs a full scan per page even when
+            // nothing is left to move.
+            let mut pager = BinPager::new(root);
             loop {
-                // One bounded readdir page of flat *.bin entries: names only,
-                // no stat — cheap even on the ZFS nodes.
-                let names: Vec<String> = {
-                    let Ok(entries) = std::fs::read_dir(root) else {
-                        break;
-                    };
-                    entries
-                        .flatten()
-                        .filter_map(|e| {
-                            let n = e.file_name().into_string().ok()?;
-                            let h = n.strip_suffix(".bin")?;
-                            sharded_rel(h)?; // shardable names only
-                            e.file_type().ok()?.is_file().then(|| h.to_string())
-                        })
-                        .take(batch)
-                        .collect()
-                };
-                if names.is_empty() {
+                let page = pager.next_page(batch).await;
+                if page.is_empty() {
                     break;
                 }
-                for h in &names {
-                    let rel = match sharded_rel(h) {
-                        Some(r) => r,
-                        None => continue,
+                for h in &page {
+                    let Some(rel) = sharded_rel(h) else {
+                        continue; // shardable names only
                     };
                     let from = root.join(format!("{h}.bin"));
                     let to = root.join(rel);
@@ -574,7 +606,7 @@ impl FlatBlobStore {
                     {
                         continue;
                     }
-                    if to.exists() {
+                    if tokio::fs::try_exists(&to).await.unwrap_or(false) {
                         // Sharded copy already present (re-store since):
                         // the flat one is a stale duplicate.
                         tokio::fs::remove_file(&from).await.ok();
@@ -596,6 +628,69 @@ impl FlatBlobStore {
             tracing::info!(moved, "storage: legacy layout migration complete");
         }
         moved
+    }
+}
+
+/// Streaming pager over the `*.bin` entries of one directory. Holds the
+/// readdir cursor across pages so a directory of any size is enumerated at
+/// most once per pass, in bounded chunks, off the async runtime — the full
+/// listing is never collected.
+pub struct BinPager {
+    dir: PathBuf,
+    cursor: Option<std::fs::ReadDir>,
+    exhausted: bool,
+}
+
+impl BinPager {
+    pub fn new(dir: &Path) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            cursor: None,
+            exhausted: false,
+        }
+    }
+
+    /// Next page of up to `batch` blob names. Empty page = directory
+    /// exhausted for this pass.
+    pub async fn next_page(&mut self, batch: usize) -> Vec<String> {
+        if self.exhausted {
+            return Vec::new();
+        }
+        let cursor = self.cursor.take();
+        let dir = self.dir.clone();
+        let (cursor, page) = tokio::task::spawn_blocking(move || {
+            let mut cursor = match cursor {
+                Some(c) => c,
+                None => match std::fs::read_dir(&dir) {
+                    Ok(c) => c,
+                    Err(_) => return (None, Vec::new()),
+                },
+            };
+            let mut page = Vec::with_capacity(batch.min(4096));
+            for e in cursor.by_ref().flatten() {
+                let Ok(name) = e.file_name().into_string() else {
+                    continue;
+                };
+                let Some(h) = name.strip_suffix(".bin") else {
+                    continue;
+                };
+                if !e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                page.push(h.to_string());
+                if page.len() >= batch {
+                    // Cursor survives to the next call: the next page
+                    // resumes here instead of re-reading from the start.
+                    return (Some(cursor), page);
+                }
+            }
+            (None, page)
+        })
+        .await
+        .unwrap_or((None, Vec::new()));
+        self.cursor = cursor;
+        self.exhausted = self.cursor.is_none();
+        page
     }
 }
 
@@ -650,6 +745,10 @@ impl crate::store::BlobStore for FlatBlobStore {
 
     fn blob_len(&self, hash_hex: &str) -> Option<u64> {
         FlatBlobStore::blob_len(self, hash_hex)
+    }
+
+    fn confirmed_absent(&self, hash_hex: &str) -> bool {
+        FlatBlobStore::confirmed_absent(self, hash_hex)
     }
 
     async fn delete(&self, hash_hex: &str) -> std::io::Result<()> {
@@ -728,6 +827,38 @@ mod tests {
                 "errno {code} must not be treated as a full disk"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn confirmed_absent_needs_every_path_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FlatBlobStore::new(dir.path().to_path_buf()).unwrap();
+        assert!(store.confirmed_absent(HASH), "never stored");
+
+        store.store(HASH, b"payload").await.unwrap();
+        assert!(!store.confirmed_absent(HASH), "live");
+        store.delete(HASH).await.unwrap();
+        assert!(!store.confirmed_absent(HASH), "trashed");
+        store.purge_trashed(HASH).await.unwrap();
+        assert!(store.confirmed_absent(HASH), "gone for good");
+
+        // A legacy file at the root counts as a copy.
+        let legacy = dir.path().join(format!("{HASH}.bin"));
+        std::fs::write(&legacy, b"payload").unwrap();
+        assert!(!store.confirmed_absent(HASH), "legacy layout");
+        std::fs::remove_file(&legacy).unwrap();
+
+        // An error other than NotFound (here ENOTDIR: a file where the
+        // shard directory goes) is not proof of absence.
+        let shard_dir = store.blob_path(HASH).parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(&shard_dir).ok();
+        std::fs::create_dir_all(shard_dir.parent().unwrap()).unwrap();
+        std::fs::write(&shard_dir, b"not a directory").unwrap();
+        assert!(
+            store.blob_len(HASH).is_none(),
+            "the lookup error reads as no length"
+        );
+        assert!(!store.confirmed_absent(HASH), "but never as absence");
     }
 
     #[tokio::test]
@@ -876,6 +1007,39 @@ mod tests {
         assert!(dir.path().join("trash/ff/00/ff00aa.bin").exists());
     }
 
+    /// The migration streams each root once through a held cursor: more
+    /// entries than one page all move, and an entry that cannot move (its
+    /// shard directory is blocked by a file) ends the pass instead of
+    /// being read again from the start of the root forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_migration_streams_the_root_once_and_terminates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FlatBlobStore::new(dir.path()).unwrap();
+        for i in 0..250u32 {
+            let h = format!("{:064x}", u128::from(i) << 64 | 0x1234);
+            std::fs::write(dir.path().join(format!("{h}.bin")), b"legacy").unwrap();
+        }
+        // `ee` is a file: the shard directory `ee/ee/` cannot be created.
+        std::fs::write(dir.path().join("ee"), b"not a directory").unwrap();
+        let stuck = format!("ee{}", "e".repeat(62));
+        std::fs::write(dir.path().join(format!("{stuck}.bin")), b"stuck").unwrap();
+
+        let moved = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            store.migrate_legacy_layout(100, std::time::Duration::from_millis(1)),
+        )
+        .await
+        .expect("the migration pass must end");
+        assert_eq!(moved, 250);
+        assert!(dir.path().join(format!("{stuck}.bin")).exists());
+        assert!(store.has(&stuck));
+        for i in 0..250u32 {
+            let h = format!("{:064x}", u128::from(i) << 64 | 0x1234);
+            assert!(!dir.path().join(format!("{h}.bin")).exists());
+            assert!(store.has(&h));
+        }
+    }
+
     #[tokio::test]
     async fn stale_tmp_artifacts_are_cleaned() {
         let dir = tempfile::tempdir().unwrap();
@@ -908,5 +1072,34 @@ mod tests {
         store.used_bytes.store(0, Ordering::Relaxed);
         store.delete(HASH).await.unwrap();
         assert_eq!(store.used_bytes(), 0, "must saturate, not wrap");
+    }
+
+    /// `blob_len`, `delete` and `remove` find the blob and its length in
+    /// both layouts (one `metadata` per candidate path), and account the
+    /// same bytes as before.
+    #[tokio::test]
+    async fn length_and_deletes_resolve_both_layouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FlatBlobStore::new(dir.path()).unwrap();
+        store.store(HASH, b"sharded").await.unwrap();
+        let legacy = "ff00aa";
+        std::fs::write(dir.path().join(format!("{legacy}.bin")), b"legacy!!").unwrap();
+        store.recompute_usage();
+        assert_eq!(store.used_bytes(), 15);
+        assert_eq!(store.blob_len(HASH), Some(7));
+        assert_eq!(store.blob_len(legacy), Some(8));
+        assert_eq!(store.blob_len("00ff"), None);
+
+        store.delete(HASH).await.unwrap();
+        assert_eq!(store.blob_len(HASH), None);
+        assert!(store.has_trashed(HASH));
+        assert_eq!((store.used_bytes(), store.trash_bytes()), (8, 7));
+        store.remove(legacy).await.unwrap();
+        assert_eq!(store.blob_len(legacy), None);
+        assert!(!store.has_trashed(legacy));
+        assert_eq!(store.used_bytes(), 0);
+        // Absent blobs: no-ops.
+        store.delete(legacy).await.unwrap();
+        store.remove(legacy).await.unwrap();
     }
 }

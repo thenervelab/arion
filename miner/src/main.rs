@@ -95,8 +95,25 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// The runtime is built by hand instead of `#[tokio::main]` for its exit:
+/// dropping a runtime waits for every `spawn_blocking` task still running,
+/// with no bound, and some of them walk the store (the stale tmp sweep, the
+/// usage recount) for tens of minutes on a large node. After a clean stop
+/// the process then stayed alive long after `Shutdown complete`, and a
+/// service manager killed it. `shutdown_background` returns at once; what
+/// is still running is dropped with the process. The clean-stop seal
+/// (`inventory::seal_on_clean_shutdown`) has already run by then, and those
+/// tasks never write to the inventory.
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async_main());
+    runtime.shutdown_background();
+    result
+}
+
+async fn async_main() -> Result<()> {
     // Install rustls crypto provider for quinn/TLS
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -619,6 +636,11 @@ async fn run_miner(cli: Cli) -> Result<()> {
         let blobs_bg = blobs_dir.clone();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
+            // First: the rebuild and the reconciliation write through the
+            // shared connection, which defers writes until the build ends.
+            if let Err(e) = tokio::task::spawn_blocking(inventory::build_trashed_index).await {
+                warn!(error = %e, "inventory: trashed_at index build task panicked");
+            }
             let rebuild_dir = blobs_bg.clone();
             match tokio::task::spawn_blocking(move || inventory::rebuild_from_fs(&rebuild_dir))
                 .await
@@ -718,6 +740,8 @@ async fn run_miner(cli: Cli) -> Result<()> {
 
     // Trash retention: purge blobs past the TTL, keep total trash under the
     // size cap (0 = auto: 10% of the quota, or 100 GiB when unlimited).
+    // With the trash disabled (deletes unlink directly) the same loop
+    // drains what an earlier run left in the trash: TTL 0, cap 0, paced.
     if config.storage.trash_enabled {
         let cap = if config.storage.trash_max_bytes > 0 {
             config.storage.trash_max_bytes
@@ -730,6 +754,14 @@ async fn run_miner(cli: Cli) -> Result<()> {
             Arc::clone(&store),
             config.storage.trash_ttl_secs,
             cap,
+            None,
+        ));
+    } else {
+        tokio::spawn(inventory::trash_purge_loop(
+            Arc::clone(&store),
+            0,
+            0,
+            Some(inventory::TRASH_DRAIN_BATCH_PAUSE),
         ));
     }
 
@@ -990,6 +1022,11 @@ async fn run_miner(cli: Cli) -> Result<()> {
     info!("Closing P2P endpoint...");
     endpoint.close(0u32.into(), b"shutdown");
     endpoint.wait_idle().await;
+
+    // 4. Nothing accepts writes any more: seal the inventory so the next
+    // start skips the O(blobs) filesystem count (waits for in-flight blob
+    // writes, refuses on any doubt; see `inventory::rebuild_from_fs`).
+    inventory::seal_on_clean_shutdown(&blobs_dir, inventory::CLEAN_STOP_DRAIN_TIMEOUT).await;
     info!("Shutdown complete");
 
     Ok(())
@@ -1214,8 +1251,8 @@ fn spawn_heartbeat_loop(
 
             // Calculate available storage
             let max_storage_gb = ctx.config.storage.max_storage_gb;
-            let disk_available = free_space(&ctx.data_dir).unwrap_or(0);
-            let disk_total = fs2::total_space(&ctx.data_dir).unwrap_or(0);
+            let disk_available = helpers::blocking(|| free_space(&ctx.data_dir)).unwrap_or(0);
+            let disk_total = helpers::blocking(|| fs2::total_space(&ctx.data_dir)).unwrap_or(0);
 
             let (total_storage, reported_available) = if max_storage_gb > 0 {
                 let max_bytes = max_storage_gb.saturating_mul(1024 * 1024 * 1024);
@@ -1501,8 +1538,8 @@ fn spawn_heartbeat_loop(
 /// Perform a single registration attempt with the validator.
 async fn register_with_validator_once(ctx: &MinerContext) -> Result<quinn::Connection> {
     // Calculate storage stats
-    let disk_available = free_space(&ctx.data_dir).unwrap_or(0);
-    let disk_total = fs2::total_space(&ctx.data_dir).unwrap_or(0);
+    let disk_available = helpers::blocking(|| free_space(&ctx.data_dir)).unwrap_or(0);
+    let disk_total = helpers::blocking(|| fs2::total_space(&ctx.data_dir)).unwrap_or(0);
 
     let (total, reported_available) = if ctx.config.storage.max_storage_gb > 0 {
         let max_bytes = ctx

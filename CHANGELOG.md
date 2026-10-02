@@ -2,6 +2,51 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.35] - 2026-10-02
+
+### Miner
+
+The purge census runs by default. Nothing is deleted by default.
+
+- **Census on by default.** `PURGE_ENABLED` now defaults to `true` and
+  `PG_LISTS_BASE_URL` to `https://s3.hippius.com/pg-inventory`;
+  `PURGE_DRY_RUN` stays `true`, so a default miner classifies its blobs and
+  reports what a pass would reclaim (`purge[census]: would delete`,
+  `miner_purge_would_purge*`) without deleting anything. Set
+  `PURGE_DRY_RUN=false` to enforce, `PURGE_ENABLED=false` (or an empty
+  `PG_LISTS_BASE_URL`) to turn the census off.
+- **Placement-epoch obligations.** The lists name, per shard, the holder at
+  the file's placement epoch, which is the miner the gateway reads first.
+  Ownership for the purge is tracked per PG over a window
+  (`PURGE_OWNERSHIP_STABLE_SECS`, 6 h) on the v3 placement only: every PG
+  owned now or within the window is protected, an epoch change never resets
+  a clock or aborts a pass, and a delete happens only on the map the node
+  holds while the validator is on that same epoch.
+- **Holder sets and live filter from disk.** Each base generation publishes
+  the sorted shard-key set of every holder and a 256-shard global live
+  filter. The miner downloads only its own set and the filter shards
+  (checked against the signed manifest; a few GB per generation), caches
+  them under `data_dir/pg-lists-cache/gen-<g>/` and maps them with mmap. The
+  in-RAM Bloom filters and `PURGE_FILTER_FP`, `PURGE_FILTER_MAX_BYTES`,
+  `PURGE_OTHERS_FILTER_MAX_BYTES` are gone (logged as ignored when set).
+  Mapped files are re-hashed before every pass.
+- **Delta chains.** Delta manifests format 2 (one bundle per 256 PGs) with a
+  holder index and withheld shard hashes; list format version 4. A broken
+  chain is retried with backoff and blocks deletes until whole again; the
+  view must be at most `PURGE_VIEW_MAX_LAG_SECS` (2 h) old for a delete.
+- **No runtime stalls.** Blocking inventory, store and list work runs off
+  the async workers; the SQLite `trashed_at` index is built in the
+  background on first start (writes journaled to `inventory.deferred` and
+  replayed); a graceful stop writes `inventory.clean` so the next start
+  skips the store count, and the process exits promptly after it.
+- **Bounded epoch archive.** `EPOCH_ARCHIVE_KEEP` (2000) most recent cluster
+  maps are kept in `data_dir/epoch_archive/`; older ones are removed.
+- **Inventory counters.** Rows with a malformed hash are counted apart
+  (`miner_purge_invalid_hash_total`); live rows whose blob the store does not
+  hold are counted (`miner_purge_absent_from_store_total`) and dropped once
+  the store confirms the absence (`miner_purge_absent_rows_dropped_total`).
+  Only the inventory row is removed; no blob is touched.
+
 ## [0.1.34] - 2026-09-21
 
 ### Miner

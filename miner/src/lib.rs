@@ -6,6 +6,8 @@
 //!
 //! - `store`: the [`store::BlobStore`] backend abstraction
 //! - `pg_lists`, `purge`: obligation-list reader and purge policy
+//! - `pg_sets`: holder sets and live filter of a generation, cached and
+//!   memory-mapped
 //! - `flat_store`: sharded flat-file backend
 //! - `storage_proof`: storage chunk proof handler, protocol v1
 //! - `validator_pin`: identity check of the validator on the miner's
@@ -19,6 +21,7 @@ pub mod flat_store;
 pub mod helpers;
 pub mod limits;
 pub mod pg_lists;
+pub mod pg_sets;
 pub mod purge;
 pub mod storage_proof;
 pub mod store;

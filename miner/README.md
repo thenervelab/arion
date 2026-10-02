@@ -135,10 +135,11 @@ touch /var/lib/hippius/miner/data/miner/.no-auto-update
 | `MINER_FETCH_CONCURRENCY` | 256 | Concurrent fetch operations |
 | `PACKED_INFLIGHT_MAX_BYTES` | RAM/8, 256 MiB..4 GiB | In-flight write budget of the packed store (see "Resource limits") |
 | `MINER_MAX_CONCURRENT_HANDLERS` | budget/3 MiB, 256..8192 | Cap on concurrent inbound P2P stream handlers (see "Resource limits") |
-| `PG_LISTS_BASE_URL` | - | Root URL of the obligation lists (`current.json`, `gen/<g>/...`); purge and backfill stay off without it |
-| `PURGE_ENABLED` | false | Obligation-list purge loop (see "Operator guide") |
+| `PG_LISTS_BASE_URL` | `https://s3.hippius.com/pg-inventory` | Root URL of the obligation lists (`current.json`, `gen/<g>/...`); set it empty to leave purge and backfill without a source (off) |
+| `PURGE_ENABLED` | true | Obligation-list purge loop (see "Operator guide"); a census only while `PURGE_DRY_RUN` stays true |
 | `PURGE_DRY_RUN` | true | When the purge is enabled: count and log, delete nothing |
 | `BACKFILL_ENABLED` | false | Obligation-list backfill loop (see "Operator guide") |
+| `EPOCH_ARCHIVE_KEEP` | 2000 | Most recent cluster-map epochs kept in `data_dir/epoch_archive/`; older ones are deleted (placement reads of an older epoch ask the validator) |
 
 ## Operator guide: obligation lists (0.1.34)
 
@@ -148,7 +149,7 @@ holder of that PG is obliged to keep (`PG_LISTS_BASE_URL/current.json` →
 list per PG). From those lists the miner derives two background loops:
 
 - **purge** — trash every live blob that is in none of the lists of the PGs
-  this miner owns (an orphan: its file was deleted, or the shard moved
+  this miner owns or owned within the last 6 h (an orphan: its file was deleted, or the shard moved
   elsewhere long ago). Two-phase: the blob goes to the local trash and stays
   restorable for `TRASH_TTL_SECS` (14 days by default).
 - **backfill** — fetch from peer miners every blob a list says this miner
@@ -161,41 +162,146 @@ nothing until told to: `PURGE_ENABLED` and `BACKFILL_ENABLED` default to
 exactly `1`/`true`/`yes`/`on` or `0`/`false`/`no`/`off`; any other spelling
 refuses to start the miner rather than guess.
 
+**From 0.1.35 the census runs by default**: `PURGE_ENABLED` defaults to
+`true` and `PG_LISTS_BASE_URL` to the public bucket, while `PURGE_DRY_RUN`
+stays `true`. Every miner classifies its blobs and reports what it would
+reclaim; nothing is deleted until the operator sets `PURGE_DRY_RUN=false`.
+The census downloads this miner's holder sets and the live filter (a few GB
+per generation, cached under `data_dir/pg-lists-cache/`). `PURGE_ENABLED=false`
+turns it off.
+
 ### Before the purge deletes anything
 
 Every one of these must hold, in this order, or the pass keeps everything
 and logs why:
 
+0. the node's uid is listed in the cluster map it holds, and not as
+   draining nor under a placement hold. A node at weight 0 (quarantined,
+   declared full) is still listed and follows the same rules as every
+   other node: what it owned in the last 6 h stays protected, and after
+   that its old unlisted blobs can be purged, which is how a node
+   declared full frees space. A node that was down (or whose clock
+   jumped) for more than a few minutes treats everything it owned as
+   owned until its restart and waits a full 6 h before purging;
 1. a generation is loaded and its manifest signature verifies against
    `VALIDATOR_NODE_ID`;
-2. the generation is at most `PURGE_GENERATION_MAX_AGE_SECS` old (7 days);
-3. every PG this miner owns is covered by the generation
-   (`coverage incomplete: N of M PGs listed` otherwise);
-4. the set of PGs this miner owns has been identical for
-   `PURGE_OWNERSHIP_STABLE_SECS` (6 h). The clock is this node's own
-   ownership, not the cluster epoch: the epoch moves every few minutes in
-   production while most nodes' owned set does not, so the former
-   `PURGE_EPOCH_STABLE_SECS` gate never opened (it is now accepted, logged
-   as deprecated and ignored). The set and the time it last changed are
-   persisted in the data directory (`purge_ownership`), so a restart does
-   not reset the clock. Every poll logs `purge: owned set stable for Ns
-   (required M)` or `purge: owned set changed (added=N removed=N),
-   stability clock reset`; a change during a real pass still aborts it;
-5. the blob is a filter miss (not listed for any owned PG under this holder),
-   not listed under another holder of an owned PG (retained as "moved"), and
-   not in a tombstone list — or it is tombstoned, which skips the age rule;
+2. the generation is at most `PURGE_GENERATION_MAX_AGE_SECS` old (7 days),
+   and the view is fresh: the newest signed cut folded into it (the last
+   applied delta's end, else the base's signed cut; never a field of the
+   unsigned `current.json`) is at most `PURGE_VIEW_MAX_LAG_SECS` old
+   (2 h, checked at pass start and before every delete). Deltas are
+   hourly, so a healthy node always runs on a view up to about an hour
+   old; the 14-day age rule, the moved class and the trash are what make
+   that lag safe. A stale or replayed pointer is just an older view, and
+   past the bound nothing is deleted. The purge state in the data
+   directory (`purge_generation`, `purge_ownership`) must also be readable
+   and writable: a failed write or a malformed file closes the purge until
+   a write succeeds;
+3. every PG of the **protected set** (item 4) is covered by the loaded
+   lists and the delta chain is whole (`coverage incomplete for the
+   protected set` otherwise). A pass re-checks this before every delete and
+   stops as soon as it no longer holds (a PG gained, a chain broken); it
+   resumes from where it stopped once coverage is back;
+4. the per-PG ownership window has been tracked for
+   `PURGE_OWNERSHIP_STABLE_SECS` (6 h). Ownership for the purge is the v3
+   (straw2) placement only: v2 data is no longer readable and the v2
+   placement reshuffles most of a node's PGs at every epoch. For every PG
+   the node records when it first and last owned it (persisted in the data
+   directory, `purge_ownership`); the protected set is every PG owned now
+   plus every PG owned at any time in the last `PURGE_OWNERSHIP_STABLE_SECS`.
+   Its lists are all loaded, so a blob listed in a PG lost five hours ago
+   (under this node or another holder) is kept, and a PG just gained is
+   protected at once: no pass deletes before its list is loaded. An epoch
+   change never resets a clock and never aborts a pass. The former
+   whole-set stability clock never opens on the network (the validator
+   publishes an epoch about every 15 minutes, each one moves some PGs of
+   every node); `PURGE_EPOCH_STABLE_SECS` is accepted, logged as deprecated
+   and ignored. A first start, or an unreadable or pre-window state file,
+   restarts the tracking: no pass for one window. The protected set is
+   logged at every change (`purge: owned PGs (v3) and protected set`) and
+   exported as `purge_protected_pgs`;
+5. the blob is not in this node's holder set (nor in a delta record naming
+   it), not a live filter hit (listed anywhere under another holder or
+   withheld: retained as "moved"), and not in a tombstone list — or it is
+   tombstoned, which skips the age rule;
 6. the blob was written at least `PURGE_MIN_AGE_SECS` (14 days) before the
    generation's scan started;
-7. no Store/PullFromPeer for that hash is in flight.
+7. no Store/PullFromPeer for that hash is in flight;
+8. epochs: a pass starts when the map its ownership comes from is at
+   most 3 epochs behind the validator's current epoch (heartbeat), but a
+   delete happens only on the map the node holds, and only while the
+   validator is on that same epoch. Otherwise the delete waits for the
+   map (up to 180 s) and the pass resumes a minute later.
+
+Passes and the dry-run census run in the background: the list poll, the
+delta extension (retried with backoff from 30 s up to `PG_LISTS_POLL_SECS`
+when a GET fails) and the ownership window keep running while an inventory
+walk takes hours.
+
+Deltas are published as range bundles (delta manifest `format` 2, one
+`bundle/<b>.added` per 256 PGs, see `pg-lists/README.md`): applying one
+costs at most one GET per bundle holding a protected PG with additions (64
+at most), instead of one GET per protected PG. A miner built before
+format 2 cannot read such a delta: its chain stays broken, coverage stays
+incomplete and it deletes nothing until upgraded.
+
+Membership is not built locally any more. Each base generation publishes,
+per holder uid, the sorted set of its shard keys (`holders/<uid>/<part>.hashes`)
+and a global 256-shard Bloom filter of every listed shard hash plus the
+shards of files withheld from the lists (`live/<shard>.bloom`, ~5 %
+false positives). The miner downloads only its own set and the 256 shards
+(checked against the signed manifest), keeps them in
+`<data_dir>/pg-lists-cache/gen-<generation>/` (reused after a restart
+without a download, a damaged file is fetched again, older generations are
+removed) and maps them from disk: no base list is downloaded and no filter
+is built in RAM. A blob in its set (or in a delta record naming it) is an
+obligation; otherwise a live filter hit (or a delta record naming another
+holder in a protected PG, or a shard hash a delta withheld from the lists)
+is the moved class. A generation that does not publish the sets, or does
+not declare this miner's uid in them, loads but never purges. Before each
+pass the mapped files are re-hashed against the signed manifest; a file
+damaged since the load drops the generation until it is reloaded and the
+file fetched again. `PURGE_FILTER_FP`,
+`PURGE_FILTER_MAX_BYTES` and `PURGE_OTHERS_FILTER_MAX_BYTES` are gone: set,
+they are logged as ignored.
+
+### Restarts, trash
+
+A graceful stop (SIGTERM, `systemctl stop/restart`) writes
+`inventory.clean` next to `inventory.db` once in-flight writes have
+drained; the next start then skips counting the blob store and is ready
+in minutes instead of hours on large HDD nodes (log: `inventory: previous
+run stopped cleanly, skipping the filesystem count`). After a crash, a
+`kill -9`, a failed inventory write or a stop before the inventory was
+ready, there is no marker and the start counts the store in the
+background as before; the purge waits for it (`inventory: ready to
+serve`). Deleting `inventory.clean` forces the count.
+
+The first start of this version on an existing inventory builds a SQLite
+index over the trashed rows in the background (one scan of the table,
+5-8 minutes on a large HDD node; log `inventory: trashed_at index built`).
+The node registers and serves meanwhile; inventory writes are queued and
+applied when the build ends, and the trash purge waits. They are also
+journaled to `inventory.deferred`: after a stop or a crash during the
+build, the next start applies that file first. Do not delete it.
+
+A census or pass that finds an inventory row without its blob on disk
+counts it in `absent_from_store` and removes the row once the store
+confirms the absence (`absent_rows_dropped`), so the next census no longer
+reports it.
+
+With `TRASH_ENABLED=false` deletes unlink directly, and whatever an earlier
+run left in the trash directory is drained in the background (about 50
+files/s, first batch 5 minutes after start).
 
 ### Rollout order
 
-1. **Dry run first.** Set `PG_LISTS_BASE_URL`, `PURGE_ENABLED=true`, leave
-   `PURGE_DRY_RUN` unset. Restart. Watch for `purge: owned PGs`, `purge:
+1. **Dry run first.** The defaults are the dry run (census on the public
+   bucket); leave `PURGE_DRY_RUN` unset. Watch for `purge: owned PGs`, `purge:
    pass finished` and `purge[census]: would delete` lines. Compare the
    `would_purge` count and bytes with what you expect to be reclaimable
    (`miner_purge_coverage_complete` must be 1; a 0 means the generation does
-   not cover every owned PG and nothing would be deleted anyway).
+   not cover every protected PG and nothing would be deleted anyway).
 2. **Enable by waves.** Set `PURGE_DRY_RUN=false` on a few nodes, wait a
    full pass interval (`PURGE_PASS_INTERVAL_SECS`, 1 h) plus the trash TTL
    margin you are comfortable with, check `purged`/`purged_bytes` match the

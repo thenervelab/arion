@@ -652,48 +652,8 @@ async fn handle_delete(
         }
     };
 
-    // Two-phase by default: move to trash (restorable until the retention
-    // window elapses) and keep the inventory row with its trash mark so the
-    // purge loop has a clock. Hard delete only when the trash is disabled.
-    // A failed store operation must NOT be acknowledged as success: the
-    // old code logged the error and answered OK anyway, so the validator
-    // counted the shard as deleted while it kept serving. Deleting an
-    // absent blob is Ok(()) on every backend (idempotent), so any Err here
-    // is a real failure. The inventory row is only updated on success —
-    // marking it trashed for a blob still live would desync the purge
-    // clock from reality.
-    if trash_enabled {
-        if let Err(e) = store.delete(&hash).await {
-            error!(
-                hash = %truncate_for_log(&hash, 32),
-                error = %e,
-                "Delete: failed to move blob to trash"
-            );
-            return send_response(send, b"ERROR: DELETE_FAILED").await;
-        }
-        trace!(
-            hash = %truncate_for_log(&hash, 32),
-            "Delete complete: blob moved to trash"
-        );
-        if let Err(e) = crate::inventory::trash_shard(&hash) {
-            warn!(hash = %hash, error = %e, "inventory: failed to mark shard trashed");
-        }
-    } else {
-        if let Err(e) = store.remove(&hash).await {
-            error!(
-                hash = %truncate_for_log(&hash, 32),
-                error = %e,
-                "Delete: failed to remove file"
-            );
-            return send_response(send, b"ERROR: DELETE_FAILED").await;
-        }
-        trace!(
-            hash = %truncate_for_log(&hash, 32),
-            "Delete complete: removed blob file"
-        );
-        if let Err(e) = crate::inventory::delete_shard(&hash) {
-            warn!(hash = %hash, error = %e, "inventory: failed to delete shard");
-        }
+    if apply_delete(store, trash_enabled, &hash).await.is_err() {
+        return send_response(send, b"ERROR: DELETE_FAILED").await;
     }
 
     // Invalidate caches to prevent serving stale data
@@ -702,6 +662,92 @@ async fn handle_delete(
 
     // Send ACK
     send_response(send, b"OK").await
+}
+
+/// The store and inventory half of a validator Delete, under the per-hash
+/// write lock (`state::lock_hash_write`, the lock Store, PullFromPeer,
+/// the backfill and the purge take): a Store of the same hash cannot
+/// interleave between the file operation and the row update, and the
+/// clean-shutdown seal of the inventory sees the delete in flight.
+///
+/// Two-phase by default: move to trash (restorable until the retention
+/// window elapses) and keep the inventory row with its trash mark so the
+/// purge loop has a clock. Hard delete only when the trash is disabled.
+/// A failed store operation must NOT be acknowledged as success: the
+/// old code logged the error and answered OK anyway, so the validator
+/// counted the shard as deleted while it kept serving. Deleting an
+/// absent blob is Ok(()) on every backend (idempotent), so any Err here
+/// is a real failure. The inventory row is only updated on success —
+/// marking it trashed for a blob still live would desync the purge
+/// clock from reality.
+async fn apply_delete(
+    store: &dyn BlobStore,
+    trash_enabled: bool,
+    hash: &str,
+) -> std::io::Result<()> {
+    let _write_lock = crate::state::lock_hash_write(hash).await;
+    if trash_enabled {
+        if let Err(e) = store.delete(hash).await {
+            error!(
+                hash = %truncate_for_log(hash, 32),
+                error = %e,
+                "Delete: failed to move blob to trash"
+            );
+            return Err(e);
+        }
+        trace!(
+            hash = %truncate_for_log(hash, 32),
+            "Delete complete: blob moved to trash"
+        );
+        if let Err(e) = crate::inventory::trash_shard(hash) {
+            warn!(hash = %hash, error = %e, "inventory: failed to mark shard trashed");
+        }
+    } else {
+        if let Err(e) = store.remove(hash).await {
+            error!(
+                hash = %truncate_for_log(hash, 32),
+                error = %e,
+                "Delete: failed to remove file"
+            );
+            return Err(e);
+        }
+        trace!(
+            hash = %truncate_for_log(hash, 32),
+            "Delete complete: removed blob file"
+        );
+        if let Err(e) = crate::inventory::delete_shard(hash) {
+            warn!(hash = %hash, error = %e, "inventory: failed to delete shard");
+        }
+    }
+    Ok(())
+}
+
+/// Outcome of [`apply_restore`].
+#[derive(Debug, PartialEq, Eq)]
+enum RestoreOutcome {
+    Present,
+    Restored,
+    NotFound,
+}
+
+/// The store and inventory half of a validator RestoreBlob, under the
+/// per-hash write lock (see [`apply_delete`]).
+async fn apply_restore(store: &dyn BlobStore, hash: &str) -> std::io::Result<RestoreOutcome> {
+    let _write_lock = crate::state::lock_hash_write(hash).await;
+    if store.has(hash) {
+        // Already live; clear any stale trash mark.
+        if let Err(e) = crate::inventory::insert_shard(hash) {
+            warn!(hash = %hash, error = %e, "inventory: failed to re-mark shard live");
+        }
+        return Ok(RestoreOutcome::Present);
+    }
+    if !store.restore(hash).await? {
+        return Ok(RestoreOutcome::NotFound);
+    }
+    if let Err(e) = crate::inventory::insert_shard(hash) {
+        warn!(hash = %hash, error = %e, "inventory: failed to re-insert restored shard");
+    }
+    Ok(RestoreOutcome::Restored)
 }
 
 /// Bring a trashed blob back into the live store on validator command.
@@ -731,19 +777,9 @@ async fn handle_restore_blob(
         return send_response(send, b"ERROR: UNAUTHORIZED").await;
     }
 
-    if store.has(&hash) {
-        // Already live; clear any stale trash mark.
-        if let Err(e) = crate::inventory::insert_shard(&hash) {
-            warn!(hash = %hash, error = %e, "inventory: failed to re-mark shard live");
-        }
-        return send_response(send, b"OK:PRESENT").await;
-    }
-
-    match store.restore(&hash).await {
-        Ok(true) => {
-            if let Err(e) = crate::inventory::insert_shard(&hash) {
-                warn!(hash = %hash, error = %e, "inventory: failed to re-insert restored shard");
-            }
+    match apply_restore(store, &hash).await {
+        Ok(RestoreOutcome::Present) => send_response(send, b"OK:PRESENT").await,
+        Ok(RestoreOutcome::Restored) => {
             info!(
                 hash = %truncate_for_log(&hash, 32),
                 authorized_by = ?validator_node_id,
@@ -751,7 +787,7 @@ async fn handle_restore_blob(
             );
             send_response(send, b"OK:RESTORED").await
         }
-        Ok(false) => send_response(send, b"NOT_FOUND").await,
+        Ok(RestoreOutcome::NotFound) => send_response(send, b"NOT_FOUND").await,
         Err(e) => {
             error!(
                 hash = %truncate_for_log(&hash, 32),
@@ -973,18 +1009,25 @@ async fn handle_cluster_map_update(
         } else {
             match serde_json::from_str::<common::ClusterMap>(&json) {
                 Ok(map) => {
-                    crate::rebalance::persist_cluster_map(&map).await;
-                    let mut map_guard = get_cluster_map().write().await;
-                    // Save old map to history before replacing (for epoch lookback)
-                    if let Some(old_map) = map_guard.as_ref() {
-                        let history_lock = crate::state::get_cluster_map_history();
-                        let mut history = history_lock.write().await;
-                        if history.len() >= crate::constants::MAX_CLUSTER_MAP_HISTORY {
-                            history.pop_front();
+                    {
+                        let mut map_guard = get_cluster_map().write().await;
+                        // Save old map to history before replacing (for epoch lookback)
+                        if let Some(old_map) = map_guard.as_ref() {
+                            let history_lock = crate::state::get_cluster_map_history();
+                            let mut history = history_lock.write().await;
+                            if history.len() >= crate::constants::MAX_CLUSTER_MAP_HISTORY {
+                                history.pop_front();
+                            }
+                            history.push_back(Arc::clone(old_map));
                         }
-                        history.push_back(Arc::clone(old_map));
+                        *map_guard = Some(Arc::new(map));
                     }
-                    *map_guard = Some(Arc::new(map));
+                    // The restart cache is written after the ACK, never
+                    // before it: a disk write on a saturated node can
+                    // outlast the validator's ACK timeout, and repeated
+                    // misses get this miner suppressed from the next
+                    // broadcasts (its map then trails the heartbeat epoch).
+                    crate::rebalance::spawn_persist_held_cluster_map();
                 }
                 Err(e) => {
                     warn!(error = %e, "Failed to parse cluster_map_json");
@@ -1478,18 +1521,21 @@ pub async fn handle_state_sync_request(conn: quinn::Connection) -> anyhow::Resul
     let req: P2PStateSyncRequest = serde_json::from_slice(&req_bytes)?;
 
     let archive_dir = match crate::state::get_data_dir() {
-        Some(dir) => dir.join("epoch_archive"),
+        Some(dir) => dir.join(crate::state_sync::EPOCH_ARCHIVE_DIR),
         None => anyhow::bail!("Data dir not set"),
     };
 
-    let mut current_epoch = req.start_epoch;
-
-    loop {
-        let file_path = archive_dir.join(format!("epoch_{}.json", current_epoch));
+    // Only the epochs this node keeps (a bounded window): a start epoch
+    // older than the window is answered from the oldest kept, which the
+    // requester reads as a gap; nothing kept at or after it is an
+    // immediate EOF, and the requester moves on to another source.
+    for current_epoch in crate::state_sync::archived_epochs_from(req.start_epoch) {
+        let file_path = archive_dir.join(crate::state_sync::epoch_file_name(current_epoch));
 
         let bytes = match tokio::fs::read(&file_path).await {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            // Pruned since the listing.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => anyhow::bail!("Failed to read epoch {current_epoch}: {e}"),
         };
 
@@ -1500,8 +1546,6 @@ pub async fn handle_state_sync_request(conn: quinn::Connection) -> anyhow::Resul
 
         send.write_all(&header).await?;
         send.write_all(&bytes).await?;
-
-        current_epoch += 1;
     }
 
     send.write_all(&0x454F4621u32.to_be_bytes()).await?; // "EOF!"
@@ -1697,5 +1741,48 @@ mod tests {
             .retry_after_ms(),
             5000
         );
+    }
+
+    /// A validator Delete (hard, trash off) and a RestoreBlob wait for
+    /// the per-hash write lock a writer holds, and count as writes in
+    /// flight meanwhile (what the clean-shutdown seal waits on).
+    #[tokio::test]
+    async fn delete_and_restore_take_the_hash_write_lock() {
+        use super::{RestoreOutcome, apply_delete, apply_restore};
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let store = miner::flat_store::FlatBlobStore::new(dir.path()).unwrap();
+        let hash = hex::encode(blake3::hash(b"p2p-delete-lock-test").as_bytes());
+        store.store(&hash, b"bytes").await.unwrap();
+
+        let writer = crate::state::lock_hash_write(&hash).await;
+        let delete = apply_delete(&store, false, &hash);
+        tokio::pin!(delete);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut delete)
+                .await
+                .is_err(),
+            "the delete waits for the writer"
+        );
+        assert!(
+            store.has(&hash),
+            "nothing removed while the writer holds the lock"
+        );
+        assert!(crate::state::hash_writes_in_flight() >= 1);
+        drop(writer);
+        delete.await.unwrap();
+        assert!(!store.has(&hash));
+
+        let writer = crate::state::lock_hash_write(&hash).await;
+        let restore = apply_restore(&store, &hash);
+        tokio::pin!(restore);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut restore)
+                .await
+                .is_err(),
+            "the restore waits for the writer"
+        );
+        drop(writer);
+        assert_eq!(restore.await.unwrap(), RestoreOutcome::NotFound);
     }
 }

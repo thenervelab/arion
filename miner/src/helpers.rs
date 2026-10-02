@@ -87,6 +87,29 @@ pub fn verify_signature(node_id_hex: &str, message: &[u8], signature: &[u8; 64])
     verifying_key.verify(message, &sig).is_ok()
 }
 
+/// Run blocking work (a filesystem call, a SQLite query, a lookup that
+/// faults mmap pages in, a CPU-bound decode) from async code without
+/// stalling the runtime.
+///
+/// On a multi-thread runtime the worker hands its core (and the IO, timer
+/// and signal drivers it may be driving) to another thread for the
+/// duration (`tokio::task::block_in_place`), so a slow disk never freezes
+/// heartbeats, timers or signal delivery. Elsewhere (a current-thread
+/// runtime, as in `#[tokio::test]`, a blocking-pool thread or no runtime)
+/// `f` runs inline, which is what the caller did before.
+///
+/// Unlike `spawn_blocking`, borrowed data may be used and the call cannot
+/// outlive its caller: dropping the calling future cannot leave the work
+/// running detached, which matters at shutdown.
+pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,6 +150,49 @@ mod tests {
     fn truncate_mixed_ascii_multibyte() {
         let mixed = "ab😀cd";
         assert_eq!(truncate_for_log(mixed, 3), "ab😀");
+    }
+
+    #[test]
+    fn blocking_runs_inline_without_a_runtime() {
+        assert_eq!(blocking(|| 7), 7);
+    }
+
+    #[tokio::test]
+    async fn blocking_runs_inline_on_a_current_thread_runtime() {
+        let local = String::from("borrowed");
+        assert_eq!(blocking(|| local.len()), 8);
+    }
+
+    /// With every worker inside `blocking`, timers still fire: the cores
+    /// were handed off instead of being held by the blocked calls.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_keeps_timers_running_on_a_multi_thread_runtime() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let mut blocked = Vec::new();
+        for _ in 0..2 {
+            let rx = std::sync::Arc::clone(&rx);
+            blocked.push(tokio::spawn(async move {
+                blocking(|| {
+                    let _ = rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(10));
+                })
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let started = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let elapsed = started.elapsed();
+        drop(tx);
+        for task in blocked {
+            task.await.unwrap();
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "a timer must fire while workers block, took {elapsed:?}"
+        );
     }
 
     #[tokio::test]
