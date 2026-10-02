@@ -56,6 +56,7 @@
 //! mover at ~10k blobs/s; the filesystem is the real limiter on I/O-bound
 //! nodes. Emptied leaf directories are removed at the end of the pass.
 
+use crate::flat_store::BinPager;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -121,6 +122,14 @@ impl BlobStore for MigratingStore {
             .blob_len(hash_hex)
             .or_else(|| self.flat.blob_len(hash_hex))
             .or_else(|| self.packed.blob_len(hash_hex))
+    }
+
+    fn confirmed_absent(&self, hash_hex: &str) -> bool {
+        // The mover stores into packed before it unlinks the flat copy:
+        // packed is checked again last, as in `blob_len`.
+        self.packed.confirmed_absent(hash_hex)
+            && self.flat.confirmed_absent(hash_hex)
+            && self.packed.confirmed_absent(hash_hex)
     }
 
     async fn delete(&self, hash_hex: &str) -> std::io::Result<()> {
@@ -226,69 +235,6 @@ fn probe_hex_subdirs(base: &Path) -> Vec<PathBuf> {
         .map(|i| base.join(format!("{i:02x}")))
         .filter(|p| p.is_dir())
         .collect()
-}
-
-/// Streaming pager over the `*.bin` entries of one directory. Holds the
-/// readdir cursor across pages so a directory of any size is enumerated at
-/// most once per pass, in bounded chunks, off the async runtime — the full
-/// listing is never collected.
-struct BinPager {
-    dir: PathBuf,
-    cursor: Option<std::fs::ReadDir>,
-    exhausted: bool,
-}
-
-impl BinPager {
-    fn new(dir: &Path) -> Self {
-        Self {
-            dir: dir.to_path_buf(),
-            cursor: None,
-            exhausted: false,
-        }
-    }
-
-    /// Next page of up to `batch` blob names. Empty page = directory
-    /// exhausted for this pass.
-    async fn next_page(&mut self, batch: usize) -> Vec<String> {
-        if self.exhausted {
-            return Vec::new();
-        }
-        let cursor = self.cursor.take();
-        let dir = self.dir.clone();
-        let (cursor, page) = tokio::task::spawn_blocking(move || {
-            let mut cursor = match cursor {
-                Some(c) => c,
-                None => match std::fs::read_dir(&dir) {
-                    Ok(c) => c,
-                    Err(_) => return (None, Vec::new()),
-                },
-            };
-            let mut page = Vec::with_capacity(batch.min(4096));
-            for e in cursor.by_ref().flatten() {
-                let Ok(name) = e.file_name().into_string() else {
-                    continue;
-                };
-                let Some(h) = name.strip_suffix(".bin") else {
-                    continue;
-                };
-                if !e.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                    continue;
-                }
-                page.push(h.to_string());
-                if page.len() >= batch {
-                    // Cursor survives to the next call: the next page
-                    // resumes here instead of re-reading from the start.
-                    return (Some(cursor), page);
-                }
-            }
-            (None, page)
-        })
-        .await
-        .unwrap_or((None, Vec::new()));
-        self.cursor = cursor;
-        self.exhausted = self.cursor.is_none();
-        page
-    }
 }
 
 /// Packed → flat → packed lookup. The mover stores a blob durably into
@@ -676,6 +622,35 @@ mod tests {
         let flat = Arc::new(FlatBlobStore::new(dir).unwrap());
         let packed = PackedStore::open(dir.join("packed")).unwrap();
         (flat, packed)
+    }
+
+    #[tokio::test]
+    async fn confirmed_absent_covers_both_sides_and_the_trash() {
+        let dir = tempfile::tempdir().unwrap();
+        let (flat, packed) = setup(dir.path()).await;
+        let hybrid = MigratingStore {
+            flat: Arc::clone(&flat),
+            packed: Arc::clone(&packed),
+        };
+        let in_flat = b"flat-side".to_vec();
+        let in_packed = b"packed-side".to_vec();
+        flat.store(&h(&in_flat), &in_flat).await.unwrap();
+        packed.store(&h(&in_packed), &in_packed).await.unwrap();
+        assert!(!hybrid.confirmed_absent(&h(&in_flat)));
+        assert!(!hybrid.confirmed_absent(&h(&in_packed)));
+        assert!(hybrid.confirmed_absent(&h(b"never-stored")));
+
+        crate::store::BlobStore::delete(&*packed, &h(&in_packed))
+            .await
+            .unwrap();
+        assert!(
+            !hybrid.confirmed_absent(&h(&in_packed)),
+            "a trashed copy is a copy"
+        );
+        crate::store::BlobStore::purge_trashed(&*packed, &h(&in_packed))
+            .await
+            .unwrap();
+        assert!(hybrid.confirmed_absent(&h(&in_packed)));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

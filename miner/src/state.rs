@@ -358,6 +358,13 @@ impl Drop for PurgePassGuard {
     }
 }
 
+/// Number of hashes with a write lock held or awaited (Store,
+/// PullFromPeer, backfill, a purge delete). Zero means no blob write is
+/// in progress; read by the clean-shutdown seal of the inventory.
+pub fn hash_writes_in_flight() -> usize {
+    hash_write_locks().len()
+}
+
 /// Whether a write for `hash_hex` is currently in progress.
 pub fn is_write_inflight(hash_hex: &str) -> bool {
     hash_write_locks()

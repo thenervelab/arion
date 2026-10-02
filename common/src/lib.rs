@@ -30,12 +30,14 @@
 //! - **Deterministic ordering**: Miners sorted by UID before placement to avoid HashMap shuffle
 
 pub mod attestation_bundle;
+pub mod hash_set_files;
 pub mod manifest;
 pub mod merkle;
 pub mod middleware;
 pub mod obligation_list;
 #[cfg(feature = "redb")]
 pub mod redb_utils;
+pub mod shard_obligations;
 pub mod storage_proof;
 pub mod store_reply;
 pub mod stun;

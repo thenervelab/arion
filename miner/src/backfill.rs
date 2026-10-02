@@ -133,6 +133,10 @@ pub struct Candidate {
     pub hash: [u8; 32],
     /// Length declared by the list; the payload must match it exactly.
     pub shard_length: u64,
+    /// The other holders the same list names for this blob (identical
+    /// shard bytes in several files or stripes), ascending: tried before
+    /// the PG's current placement, since the list says they hold it.
+    pub listed_holders: Vec<u32>,
 }
 
 impl Candidate {
@@ -202,6 +206,33 @@ pub struct Peer {
     /// Hex node id (the key of the connection pool and peer cache).
     pub node_id: String,
     pub addr: SocketAddr,
+}
+
+/// The miners of `uids` (in that order) that can be dialled: this miner,
+/// draining and offline miners and miners without any direct address are
+/// skipped, as in [`holders_for_pg`]. A uid absent from the map is
+/// skipped. The address comes from `known_addr` first, else from the map.
+pub fn peers_for_uids(
+    map: &common::ClusterMap,
+    uids: &[u32],
+    self_uid: u32,
+    known_addr: impl Fn(&str) -> Option<SocketAddr>,
+) -> Vec<Peer> {
+    uids.iter()
+        .filter(|uid| **uid != self_uid)
+        .filter_map(|uid| map.miners.iter().find(|m| m.uid == *uid))
+        .filter(|m| !m.draining && !m.drained_for_offline)
+        .filter_map(|m| {
+            let node_id = m.endpoint.id.to_string();
+            let addr =
+                known_addr(&node_id).or_else(|| common::socket_addr_from_endpoint(&m.endpoint))?;
+            Some(Peer {
+                uid: m.uid,
+                node_id,
+                addr,
+            })
+        })
+        .collect()
 }
 
 /// Peers placed on `pg_id` that may hold its blobs, at most `max`, in
@@ -360,8 +391,8 @@ pub struct BackfillMetrics {
     pub pending: AtomicU64,
     pub generation: AtomicU64,
     /// Polls refused because this miner owns no PG under the current map
-    /// (weight 0): nothing to fetch, and an empty owned set is never read
-    /// as "nothing obliged". Exposed as
+    /// (weight 0) and the holder index names it in none: nothing to fetch.
+    /// Exposed as
     /// `miner_backfill_refused_empty_ownership_total`.
     pub refused_empty_ownership: AtomicU64,
 }
@@ -459,7 +490,7 @@ impl PauseReason {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn lookup_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
@@ -542,7 +573,7 @@ mod tests {
 
     /// A cluster map of `n` miners in `n` families, weight 100, over 256
     /// PGs; miner `i` has direct address 10.0.0.i:4001.
-    fn test_map(n: u32) -> common::ClusterMap {
+    pub(crate) fn test_map(n: u32) -> common::ClusterMap {
         let mut map = common::ClusterMap::new();
         map.epoch = 42;
         map.pg_count = 256;
@@ -643,6 +674,24 @@ mod tests {
             3,
             "the peer cache alone is enough"
         );
+    }
+
+    #[test]
+    fn listed_peers_keep_their_order_and_skip_the_undialable() {
+        let mut map = test_map(40);
+        map.miners[4].draining = true;
+        map.miners[5].drained_for_offline = true;
+        map.miners[6].endpoint.addrs.clear();
+        let peers = peers_for_uids(&map, &[9, 7, 4, 5, 6, 3, 999], 7, |_| None);
+        assert_eq!(
+            peers.iter().map(|p| p.uid).collect::<Vec<_>>(),
+            vec![9, 3],
+            "self, draining, offline, address-less and unknown uids skipped"
+        );
+        let cached: SocketAddr = "192.0.2.9:5000".parse().unwrap();
+        let with_cache = peers_for_uids(&map, &[6], 7, |_| Some(cached));
+        assert_eq!(with_cache.len(), 1, "the peer cache alone is enough");
+        assert_eq!(with_cache[0].addr, cached);
     }
 
     #[test]

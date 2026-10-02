@@ -284,18 +284,11 @@ async fn get_or_fetch_cluster_map(
         }
     }
 
-    // Secondary path: check local epoch_archive on disk.
-    let mut fetched = None;
-    if let Some(data_dir) = crate::state::get_data_dir() {
-        let path = data_dir
-            .join("epoch_archive")
-            .join(format!("epoch_{}.json", epoch));
-        if let Ok(bytes) = tokio::fs::read(&path).await {
-            if let Ok(map) = serde_json::from_slice::<common::ClusterMap>(&bytes) {
-                fetched = Some(map);
-            }
-        }
-    }
+    // Secondary path: the local epoch_archive, verified (validator
+    // signature, epoch). It keeps only the most recent epochs
+    // (`state_sync::epoch_archive_keep`): an older one, or one that fails
+    // verification (deleted), comes from the validator below.
+    let mut fetched = crate::state_sync::read_verified_archived_map(epoch, validator_node_id).await;
 
     // Cache miss and disk miss — fetch from the validator.
     if fetched.is_none() {
@@ -1924,11 +1917,49 @@ async fn fetch_manifest_on_conn(
 /// File name for the persisted cluster map cache.
 const CLUSTER_MAP_CACHE_FILE: &str = "cluster_map_cache.json";
 
-/// Persist the cluster map to `{data_dir}/cluster_map_cache.json` so it survives restarts.
-pub async fn persist_cluster_map(map: &common::ClusterMap) {
+/// A persist of the held map is queued and has not read the map yet.
+static CLUSTER_MAP_PERSIST_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Serializes the cache writes (one file, one writer at a time).
+static CLUSTER_MAP_PERSIST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The held map, as the persist task reads it.
+type HeldMap = TokioRwLock<Option<Arc<common::ClusterMap>>>;
+
+/// Persist the map held in `state::get_cluster_map()` in the background,
+/// off the `ClusterMapUpdate` path: the validator waits for that message's
+/// ACK for a few seconds only (5 s by default, failures counted toward a
+/// 10 min broadcast suppression), and a file write on a node whose disk
+/// is saturated can take longer than that. The file is only a restart
+/// cache, so writing it after the ACK changes nothing else. Requests
+/// coalesce: while one persist is queued and has not read the map yet,
+/// further requests are dropped (the queued one writes the newest map).
+pub fn spawn_persist_held_cluster_map() {
     let Some(data_dir) = crate::state::get_data_dir() else {
         return;
     };
+    spawn_persist_from(data_dir.clone(), get_cluster_map());
+}
+
+/// [`spawn_persist_held_cluster_map`] for a given directory and map slot.
+fn spawn_persist_from(data_dir: std::path::PathBuf, held: &'static HeldMap) {
+    if CLUSTER_MAP_PERSIST_PENDING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    tokio::spawn(async move {
+        let _writer = CLUSTER_MAP_PERSIST_LOCK.lock().await;
+        // Cleared before the map is read: a map installed after this
+        // point queues its own persist.
+        CLUSTER_MAP_PERSIST_PENDING.store(false, Ordering::Release);
+        let map = held.read().await.clone();
+        if let Some(map) = map {
+            persist_cluster_map_to(&data_dir, &map).await;
+        }
+    });
+}
+
+/// Write the cluster map to `{data_dir}/cluster_map_cache.json` so it survives restarts.
+async fn persist_cluster_map_to(data_dir: &std::path::Path, map: &common::ClusterMap) {
     let path = data_dir.join(CLUSTER_MAP_CACHE_FILE);
     match serde_json::to_string(map) {
         Ok(json) => {
@@ -2627,5 +2658,41 @@ mod tests {
         assert!(out2.is_empty());
         assert_eq!(req2, vec![vec![1, 2], vec![3]]);
         assert_eq!(sweep.cursor, 0);
+    }
+
+    /// Persisting the held map never blocks its caller (the
+    /// `ClusterMapUpdate` handler, before its ACK), even while a previous
+    /// cache write is stuck on the disk; requests made meanwhile coalesce
+    /// into the queued one, and the file ends at the newest map. (One
+    /// test: the pending flag and the writer lock are process-wide.)
+    #[tokio::test]
+    async fn held_map_persist_never_blocks_the_caller_and_ends_at_the_newest_map() {
+        static HELD: super::HeldMap = tokio::sync::RwLock::const_new(None);
+        let dir = tempfile::tempdir().unwrap();
+        let stuck_writer = super::CLUSTER_MAP_PERSIST_LOCK.lock().await;
+        let started = std::time::Instant::now();
+        for epoch in 1..=3u64 {
+            *HELD.write().await = Some(Arc::new(common::ClusterMap {
+                epoch,
+                ..common::ClusterMap::default()
+            }));
+            super::spawn_persist_from(dir.path().to_path_buf(), &HELD);
+        }
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(super::CLUSTER_MAP_PERSIST_PENDING.load(Ordering::Acquire));
+        drop(stuck_writer);
+        let cache = dir.path().join(super::CLUSTER_MAP_CACHE_FILE);
+        let mut epoch = None;
+        for _ in 0..200 {
+            if !super::CLUSTER_MAP_PERSIST_PENDING.load(Ordering::Acquire)
+                && let Some(map) = super::load_cluster_map_cache(dir.path()).await
+            {
+                epoch = Some(map.epoch);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cache.exists());
+        assert_eq!(epoch, Some(3), "the cache ends at the newest map");
     }
 }

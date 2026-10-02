@@ -26,7 +26,7 @@ use tracing::{debug, error, info, warn};
 
 use miner::backfill::{
     BackfillConfig, BackfillMetrics, Candidate, Cursor, FetchError, PauseReason, Peer,
-    holders_for_pg, verify_payload,
+    holders_for_pg, peers_for_uids, verify_payload,
 };
 use miner::pg_lists::{self, ListExpectation, ListSource, MAX_LIST_BYTES, Manifest};
 use miner::purge::{PurgeConfig, RateLimiter, generation_is_fresh};
@@ -48,8 +48,10 @@ pub fn metrics() -> &'static BackfillMetrics {
 pub trait PassEnv: Send + Sync {
     /// The inventory holds `hash_hex` as a live (not trashed) shard.
     fn has_live(&self, hash_hex: &str) -> Result<bool>;
-    /// Peers placed on `pg_id` to try, at most `max`, best first.
-    async fn holders(&self, pg_id: u32, max: usize) -> Vec<Peer>;
+    /// Peers to try for a blob of `pg_id`, at most `max`, best first: the
+    /// holders `listed` for the same blob by the list, then the miners
+    /// placed on the PG by the current map.
+    async fn holders(&self, pg_id: u32, listed: &[u32], max: usize) -> Vec<Peer>;
     /// This miner's uid: the listed records whose `holder_uid` is this
     /// are its own.
     fn my_uid(&self) -> u32;
@@ -79,24 +81,27 @@ impl PassEnv for LiveEnv {
     fn has_live(&self, hash_hex: &str) -> Result<bool> {
         Ok(inventory::live_stored_at(hash_hex)?.is_some())
     }
-    async fn holders(&self, pg_id: u32, max: usize) -> Vec<Peer> {
+    async fn holders(&self, pg_id: u32, listed: &[u32], max: usize) -> Vec<Peer> {
         let Some(map) = state::get_cluster_map().read().await.clone() else {
             return Vec::new();
         };
         let me = state::get_miner_uid();
         let cache = state::get_peer_cache();
+        let listed = listed.to_vec();
         tokio::task::spawn_blocking(move || {
-            holders_for_pg(
-                &map,
-                pg_id,
-                me,
-                |node_id| {
-                    cache
-                        .get(node_id)
-                        .and_then(|addr| state::socket_addr_from_endpoint(&addr))
-                },
-                max,
-            )
+            let known = |node_id: &str| {
+                cache
+                    .get(node_id)
+                    .and_then(|addr| state::socket_addr_from_endpoint(&addr))
+            };
+            let mut peers = peers_for_uids(&map, &listed, me, known);
+            for peer in holders_for_pg(&map, pg_id, me, known, max) {
+                if !peers.iter().any(|p| p.uid == peer.uid) {
+                    peers.push(peer);
+                }
+            }
+            peers.truncate(max);
+            peers
         })
         .await
         .unwrap_or_default()
@@ -351,7 +356,7 @@ async fn scan_pg_list(
         );
     }
     let path = format!("gen/{}/{}", manifest.generation, Manifest::list_path(pg_id));
-    let bytes = source.fetch(&path, obj.size).await?;
+    let bytes = pg_lists::fetch_sized(source, &path, obj.size).await?;
     if bytes.len() as u64 != obj.size {
         anyhow::bail!(
             "manifest size {} but body is {} bytes",
@@ -366,36 +371,40 @@ async fn scan_pg_list(
         ec_m: manifest.ec_m,
         sha256_hex: &obj.sha256,
     };
-    let my_uid = env.my_uid();
-    let mut truncated = false;
-    let mut lookup_error: Option<anyhow::Error> = None;
-    let mut found = 0usize;
-    let mut other_holder = 0u64;
-    let header = pg_lists::decode_list(&bytes, expect, &mut |record| {
-        if truncated || lookup_error.is_some() {
-            return;
-        }
-        if !record.is_held_by(my_uid) {
-            other_holder += 1;
-            return;
-        }
-        match env.has_live(&hex::encode(record.blob_hash)) {
-            Ok(true) => {}
-            Ok(false) => {
-                if found >= room {
-                    truncated = true;
-                    return;
-                }
-                found += 1;
-                out.push(Candidate {
-                    pg_id,
-                    hash: record.blob_hash,
-                    shard_length: u64::from(record.shard_length),
-                });
+    let mut scan = ListScan {
+        pg_id,
+        my_uid: env.my_uid(),
+        room,
+        found: 0,
+        truncated: false,
+        lookup_error: None,
+        other_holder: 0,
+    };
+    // Records are sorted by (blob hash, holder): the holders of one blob
+    // are consecutive, so a blob is decided once all its holders are seen.
+    let mut group: Option<BlobGroup> = None;
+    let header = pg_lists::decode_list(&bytes, expect, &mut |record| match group.as_mut() {
+        Some(g) if g.hash == record.blob_hash => g.holders.push(record.holder_uid),
+        _ => {
+            if let Some(done) = group.replace(BlobGroup {
+                hash: record.blob_hash,
+                shard_length: record.shard_length,
+                holders: vec![record.holder_uid],
+            }) {
+                scan.decide(done, env, out);
             }
-            Err(e) => lookup_error = Some(e),
         }
     })?;
+    if let Some(done) = group.take() {
+        scan.decide(done, env, out);
+    }
+    let ListScan {
+        found,
+        truncated,
+        lookup_error,
+        other_holder,
+        ..
+    } = scan;
     skips.other_holder += other_holder;
     if let Some(e) = lookup_error {
         // A failed inventory read leaves the PG's candidates unknown:
@@ -416,6 +425,62 @@ async fn scan_pg_list(
     } else {
         ScanOutcome::Complete
     })
+}
+
+/// Every holder one list names for one blob hash.
+struct BlobGroup {
+    hash: [u8; 32],
+    shard_length: u32,
+    holders: Vec<u32>,
+}
+
+/// State of one list scan (see [`scan_pg_list`]).
+struct ListScan {
+    pg_id: u32,
+    my_uid: u32,
+    room: usize,
+    found: usize,
+    truncated: bool,
+    lookup_error: Option<anyhow::Error>,
+    /// Records naming another holder.
+    other_holder: u64,
+}
+
+impl ListScan {
+    /// A blob this miner is listed for and lacks becomes a candidate,
+    /// with the other listed holders as its first sources.
+    fn decide(&mut self, group: BlobGroup, env: &dyn PassEnv, out: &mut Vec<Candidate>) {
+        let mine = group.holders.contains(&self.my_uid);
+        self.other_holder += group
+            .holders
+            .iter()
+            .filter(|uid| **uid != self.my_uid)
+            .count() as u64;
+        if !mine || self.truncated || self.lookup_error.is_some() {
+            return;
+        }
+        match env.has_live(&hex::encode(group.hash)) {
+            Ok(true) => {}
+            Ok(false) => {
+                if self.found >= self.room {
+                    self.truncated = true;
+                    return;
+                }
+                self.found += 1;
+                out.push(Candidate {
+                    pg_id: self.pg_id,
+                    hash: group.hash,
+                    shard_length: u64::from(group.shard_length),
+                    listed_holders: group
+                        .holders
+                        .into_iter()
+                        .filter(|uid| *uid != self.my_uid)
+                        .collect(),
+                });
+            }
+            Err(e) => self.lookup_error = Some(e),
+        }
+    }
 }
 
 /// Block while a pause condition holds, re-checking every
@@ -479,7 +544,9 @@ async fn fetch_one(
 ) -> FetchOutcome {
     let mut out = FetchOutcome::default();
     let hash_hex = candidate.hash_hex();
-    let peers = env.holders(candidate.pg_id, peers_per_blob).await;
+    let peers = env
+        .holders(candidate.pg_id, &candidate.listed_holders, peers_per_blob)
+        .await;
     if peers.is_empty() {
         debug!(hash = %hash_hex, pg_id = candidate.pg_id, "backfill: no eligible peer");
         out.no_peer += 1;
@@ -600,6 +667,9 @@ pub async fn run_loop(
         );
     }
     let mut manifest: Option<Manifest> = None;
+    // PGs the current generation's holder index names this miner in,
+    // fetched once per generation.
+    let mut held: Option<(u64, Vec<u32>)> = None;
     let mut last_poll_at: Option<tokio::time::Instant> = None;
     let mut last_pass_at: Option<tokio::time::Instant> = None;
     let mut last_logged_wait: Option<&'static str> = None;
@@ -613,31 +683,12 @@ pub async fn run_loop(
             epoch,
             pgs: owned,
             weight,
+            ..
         }) = crate::pg_purge::owned_pgs().await
         else {
             debug!("backfill: no cluster map yet");
             continue;
         };
-        if !miner::purge::ownership_nonempty(&owned) {
-            // Same clause 0 as the purge: a weight-0 miner owns no PG.
-            // There is nothing to fetch, and the manifest is not even
-            // polled on its behalf.
-            metrics
-                .refused_empty_ownership
-                .fetch_add(1, Ordering::Relaxed);
-            let generation = manifest.as_ref().map(|m| m.generation).unwrap_or(0);
-            if last_logged_empty != Some(generation) {
-                warn!(
-                    epoch,
-                    weight = ?weight,
-                    generation,
-                    "backfill: this miner owns no PG under the current map (weight 0?), nothing to fetch"
-                );
-                last_logged_empty = Some(generation);
-            }
-            continue;
-        }
-        last_logged_empty = None;
         let poll_due = last_poll_at.is_none_or(|t| t.elapsed().as_secs() >= purge_cfg.poll_secs);
         if manifest.is_none() || poll_due {
             refresh_manifest(source.as_ref(), &validator_node_id, &mut manifest).await;
@@ -677,6 +728,43 @@ pub async fn run_loop(
         if last_pass_at.is_some_and(|t| t.elapsed().as_secs() < cfg.pass_interval_secs) {
             continue;
         }
+        // The walk covers the PGs owned now and those whose list names this
+        // miner as a holder (placed on it at an older epoch). A failed index
+        // fetch only narrows the walk to the owned PGs this pass.
+        if held.as_ref().is_none_or(|(g, _)| *g != current.generation) {
+            match pg_lists::fetch_holder_pgs(source.as_ref(), current, env.my_uid()).await {
+                Ok(pgs) => held = Some((current.generation, pgs.unwrap_or_default())),
+                Err(e) => warn!(
+                    generation = current.generation,
+                    error = %format!("{e:#}"),
+                    "backfill: holder index unavailable, walking the owned PGs only"
+                ),
+            }
+        }
+        let mut owned = owned;
+        if let Some((_, pgs)) = held.as_ref().filter(|(g, _)| *g == current.generation) {
+            owned.extend(pgs.iter().copied());
+            owned.sort_unstable();
+            owned.dedup();
+        }
+        if owned.is_empty() {
+            // A miner that owns no PG (weight 0) and that no list names as
+            // a holder has nothing to fetch.
+            metrics
+                .refused_empty_ownership
+                .fetch_add(1, Ordering::Relaxed);
+            if last_logged_empty != Some(current.generation) {
+                warn!(
+                    epoch,
+                    weight = ?weight,
+                    generation = current.generation,
+                    "backfill: this miner owns no PG under the current map (weight 0?) and no list names it as a holder, nothing to fetch"
+                );
+                last_logged_empty = Some(current.generation);
+            }
+            continue;
+        }
+        last_logged_empty = None;
 
         info!(
             generation = current.generation,
@@ -814,14 +902,26 @@ mod tests {
         pgs: &[(u32, u32)],
         holder_of: &dyn Fn(u32, u32) -> u32,
     ) -> String {
+        write_generation_records(root, pgs, &|pg, count| {
+            (0..count)
+                .map(|i| record_held_by(pg, i, holder_of(pg, i)))
+                .collect()
+        })
+    }
+
+    /// The generation of `pgs` (`(pg, count)`) whose list of each PG holds
+    /// `records_of(pg, count)`.
+    fn write_generation_records(
+        root: &std::path::Path,
+        pgs: &[(u32, u32)],
+        records_of: &dyn Fn(u32, u32) -> Vec<Record>,
+    ) -> String {
         let key = deterministic_key(3);
         let gen_dir = root.join(format!("gen/{GENERATION}"));
         std::fs::create_dir_all(gen_dir.join("pg")).unwrap();
         let mut objects = serde_json::Map::new();
         for &(pg, count) in pgs {
-            let records: Vec<Record> = (0..count)
-                .map(|i| record_held_by(pg, i, holder_of(pg, i)))
-                .collect();
+            let records = records_of(pg, count);
             let body = encode_list(pg, GENERATION, 10, 20, &records);
             std::fs::write(gen_dir.join(Manifest::list_path(pg)), &body).unwrap();
             objects.insert(
@@ -925,8 +1025,15 @@ mod tests {
         fn has_live(&self, hash_hex: &str) -> Result<bool> {
             Ok(self.live.lock().unwrap().contains(hash_hex))
         }
-        async fn holders(&self, _pg_id: u32, max: usize) -> Vec<Peer> {
-            self.holders.iter().take(max).cloned().collect()
+        async fn holders(&self, _pg_id: u32, listed: &[u32], max: usize) -> Vec<Peer> {
+            let mut peers: Vec<Peer> = listed.iter().map(|uid| peer(*uid)).collect();
+            for p in &self.holders {
+                if !peers.iter().any(|q| q.uid == p.uid) {
+                    peers.push(p.clone());
+                }
+            }
+            peers.truncate(max);
+            peers
         }
         fn my_uid(&self) -> u32 {
             self.my_uid
@@ -1187,6 +1294,54 @@ mod tests {
             let (data, hash) = blob(7, i);
             assert_eq!(rig.store.read(&hex::encode(hash)).await.unwrap(), data);
         }
+    }
+
+    /// The same blob is listed for this miner and for another holder
+    /// (identical shard bytes in two files): that holder is tried first,
+    /// before the PG's current placement.
+    #[tokio::test]
+    async fn listed_other_holder_is_the_first_source() {
+        let pgs = [(9u32, 2u32)];
+        let bucket = tempfile::tempdir().unwrap();
+        let validator_hex = write_generation_records(bucket.path(), &pgs, &|pg, count| {
+            let mut records: Vec<Record> = (0..count).map(|i| record(pg, i)).collect();
+            records.push(record_held_by(pg, 0, 42));
+            records
+        });
+        let source = DirListSource::new(bucket.path());
+        let manifest = fetch_manifest(&source, GENERATION, &validator_hex)
+            .await
+            .unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FlatBlobStore::new(store_dir.path()).unwrap());
+        let rig = Rig {
+            _bucket: bucket,
+            _store_dir: store_dir,
+            source,
+            manifest,
+            store,
+            metrics: fresh_metrics(),
+        };
+        let env = Arc::new(FakeEnv::new(
+            vec![peer(1), peer(2), peer(3)],
+            HashMap::from([(42, Serve::Honest), (1, Serve::Honest)]),
+            &pgs,
+        ));
+        let s = run(&rig, &env, &[9], Cursor::default(), &fast_cfg()).await;
+        assert_eq!((s.candidates, s.fetched, s.bad_peer), (2, 2, 0), "{s:?}");
+        assert_eq!(s.other_holder, 1, "the other holder's record");
+        let (_, shared) = blob(9, 0);
+        let (_, alone) = blob(9, 1);
+        let fetches = env.fetches.lock().unwrap().clone();
+        assert!(
+            fetches.contains(&(42, hex::encode(shared))),
+            "the listed holder served the shared blob: {fetches:?}"
+        );
+        assert!(
+            fetches.contains(&(1, hex::encode(alone))),
+            "the placement's first peer served the other: {fetches:?}"
+        );
+        assert!(!fetches.contains(&(1, hex::encode(shared))), "{fetches:?}");
     }
 
     /// No holder yields the blob: counted as no_peer, nothing stored,

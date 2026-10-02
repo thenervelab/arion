@@ -970,6 +970,14 @@ impl crate::store::BlobStore for PackedStore {
             .map(|loc| loc.payload_len as u64)
     }
 
+    fn confirmed_absent(&self, hash_hex: &str) -> bool {
+        // The index is the store's whole truth: a miss on both maps is
+        // definite.
+        let key = name_key(hash_hex);
+        let idx = self.idx.read().unwrap();
+        !idx.live.contains_key(key) && !idx.trash.contains_key(&key)
+    }
+
     async fn delete(&self, hash_hex: &str) -> std::io::Result<()> {
         let key = name_key(hash_hex);
         if !self.idx.read().unwrap().live.contains_key(key) {
