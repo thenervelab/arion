@@ -611,6 +611,70 @@ pub fn live_stored_at(hash: &str) -> Result<Option<i64>> {
     })
 }
 
+/// Read-only connections kept for [`live_among`], at most this many idle.
+const MAX_IDLE_READERS: usize = 64;
+
+/// Idle read-only connections of [`live_among`].
+static READERS: Mutex<Vec<rusqlite::Connection>> = Mutex::new(Vec::new());
+
+/// Which of `hashes` the inventory holds as LIVE (not trashed) shards, in
+/// order: the batch form of `live_stored_at(..).is_some()`.
+///
+/// Runs on a read-only connection of its own (WAL: readers neither take
+/// the connection lock of [`with_db`] nor block its writers). Each lookup
+/// is its own implicit read transaction, as the point query was: no
+/// reader holds a snapshot across a batch, so concurrent batches never
+/// keep a checkpoint from resetting the WAL. Several callers run in
+/// parallel on distinct connections, so their disk reads overlap instead
+/// of queueing one point query at a time behind every other inventory
+/// user. Blocking: call it from `spawn_blocking`.
+pub fn live_among(hashes: &[[u8; 32]]) -> Result<Vec<bool>> {
+    let conn = checkout_reader()?;
+    let result = live_among_on(&conn, hashes);
+    if result.is_ok() {
+        let mut idle = READERS.lock().unwrap_or_else(|e| e.into_inner());
+        if idle.len() < MAX_IDLE_READERS {
+            idle.push(conn);
+        }
+    }
+    result
+}
+
+fn checkout_reader() -> Result<rusqlite::Connection> {
+    if let Some(conn) = READERS.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+        return Ok(conn);
+    }
+    let path = DB_PATH
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("inventory not initialized"))?;
+    open_reader(path)
+}
+
+/// A read-only connection on the inventory file.
+pub(crate) fn open_reader(path: &Path) -> Result<rusqlite::Connection> {
+    use rusqlite::OpenFlags;
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    Ok(conn)
+}
+
+/// [`live_among`] on a given connection.
+pub(crate) fn live_among_on(conn: &rusqlite::Connection, hashes: &[[u8; 32]]) -> Result<Vec<bool>> {
+    let mut out = Vec::with_capacity(hashes.len());
+    let mut hex_buf = [0u8; 64];
+    let mut stmt =
+        conn.prepare_cached("SELECT 1 FROM shards WHERE hash = ?1 AND trashed_at IS NULL")?;
+    for hash in hashes {
+        hex::encode_to_slice(hash, &mut hex_buf).expect("64-byte buffer for 32 bytes");
+        let hex = std::str::from_utf8(&hex_buf).expect("hex is ASCII");
+        out.push(stmt.exists(rusqlite::params![hex])?);
+    }
+    Ok(out)
+}
+
 /// Mark a shard as trashed: excluded from every listing, retention clock
 /// started. Inserts the row if the DB never knew the shard.
 pub fn trash_shard(hash: &str) -> Result<()> {
@@ -1057,8 +1121,8 @@ fn is_trashed_row(hash: &str) -> Result<bool> {
 /// the process from one trashed by a Delete after the walk). The steady
 /// state, a Delete that renamed the file and marked its row, costs no
 /// `stat` at all; it cost two per trashed blob before (hours at startup
-/// on a node whose trash held the previous purge pass, measured on a
-/// test bench). No lock on the DB is held across a filesystem call.
+/// on a node whose trash held the previous purge pass, measured on a test
+/// bench). No lock on the DB is held across a filesystem call.
 pub async fn reconcile_trash(store: &dyn crate::store::BlobStore) -> Result<usize> {
     let mut trashed_files = crate::helpers::blocking(|| store.list_trashed_hashes());
     let now = std::time::SystemTime::now()
@@ -1124,6 +1188,72 @@ pub async fn reconcile_trash(store: &dyn crate::store::BlobStore) -> Result<usiz
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// The batch lookup of the backfill answers exactly what one point
+    /// query per hash answers (live, trashed, absent), on a read-only
+    /// connection opened beside the writer;
+    /// rows the writer commits later are seen by the next call.
+    #[test]
+    fn live_among_matches_point_lookups() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inventory.db");
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE shards (hash TEXT PRIMARY KEY, stored_at INTEGER NOT NULL,
+                 trashed_at INTEGER);",
+            )
+            .unwrap();
+        let hash_of = |i: u32| *blake3::hash(&i.to_le_bytes()).as_bytes();
+        let n = 3_000u32;
+        // i % 3 == 0: live, 1: trashed, 2: absent.
+        for i in (0..n).filter(|i| i % 3 != 2) {
+            let trashed = (i % 3 == 1).then_some(5i64);
+            writer
+                .execute(
+                    "INSERT INTO shards (hash, stored_at, trashed_at) VALUES (?1, 1, ?2)",
+                    rusqlite::params![hex::encode(hash_of(i)), trashed],
+                )
+                .unwrap();
+        }
+        let mut hashes: Vec<[u8; 32]> = (0..n).map(hash_of).collect();
+        hashes.sort_unstable();
+        let point = |conn: &rusqlite::Connection, h: &[u8; 32]| -> bool {
+            conn.query_row(
+                "SELECT stored_at FROM shards WHERE hash = ?1 AND trashed_at IS NULL",
+                rusqlite::params![hex::encode(h)],
+                |r| r.get::<_, i64>(0),
+            )
+            .is_ok()
+        };
+        let reader = open_reader(&path).unwrap();
+        let batch = live_among_on(&reader, &hashes).unwrap();
+        let expected: Vec<bool> = hashes.iter().map(|h| point(&writer, h)).collect();
+        assert_eq!(batch, expected);
+        assert_eq!(
+            batch.iter().filter(|b| **b).count(),
+            (0..n).filter(|i| i % 3 == 0).count()
+        );
+        assert!(live_among_on(&reader, &[]).unwrap().is_empty());
+
+        // A later commit is seen by the next batch on the same reader.
+        let absent = hash_of(2);
+        assert!(!live_among_on(&reader, &[absent]).unwrap()[0]);
+        writer
+            .execute(
+                "INSERT INTO shards (hash, stored_at) VALUES (?1, 2)",
+                rusqlite::params![hex::encode(absent)],
+            )
+            .unwrap();
+        assert!(live_among_on(&reader, &[absent]).unwrap()[0]);
+        // The reader cannot write.
+        assert!(
+            reader
+                .execute("DELETE FROM shards", [])
+                .is_err_and(|e| e.to_string().contains("readonly"))
+        );
+    }
 
     /// The trash queries read the partial index, never the whole table
     /// (a scan and a sort of every live row per batch before).

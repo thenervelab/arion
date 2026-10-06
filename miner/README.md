@@ -135,10 +135,16 @@ touch /var/lib/hippius/miner/data/miner/.no-auto-update
 | `MINER_FETCH_CONCURRENCY` | 256 | Concurrent fetch operations |
 | `PACKED_INFLIGHT_MAX_BYTES` | RAM/8, 256 MiB..4 GiB | In-flight write budget of the packed store (see "Resource limits") |
 | `MINER_MAX_CONCURRENT_HANDLERS` | budget/3 MiB, 256..8192 | Cap on concurrent inbound P2P stream handlers (see "Resource limits") |
+| `MINER_QUIC_MAX_INCOMING` | 1024 | Inbound QUIC connection attempts queued before the miner handles them; beyond it new attempts get an immediate CONNECTION_REFUSED (>= 1) |
+| `MINER_QUIC_STALE_INCOMING_SECS` | 5 | An attempt that waited this long before being handled is refused (CONNECTION_REFUSED) instead of being dropped silently at the 30 s QUIC idle timeout (1..29); invalid values stop the miner at startup |
 | `PG_LISTS_BASE_URL` | `https://s3.hippius.com/pg-inventory` | Root URL of the obligation lists (`current.json`, `gen/<g>/...`); set it empty to leave purge and backfill without a source (off) |
-| `PURGE_ENABLED` | true | Obligation-list purge loop (see "Operator guide"); a census only while `PURGE_DRY_RUN` stays true |
-| `PURGE_DRY_RUN` | true | When the purge is enabled: count and log, delete nothing |
+| `PURGE_ENABLED` | true | Obligation-list purge loop (see "Operator guide"); deletes (two-phase trash) unless `PURGE_DRY_RUN=true` |
+| `PURGE_DRY_RUN` | false | `true`: census only, count and log, delete nothing. Default `false` since 0.1.36 (was `true`) |
 | `BACKFILL_ENABLED` | false | Obligation-list backfill loop (see "Operator guide") |
+| `BACKFILL_LOCAL_SOURCE_DIRS` | - | Comma-separated absolute paths of flat store roots set aside on this node; the backfill reads each missing shard there (direct path, never a directory listing) before asking peers (see "Importing a set-aside flat store") |
+| `BACKFILL_LOCAL_SOURCE_DELETE` | false | Move instead of copy: unlink each set-aside file once its blob is durably in the live store, reads back verified and has its inventory row (or was already held with one); honoured only on a pure packed store (`STORE_BACKEND=packed`, no flat data left to migrate; strict boolean, a typo fails startup) |
+| `BACKFILL_LOCAL_CONCURRENCY` | 64 | Local lookups in flight (1..256); disk-bound, not charged to `BACKFILL_MAX_BYTES_PER_SEC` |
+| `BACKFILL_DISCOVERY_CONCURRENCY` | 8 | PG lists fetched, verified and looked up in the inventory at once during backfill discovery (1..64); results are still consumed in PG order |
 | `EPOCH_ARCHIVE_KEEP` | 2000 | Most recent cluster-map epochs kept in `data_dir/epoch_archive/`; older ones are deleted (placement reads of an older epoch ask the validator) |
 
 ## Operator guide: obligation lists (0.1.34)
@@ -169,6 +175,14 @@ reclaim; nothing is deleted until the operator sets `PURGE_DRY_RUN=false`.
 The census downloads this miner's holder sets and the live filter (a few GB
 per generation, cached under `data_dir/pg-lists-cache/`). `PURGE_ENABLED=false`
 turns it off.
+
+**From 0.1.36 the purge deletes by default**: `PURGE_DRY_RUN` defaults to
+`false`. Every gate below still applies (14-day minimum age, 6 h per-PG
+ownership window, complete coverage, generation and view freshness), and a
+deleted blob goes to the local trash, restorable for `TRASH_TTL_SECS` (14
+days) before it is gone. To keep the census only, set `PURGE_DRY_RUN=true`;
+to turn the loop off, `PURGE_ENABLED=false`. Either takes effect at the next
+restart.
 
 ### Before the purge deletes anything
 
@@ -296,13 +310,13 @@ files/s, first batch 5 minutes after start).
 
 ### Rollout order
 
-1. **Dry run first.** The defaults are the dry run (census on the public
-   bucket); leave `PURGE_DRY_RUN` unset. Watch for `purge: owned PGs`, `purge:
+1. **Dry run first.** Since 0.1.36 the default deletes: set
+   `PURGE_DRY_RUN=true` for the census on the public bucket. Watch for `purge: owned PGs`, `purge:
    pass finished` and `purge[census]: would delete` lines. Compare the
    `would_purge` count and bytes with what you expect to be reclaimable
    (`miner_purge_coverage_complete` must be 1; a 0 means the generation does
    not cover every protected PG and nothing would be deleted anyway).
-2. **Enable by waves.** Set `PURGE_DRY_RUN=false` on a few nodes, wait a
+2. **Enable by waves.** Remove `PURGE_DRY_RUN=true` (or set it to `false`) on a few nodes, wait a
    full pass interval (`PURGE_PASS_INTERVAL_SECS`, 1 h) plus the trash TTL
    margin you are comfortable with, check `purged`/`purged_bytes` match the
    census, then widen. Deletions are paced (`PURGE_RATE_PER_SEC` 50/s,
@@ -312,8 +326,51 @@ files/s, first batch 5 minutes after start).
    `BACKFILL_ENABLED=true`. It pauses while a purge pass runs and while the
    blob filesystem has less than `BACKFILL_MIN_FREE_BYTES` (50 GiB) free;
    fetches are bounded by `BACKFILL_MAX_BYTES_PER_SEC` (20 MiB/s).
-4. **Rollback** at any step: unset the switch (or set it to `false`) and
-   restart. Nothing already trashed is lost before `TRASH_TTL_SECS` elapses.
+4. **Rollback** at any step: set `PURGE_DRY_RUN=true` (back to the census),
+   `PURGE_ENABLED=false` or `BACKFILL_ENABLED=false`, and restart. Nothing already trashed is lost before `TRASH_TTL_SECS` elapses.
+
+### Importing a set-aside flat store
+
+An operator who resets a node to the packed store (`STORE_BACKEND=packed`
+on an empty storage directory) after renaming its old flat store directory
+aside on the same disks can import the shards the node still holds from
+there instead of fetching them from peers (a shard usually has no other
+holder with the same bytes, so a peer-only backfill finds almost nothing):
+
+```bash
+BACKFILL_ENABLED=true
+BACKFILL_LOCAL_SOURCE_DIRS=/srv/miner/storage.flat-old-1   # the renamed --storage-path
+```
+
+Each candidate of a pass is looked up in every listed root by direct path
+(`ab/cd/<hash>.bin`, then `<hash>.bin`), read up to its listed length,
+verified (blake3, then length) and stored like a peer fetch. By default
+the roots are only read; nothing is created or removed in them, so the
+directory can be deleted by hand once `miner_backfill_local_total{outcome="hit"}`
+stops growing. The `backfill: pass finished` line reports `local_hit`,
+`local_miss` and `local_bad`; misses and bad copies go to the peers.
+
+A copy doubles the disk usage until the old directory is deleted. With
+`BACKFILL_LOCAL_SOURCE_DELETE=true` the import moves instead: once a blob is
+stored in the packed store (which syncs a write before acknowledging it), its
+inventory row is written and the live copy reads back and verifies, the exact
+file it was read from (`ab/cd/<hash>.bin` or `<hash>.bin`) is unlinked; a file
+whose blob the live store already holds (verified the same way) is unlinked
+as a duplicate when its inventory row is live too. Copies that fail
+verification, store or inventory errors and anything uncertain keep the file;
+directories are never removed (empty ones stay), nothing outside the listed
+roots is touched (a symlinked shard directory or a file replaced since it was
+read is refused), and a root that overlaps the live storage directory is never
+deleted from. The flag is ignored, with a warning, on the flat backend (no
+sync before the acknowledgement) and while a flat-to-packed migration is
+running (answers may come from unsynced flat files). The pass
+line adds `local_deleted` and `local_delete_errors`
+(`miner_backfill_local_source_deleted_total`,
+`miner_backfill_local_source_delete_errors_total`).
+Imports start as soon as the first lists are scanned (discovery and fetch
+overlap); the `backfill: discovery progress` / `discovery finished` lines
+give the discovery rate (`pgs_per_sec`, `records_per_sec`), also exported as
+`miner_backfill_discovery_pgs_total` and `miner_backfill_discovery_records_total`.
 
 The full knob list (`PURGE_*`, `BACKFILL_*`, `PG_LISTS_*`) is documented
 where it is parsed: `purge::PurgeConfig::from_env` (`src/purge.rs`) and
@@ -330,8 +387,7 @@ unlinks only filter misses older than `PURGE_MIN_AGE_SECS` until a free-space
 target is reached, then exits so systemd restarts the normal miner.
 
 **Rescue mode is not part of 0.1.34.** It was removed before 0.1.33 because
-it deleted without the index and defaulted `PURGE_DRY_RUN` to `false`, and
-it has not been re-admitted; `PURGE_RESCUE` is not read by this binary. A
+it deleted without the inventory index, and it has not been re-admitted; `PURGE_RESCUE` is not read by this binary. A
 miner that cannot open its inventory index exits non-zero, as 0.1.32 did.
 Free space by hand on such a node (start with the trash directory under the
 blob store, whose contents are already deleted blobs).

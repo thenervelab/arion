@@ -209,6 +209,20 @@ impl BlobStore for MigratingStore {
     async fn migrate_legacy_layout(&self, _batch: usize, _pause: Duration) -> u64 {
         0
     }
+
+    fn persist_on_clean_shutdown(&self) -> std::io::Result<()> {
+        self.packed.persist_on_clean_shutdown()
+    }
+
+    /// Stores go to the packed side, but `has`/`read` may still answer
+    /// from flat files written without a sync, and the mover (which takes
+    /// no per-hash lock) restores a trashed flat blob, packs it and trashes
+    /// it again: a caller deleting its own copy on the strength of this
+    /// store's answer could be left with a trashed or unsynced one. Not
+    /// durable until the flat side is gone (then the node opens as packed).
+    fn store_is_durable(&self) -> bool {
+        false
+    }
 }
 
 /// Counters published by the mover (for logs). `skipped` counts skip
@@ -578,33 +592,98 @@ pub async fn run_migration(
     moved_total
 }
 
-/// First `*.bin` found in `dir`, lazily — stops at the first hit.
-fn has_any_bin(dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
+/// A store root whose own directory size is above this is never listed at
+/// startup. `st_size` of a directory is the bytes of its directory blocks
+/// on ext4/xfs (which never shrink) and its entry count on ZFS, so 64 KiB
+/// bounds a listing to roughly a thousand entries on ext4 and 64 k on ZFS.
+/// One `stat`, no enumeration.
+const SMALL_ROOT_DIR_BYTES: u64 = 64 << 10;
+
+/// Entries of a small root read at most before it is assumed to hold
+/// flat blobs: a guard for a filesystem whose directory `st_size` says
+/// nothing about its size (some FUSE filesystems report a constant).
+const SMALL_ROOT_MAX_ENTRIES: usize = 4096;
+
+/// Whether `dir` may hold a legacy `*.bin`: the first one found, an entry
+/// that cannot be read (as if it were one), more than
+/// `SMALL_ROOT_MAX_ENTRIES` entries, or a directory that cannot be listed
+/// all answer yes; only a short listing without any `.bin` answers no.
+/// Only called on a directory whose `st_size` says it is small (see
+/// [`flat_data_present`]).
+fn may_hold_bin(dir: &Path) -> bool {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), error = %e, "migration: store root unreadable, assuming legacy flat blobs");
+            return true;
+        }
     };
-    entries.flatten().any(|e| {
-        e.file_name().to_string_lossy().ends_with(".bin")
-            && e.file_type().map(|t| t.is_file()).unwrap_or(false)
-    })
+    for (n, entry) in entries.enumerate() {
+        if n >= SMALL_ROOT_MAX_ENTRIES {
+            return true;
+        }
+        let Ok(e) = entry else {
+            return true;
+        };
+        if e.file_name().to_string_lossy().ends_with(".bin")
+            && e.file_type().map(|t| t.is_file()).unwrap_or(true)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether some `ab/` directory of `base` holds some `ab/cd/` directory:
+/// name probes only (`stat`), stopping at the first hit.
+fn has_sharded_tree(base: &Path) -> bool {
+    probe_hex_subdirs(base)
+        .iter()
+        .any(|l1| (0u16..=255).any(|i| l1.join(format!("{i:02x}")).is_dir()))
 }
 
 /// Whether a data dir still holds flat-layout blobs (live or trashed) that
-/// need migrating. Bounded probe: shard dirs are found by name probing
-/// (never by listing the roots), and each directory scan stops at the
-/// first `.bin`.
+/// need migrating. Startup path: NEVER enumerates a directory that may
+/// hold millions of entries. Measured on a test bench: the former first
+/// step, a `read_dir` of the store root to look for a `.bin`, held the
+/// startup for more than 50 minutes in `getdents64` through a FUSE union
+/// mount (which reads the whole directory of every branch before
+/// returning the first entry).
+///
+/// Per root (live, then trash):
+/// - the sharded tree is detected by name probes: some `ab/cd/` directory
+///   exists (at most 256 + 256 `stat`s per `ab/` found, first hit wins).
+///   An `ab/cd/` left empty is still reported (the mover sweeps it at the
+///   end of its pass, and the next start sees nothing);
+/// - legacy flat blobs (`<hash>.bin` in the root itself) cannot be found by
+///   name: the root is listed only when its own `st_size` is at most
+///   `SMALL_ROOT_DIR_BYTES`, and then at most `SMALL_ROOT_MAX_ENTRIES`
+///   entries of it; a larger root, a longer listing or a listing error is
+///   reported as holding flat data (the hybrid store and the mover, which
+///   streams the root in the background, are always correct; only a
+///   missed flat blob would not be).
 pub fn flat_data_present(data_dir: &Path) -> bool {
     let trash = data_dir.join("trash");
     for base in [data_dir, trash.as_path()] {
-        if has_any_bin(base) {
+        if has_sharded_tree(base) {
             return true;
         }
-        for l1 in probe_hex_subdirs(base) {
-            for l2 in probe_hex_subdirs(&l1) {
-                if has_any_bin(&l2) {
-                    return true;
-                }
-            }
+        let Ok(meta) = std::fs::metadata(base) else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        if meta.len() > SMALL_ROOT_DIR_BYTES {
+            tracing::info!(
+                root = %base.display(),
+                dir_size = meta.len(),
+                "migration: store root too large to list at startup, assuming legacy flat blobs"
+            );
+            return true;
+        }
+        if may_hold_bin(base) {
+            return true;
         }
     }
     false
@@ -1073,5 +1152,62 @@ mod tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(moved, 1);
         assert!(packed.has(&h(&leaf_blob)));
+    }
+
+    /// The startup probe: an empty root, a packed-only root, a sharded
+    /// tree (live or trash), a legacy blob in a small root, and a root too
+    /// large to list (reported present, never listed).
+    #[test]
+    fn flat_data_present_probes_without_listing_large_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(!flat_data_present(root), "empty root");
+        std::fs::create_dir_all(root.join("packed/volumes")).unwrap();
+        std::fs::create_dir_all(root.join("trash")).unwrap();
+        std::fs::create_dir_all(root.join(".tmp")).unwrap();
+        assert!(!flat_data_present(root), "packed-only root, empty trash");
+
+        std::fs::create_dir_all(root.join("ab")).unwrap();
+        assert!(
+            !flat_data_present(root),
+            "an ab/ without any ab/cd/ is not a tree"
+        );
+        std::fs::create_dir_all(root.join("ab/cd")).unwrap();
+        assert!(flat_data_present(root), "sharded tree found by name probes");
+        std::fs::remove_dir(root.join("ab/cd")).unwrap();
+        std::fs::remove_dir(root.join("ab")).unwrap();
+
+        std::fs::create_dir_all(root.join("trash/01/02")).unwrap();
+        assert!(flat_data_present(root), "sharded trash tree");
+        std::fs::remove_dir(root.join("trash/01/02")).unwrap();
+        std::fs::remove_dir(root.join("trash/01")).unwrap();
+
+        std::fs::write(root.join(format!("{}.bin", "e".repeat(64))), b"x").unwrap();
+        assert!(flat_data_present(root), "legacy blob in a small root");
+        std::fs::remove_file(root.join(format!("{}.bin", "e".repeat(64)))).unwrap();
+        assert!(!flat_data_present(root));
+
+        // A root whose directory size says it may be huge is not listed;
+        // where the size says nothing (tmpfs), the listing stops at the
+        // entry cap. Either way it is assumed to hold flat blobs.
+        let big = tempfile::tempdir().unwrap();
+        for i in 0..SMALL_ROOT_MAX_ENTRIES + 10 {
+            std::fs::write(
+                big.path()
+                    .join(format!("not-a-blob-{i:05}-padding-padding")),
+                b"",
+            )
+            .unwrap();
+        }
+        assert!(
+            flat_data_present(big.path()),
+            "large root assumed to hold flat blobs"
+        );
+        // A short root without any blob is not.
+        let short = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            std::fs::write(short.path().join(format!("other-{i}")), b"").unwrap();
+        }
+        assert!(!flat_data_present(short.path()));
     }
 }

@@ -26,7 +26,7 @@ mod version_check;
 
 // Standalone modules live in the `miner` library (see `src/lib.rs`); the
 // binary's own modules reach them through these crate-root bindings.
-use miner::{constants, flat_store, helpers, limits, storage_proof, store};
+use miner::{constants, flat_store, helpers, limits, quic_accept, storage_proof, store};
 
 use anyhow::Result;
 use clap::Parser;
@@ -508,10 +508,29 @@ async fn run_miner(cli: Cli) -> Result<()> {
     transport_config.stream_receive_window((2 * 1024 * 1024_u32).into());
     transport_config.receive_window((64 * 1024 * 1024_u32).into());
     transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
+    // Inbound admission bounds (see `quic_accept`): an invalid knob is fatal.
+    let accept_cfg = quic_accept::AcceptConfig::from_env().map_err(|e| {
+        error!(error = %e, "startup: refusing to run with an invalid QUIC accept knob");
+        e
+    })?;
+    transport_config.max_idle_timeout(Some(quinn::IdleTimeout::try_from(accept_cfg.idle_timeout)?));
     let transport_config = Arc::new(transport_config);
 
-    let endpoint =
-        common::transport::create_endpoint(bind_addr, &signing_key, Some(transport_config)).await?;
+    let endpoint = common::transport::create_endpoint_with(
+        bind_addr,
+        &signing_key,
+        Some(transport_config),
+        |server| {
+            server.max_incoming(accept_cfg.max_incoming);
+        },
+    )
+    .await?;
+    info!(
+        idle_timeout_secs = accept_cfg.idle_timeout.as_secs(),
+        max_incoming = accept_cfg.max_incoming,
+        stale_incoming_secs = accept_cfg.stale_after.as_secs(),
+        "QUIC accept bounds"
+    );
 
     info!(node_id = %truncate_for_log(&node_id, 16), bind = %bind_addr, "Quinn endpoint bound");
 
@@ -571,9 +590,11 @@ async fn run_miner(cli: Cli) -> Result<()> {
         .unwrap_or_else(|| config.storage.backend.clone());
     let store: Arc<dyn BlobStore> = match backend.as_str() {
         "packed" => {
-            let packed = packed_store::PackedStore::open(blobs_dir.join("packed"))
-                .map_err(|e| anyhow::anyhow!("Failed to open packed blob store: {}", e))?;
-            if migrating_store::flat_data_present(&blobs_dir) {
+            // Volume scan and directory probes: off the runtime workers.
+            let packed =
+                helpers::blocking(|| packed_store::PackedStore::open(blobs_dir.join("packed")))
+                    .map_err(|e| anyhow::anyhow!("Failed to open packed blob store: {}", e))?;
+            if helpers::blocking(|| migrating_store::flat_data_present(&blobs_dir)) {
                 // Existing per-file blobs: serve through the hybrid (packed
                 // first, flat fallback) and drain the flat layout in the
                 // background. Resumable across restarts — the cursor is the
@@ -818,20 +839,40 @@ async fn run_miner(cli: Cli) -> Result<()> {
                         info!("Accept loop: endpoint closed");
                         break;
                     };
+                    // Never block the loop: the decision, the handshake and
+                    // the handler all run in the per-attempt task.
+                    let dequeued_at = std::time::Instant::now();
                     let handler = accept_handler.clone();
-                    let permit = match conn_semaphore.clone().try_acquire_owned() {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            warn!(
-                                "Connection limit reached ({}), dropping incoming connection",
-                                crate::constants::INBOUND_CONNECTION_LIMIT
-                            );
-                            drop(incoming);
-                            continue;
-                        }
-                    };
+                    let conn_semaphore = conn_semaphore.clone();
                     tokio::spawn(async move {
-                        let _permit = permit; // held until task completes
+                        let permit = conn_semaphore.try_acquire_owned().ok();
+                        let waited = dequeued_at.elapsed();
+                        let decision = quic_accept::decide(
+                            waited,
+                            accept_cfg.stale_after,
+                            permit.is_some(),
+                        );
+                        if quic_accept::record(decision) {
+                            let (accepted, refused_stale, refused_full) = quic_accept::totals();
+                            warn!(
+                                ?decision,
+                                waited_ms = waited.as_millis() as u64,
+                                remote = %incoming.remote_address(),
+                                connection_limit = crate::constants::INBOUND_CONNECTION_LIMIT,
+                                accepted,
+                                refused_stale,
+                                refused_full,
+                                "QUIC accept: refusing inbound connection attempt (rate-limited log)"
+                            );
+                        }
+                        let Some(_permit) = permit.filter(|_| {
+                            decision == quic_accept::AcceptDecision::Accept
+                        }) else {
+                            // Explicit CONNECTION_REFUSED: the client fails
+                            // fast instead of timing out on silence.
+                            incoming.refuse();
+                            return;
+                        };
                         match incoming.await {
                             Ok(conn) => {
                                 let alpn = conn.handshake_data()
@@ -1027,6 +1068,19 @@ async fn run_miner(cli: Cli) -> Result<()> {
     // start skips the O(blobs) filesystem count (waits for in-flight blob
     // writes, refuses on any doubt; see `inventory::rebuild_from_fs`).
     inventory::seal_on_clean_shutdown(&blobs_dir, inventory::CLEAN_STOP_DRAIN_TIMEOUT).await;
+
+    // 5. Persist the store's open-time cache (packed: the index snapshot,
+    // so the next open scans only what is appended after it instead of
+    // every volume since the last periodic snapshot). A cache: a failure
+    // only costs a longer next start.
+    let snapshot_store = Arc::clone(&store);
+    match tokio::task::spawn_blocking(move || snapshot_store.persist_on_clean_shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!(error = %e, "storage: shutdown snapshot failed (the next open rescans)")
+        }
+        Err(e) => warn!(error = %e, "storage: shutdown snapshot task panicked"),
+    }
     info!("Shutdown complete");
 
     Ok(())

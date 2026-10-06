@@ -105,6 +105,17 @@ pub async fn create_endpoint(
     secret_key: &ed25519_dalek::SigningKey,
     transport_config: Option<Arc<quinn::TransportConfig>>,
 ) -> Result<quinn::Endpoint> {
+    create_endpoint_with(bind_addr, secret_key, transport_config, |_| {}).await
+}
+
+/// [`create_endpoint`] with a hook to tune the server config (e.g.
+/// `max_incoming`) before the endpoint is bound.
+pub async fn create_endpoint_with(
+    bind_addr: SocketAddr,
+    secret_key: &ed25519_dalek::SigningKey,
+    transport_config: Option<Arc<quinn::TransportConfig>>,
+    tune_server: impl FnOnce(&mut quinn::ServerConfig),
+) -> Result<quinn::Endpoint> {
     let (mut server_config, mut client_config) = generate_tls_config(secret_key)?;
     let alpns = vec![
         crate::VALIDATOR_CONTROL_ALPN.to_vec(),
@@ -125,6 +136,7 @@ pub async fn create_endpoint(
     if let Some(ref config) = transport_config {
         server_config.transport_config(config.clone());
     }
+    tune_server(&mut server_config);
     let mut endpoint =
         quinn::Endpoint::server(server_config, bind_addr).context("bind quinn endpoint")?;
 

@@ -143,6 +143,26 @@ impl FlatBlobStore {
         })
     }
 
+    /// Open an existing root for reads only: nothing is created in it (no
+    /// trash, no tmp directory). For a set-aside store read as a backfill
+    /// source; writing through such a handle is not supported. One `stat`.
+    pub fn open_read_only(data_dir: impl AsRef<Path>) -> std::io::Result<Self> {
+        let data_dir = data_dir.as_ref().to_path_buf();
+        if !std::fs::metadata(&data_dir)?.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                format!("{} is not a directory", data_dir.display()),
+            ));
+        }
+        Ok(Self {
+            trash_dir: data_dir.join(TRASH_DIR),
+            tmp_dir: data_dir.join(TMP_DIR),
+            data_dir,
+            used_bytes: AtomicU64::new(0),
+            trash_bytes: AtomicU64::new(0),
+        })
+    }
+
     /// Walk both spaces and set the usage counters. EXPENSIVE and blocking —
     /// run from `spawn_blocking` once the miner is registered and serving.
     pub fn recompute_usage(&self) {
@@ -330,7 +350,9 @@ impl FlatBlobStore {
     /// reputation penalty that never decays. A blob that moved mid-check is by
     /// then definitively sharded, so one retry closes the race completely.
     pub async fn read(&self, hash_hex: &str) -> std::io::Result<Bytes> {
-        self.read_either_layout(hash_hex, tokio::fs::read).await
+        self.read_either_layout(hash_hex, tokio::fs::read)
+            .await
+            .map(|(data, _)| Bytes::from(data))
     }
 
     /// Read blob data only if the file is at most `max_len` bytes long
@@ -341,24 +363,54 @@ impl FlatBlobStore {
     pub async fn read_at_most(&self, hash_hex: &str, max_len: u64) -> std::io::Result<Bytes> {
         self.read_either_layout(hash_hex, |path| read_file_at_most(path, max_len))
             .await
+            .map(|(data, _)| Bytes::from(data))
+    }
+
+    /// [`read_at_most`](Self::read_at_most), with the path the bytes were
+    /// read from (sharded or legacy root) and the identity of the file
+    /// that was open (device, inode). The backfill's local source unlinks
+    /// exactly that file, and only if the path still names it, once the
+    /// copy is in the live store.
+    pub async fn read_at_most_located(
+        &self,
+        hash_hex: &str,
+        max_len: u64,
+    ) -> std::io::Result<(Bytes, PathBuf, FileId)> {
+        self.read_either_layout(hash_hex, |path| read_file_at_most_identified(path, max_len))
+            .await
+            .map(|((data, id), path)| (Bytes::from(data), path, id))
+    }
+
+    /// Whether `path` is one of the two paths this root stores `hash_hex`
+    /// at (sharded `ab/cd/<hash>.bin` or legacy `<hash>.bin`). Pure path
+    /// comparison, no filesystem access.
+    pub fn is_blob_path(&self, hash_hex: &str, path: &Path) -> bool {
+        path == self.blob_path(hash_hex) || path == self.blob_path_flat(hash_hex)
     }
 
     /// Sharded path first, legacy flat fallback, sharded retry (the lookup
     /// race documented on [`read`](Self::read)); `read` does the file I/O.
-    async fn read_either_layout<F, Fut>(&self, hash_hex: &str, read: F) -> std::io::Result<Bytes>
+    /// Returns what `read` returned and the path it was read from.
+    async fn read_either_layout<T, F, Fut>(
+        &self,
+        hash_hex: &str,
+        read: F,
+    ) -> std::io::Result<(T, PathBuf)>
     where
         F: Fn(PathBuf) -> Fut,
-        Fut: std::future::Future<Output = std::io::Result<Vec<u8>>>,
+        Fut: std::future::Future<Output = std::io::Result<T>>,
     {
-        match read(self.blob_path(hash_hex)).await {
-            Ok(data) => Ok(Bytes::from(data)),
+        let sharded = self.blob_path(hash_hex);
+        match read(sharded.clone()).await {
+            Ok(data) => Ok((data, sharded)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                match read(self.blob_path_flat(hash_hex)).await {
-                    Ok(data) => Ok(Bytes::from(data)),
+                let flat = self.blob_path_flat(hash_hex);
+                match read(flat.clone()).await {
+                    Ok(data) => Ok((data, flat)),
                     Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => {
                         // Migrated out from under us between the two lookups.
-                        let data = read(self.blob_path(hash_hex)).await?;
-                        Ok(Bytes::from(data))
+                        let data = read(sharded.clone()).await?;
+                        Ok((data, sharded))
                     }
                     Err(e2) => Err(e2),
                 }
@@ -701,6 +753,34 @@ impl BinPager {
 /// that grows under the read is detected by a one-byte probe into a stack
 /// buffer, never by growing the vector.
 async fn read_file_at_most(path: PathBuf, max_len: u64) -> std::io::Result<Vec<u8>> {
+    read_file_at_most_identified(path, max_len)
+        .await
+        .map(|(data, _)| data)
+}
+
+/// Identity of a file on its filesystem (`st_dev`, `st_ino`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileId {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl FileId {
+    pub fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }
+    }
+}
+
+/// [`read_file_at_most`], with the identity of the file it read (taken
+/// from the open descriptor, so it is the file whose bytes were returned).
+async fn read_file_at_most_identified(
+    path: PathBuf,
+    max_len: u64,
+) -> std::io::Result<(Vec<u8>, FileId)> {
     use tokio::io::AsyncReadExt as _;
 
     let too_large = || {
@@ -710,7 +790,9 @@ async fn read_file_at_most(path: PathBuf, max_len: u64) -> std::io::Result<Vec<u
         )
     };
     let mut file = tokio::fs::File::open(path).await?;
-    let len = file.metadata().await?.len();
+    let meta = file.metadata().await?;
+    let id = FileId::of(&meta);
+    let len = meta.len();
     if len > max_len {
         return Err(too_large());
     }
@@ -720,7 +802,7 @@ async fn read_file_at_most(path: PathBuf, max_len: u64) -> std::io::Result<Vec<u
     if file.read(&mut probe).await? != 0 {
         return Err(too_large());
     }
-    Ok(data)
+    Ok((data, id))
 }
 
 /// [`BlobStore`](crate::store::BlobStore) implementation: pure delegation to

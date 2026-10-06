@@ -2,6 +2,73 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.36] - 2026-10-06
+
+### Miner
+
+The obligation-list purge deletes by default.
+
+- **Purge deletes by default.** `PURGE_DRY_RUN` now defaults to `false`
+  (was `true`): a default miner trashes the blobs no obligation list of its
+  PGs names. Every gate is unchanged: 14-day minimum blob age
+  (`PURGE_MIN_AGE_SECS`), 6 h per-PG ownership window
+  (`PURGE_OWNERSHIP_STABLE_SECS`), complete coverage of the protected PGs,
+  generation and view freshness (`PURGE_GENERATION_MAX_AGE_SECS`,
+  `PURGE_VIEW_MAX_LAG_SECS`), epoch checks, paced deletes. Deletes are
+  two-phase: a blob goes to the local trash and stays restorable
+  (`RestoreBlob`) for `TRASH_TTL_SECS` (14 days). To keep the census only,
+  set `PURGE_DRY_RUN=true`; to turn the loop off, `PURGE_ENABLED=false`.
+  A `--no-default-features` build still only counts.
+- **Explicit QUIC refusal under accept backlog.** An inbound connection
+  attempt the miner cannot handle in time is now answered with
+  CONNECTION_REFUSED instead of being dropped silently at the 30 s QUIC idle
+  timeout, which made clients retry into a self-sustaining backlog.
+  `MINER_QUIC_MAX_INCOMING` (1024) bounds the queued attempts,
+  `MINER_QUIC_STALE_INCOMING_SECS` (5, 1..29) refuses an attempt that waited
+  longer; invalid values stop the miner at startup. Counter
+  `miner_quic_incoming_total{outcome=accepted|refused_stale|refused_full}`.
+- **Packed store durability and fast restarts.** The first acknowledgement
+  of every new volume also waits for an fsync of the volume directory and
+  the store root, so an acknowledged write survives a crash. A clean stop
+  writes the index snapshot after the inventory seal; the next start scans
+  only what was appended after it instead of every volume. The open-time
+  scan reads sequentially through a large buffer, and an I/O error now
+  fails the open instead of truncating the volume.
+- **Probe-based startup.** Detecting leftover flat data no longer lists the
+  store root: the sharded tree is found by name probes, and the root is
+  listed only when it is small. Startup no longer stalls for a long time on
+  a huge directory.
+- **Backfill from a local source.** `BACKFILL_LOCAL_SOURCE_DIRS`
+  (comma-separated absolute paths) names flat store roots set aside on this
+  node; each missing shard is looked up there by direct path, verified and
+  stored before peers are asked (`BACKFILL_LOCAL_CONCURRENCY`, 64, not
+  charged to the network byte budget). With
+  `BACKFILL_LOCAL_SOURCE_DELETE=true` (packed store only) the import moves
+  instead of copying: a source file is unlinked only once its blob is
+  durably stored, has its inventory row and reads back verified.
+  Counters `miner_backfill_local_total{outcome}`,
+  `miner_backfill_local_source_deleted_total`.
+- **Faster backfill discovery.** PG lists are fetched, verified and looked
+  up in the inventory concurrently (`BACKFILL_DISCOVERY_CONCURRENCY`, 8,
+  1..64) and fetching starts while discovery runs. An epoch move during
+  discovery no longer discards the candidates already collected, and the
+  cursor resumes by PG id.
+
+#### Migrating a node to the packed store
+
+1. Stop the miner and rename the old flat storage directory aside on the
+   same disks (for example `storage` to `storage.flat-old`).
+2. Start with `STORE_BACKEND=packed` on a new, empty storage directory.
+3. Import what the node still holds: `BACKFILL_ENABLED=true` and
+   `BACKFILL_LOCAL_SOURCE_DIRS=<the renamed directory>`; add
+   `BACKFILL_LOCAL_SOURCE_DELETE=true` to move instead of copy if the disk
+   cannot hold both copies.
+4. Once `miner_backfill_local_total{outcome="hit"}` stops growing, delete
+   the old directory. Never list or walk it recursively while the miner
+   runs; the import reads it by direct path only.
+
+See `miner/README.md`, "Importing a set-aside flat store".
+
 ## [0.1.35] - 2026-10-02
 
 ### Miner

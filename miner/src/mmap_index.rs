@@ -298,6 +298,32 @@ impl MmapLiveIndex {
         }
     }
 
+    /// The location a removed `key` had, from its tombstone: the newest
+    /// (highest volume, then offset) of the tombstones carrying the key on
+    /// its probe chain, since volumes are append-only and a key's latest
+    /// record is always its last live location. `None` when the key is live
+    /// or no tombstone of it survives (a grow drops tombstones, an insert
+    /// may reuse one). Journal replay uses it for a delete the table
+    /// already reflects (written back after the snapshot it replays from).
+    pub fn tombstoned(&self, key: u128) -> Option<Loc> {
+        let mask = self.slots - 1;
+        let mut i = (key as u64) & mask;
+        let mut newest: Option<Loc> = None;
+        loop {
+            match self.read_slot(i) {
+                (FLAG_EMPTY, _) => return newest,
+                (FLAG_LIVE, Some((k, _))) if k == key => return None,
+                (FLAG_TOMB, Some((k, l))) if k == key => {
+                    if newest.is_none_or(|n| (l.vol, l.off) > (n.vol, n.off)) {
+                        newest = Some(l);
+                    }
+                    i = (i + 1) & mask;
+                }
+                _ => i = (i + 1) & mask,
+            }
+        }
+    }
+
     pub fn contains_key(&self, key: u128) -> bool {
         self.get(key).is_some()
     }
