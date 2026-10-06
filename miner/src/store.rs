@@ -147,6 +147,23 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug {
     /// resumable. Returns the number of entries moved; backends without a
     /// legacy layout return 0.
     async fn migrate_legacy_layout(&self, batch: usize, pause: Duration) -> u64;
+
+    /// Persist what lets the next open start without rescanning (the
+    /// packed index snapshot). Called once during a graceful shutdown,
+    /// blocking (run it off the runtime workers). Only a cache: skipping
+    /// it, or a crash before it, costs a longer next open, never data.
+    /// Backends with nothing to persist keep the default.
+    fn persist_on_clean_shutdown(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Whether a successful [`store`](Self::store) means the bytes are on
+    /// stable storage (synced before the call returned), so that a power
+    /// loss right after cannot lose them. The backfill unlinks a set-aside
+    /// source copy only on a store that says so. Default `false`.
+    fn store_is_durable(&self) -> bool {
+        false
+    }
 }
 
 /// Shared handles are stores too: lets call sites hold `Arc<dyn BlobStore>`
@@ -209,5 +226,11 @@ impl<T: BlobStore + ?Sized> BlobStore for std::sync::Arc<T> {
     }
     async fn migrate_legacy_layout(&self, batch: usize, pause: Duration) -> u64 {
         (**self).migrate_legacy_layout(batch, pause).await
+    }
+    fn persist_on_clean_shutdown(&self) -> std::io::Result<()> {
+        (**self).persist_on_clean_shutdown()
+    }
+    fn store_is_durable(&self) -> bool {
+        (**self).store_is_durable()
     }
 }

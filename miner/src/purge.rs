@@ -108,16 +108,20 @@
 //!
 //! ## Kill switches
 //!
-//! `PURGE_ENABLED` defaults to false; when enabled, `PURGE_DRY_RUN`
-//! defaults to true and only logs what would be deleted.
+//! `PURGE_ENABLED` defaults to true. Since 0.1.36 `PURGE_DRY_RUN` defaults
+//! to false: a build with the `purge-enforce` feature deletes (two-phase
+//! trash) once every gate below opens; `PURGE_DRY_RUN=true` keeps the
+//! census, which only logs what would be deleted. `PURGE_ENABLED=false`
+//! turns the loop off.
 //!
 //! ## Mode
 //!
 //! What a pass may do is a type, [`Mode`], not a boolean. A build without
 //! the `purge-enforce` Cargo feature has exactly one variant, `Census`:
 //! the pass counts and logs, the store calls that delete are not
-//! compiled, and `PURGE_DRY_RUN=false` is answered with a warning and the
-//! census. Only a build with the feature carries `Enforce`.
+//! compiled, and an explicit `PURGE_DRY_RUN=false` is answered with a warning
+//! and the census (the unset default is the census, silently). Only a build
+//! with the feature carries `Enforce`.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -192,6 +196,20 @@ impl Mode {
         }
     }
 
+    /// The mode when `PURGE_DRY_RUN` is unset: `Enforce` in a build that
+    /// carries it, else `Census`. Unlike [`Mode::from_dry_run`] it never
+    /// warns: nobody asked for enforcement.
+    pub fn default_for_build() -> Self {
+        #[cfg(feature = "purge-enforce")]
+        {
+            Mode::Enforce
+        }
+        #[cfg(not(feature = "purge-enforce"))]
+        {
+            Mode::Census
+        }
+    }
+
     /// True when the pass only counts.
     pub fn is_census(self) -> bool {
         matches!(self, Mode::Census)
@@ -213,12 +231,14 @@ pub struct PurgeConfig {
     /// `PG_LISTS_BASE_URL`: public bucket root, [`DEFAULT_PG_LISTS_BASE_URL`]
     /// when unset; set but empty, there is no source and the purge stays off.
     pub base_url: Option<String>,
-    /// `PURGE_ENABLED` (default true). With the default `PURGE_DRY_RUN=true`
-    /// this runs the census only: blobs are classified, nothing is deleted.
+    /// `PURGE_ENABLED` (default true). With the default `PURGE_DRY_RUN=false`
+    /// a `purge-enforce` build deletes (two-phase trash) once every gate
+    /// opens; `PURGE_DRY_RUN=true` runs the census only.
     pub enabled: bool,
-    /// `PURGE_DRY_RUN` (default true) as a [`Mode`]: `Census` logs
-    /// candidates and deletes nothing; `Enforce` only exists in a build
-    /// with the `purge-enforce` feature.
+    /// `PURGE_DRY_RUN` (default false since 0.1.36) as a [`Mode`]: `Census`
+    /// logs candidates and deletes nothing; `Enforce` only exists in a
+    /// build with the `purge-enforce` feature, see
+    /// [`Mode::default_for_build`].
     pub mode: Mode,
     /// `PURGE_MIN_AGE_SECS` (default 1 209 600 = 14 days): a blob must
     /// have been stored this long before the earlier of now and the
@@ -281,7 +301,7 @@ impl Default for PurgeConfig {
         Self {
             base_url: Some(DEFAULT_PG_LISTS_BASE_URL.to_string()),
             enabled: true,
-            mode: Mode::Census,
+            mode: Mode::default_for_build(),
             min_age_secs: 14 * 86_400,
             rate_per_sec: 50,
             max_bytes_per_sec: 50 * 1024 * 1024,
@@ -1629,11 +1649,22 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults_are_a_census_on_the_public_bucket() {
+    fn config_defaults_enforce_on_the_public_bucket() {
         let cfg = PurgeConfig::from_lookup(|_| None).unwrap();
         assert_eq!(cfg, PurgeConfig::default());
         assert!(cfg.enabled);
-        assert!(cfg.mode.is_census(), "nothing is deleted by default");
+        assert_eq!(cfg.mode, Mode::default_for_build());
+        assert_eq!(
+            cfg.mode.enforces(),
+            ENFORCEMENT_COMPILED,
+            "unset PURGE_DRY_RUN deletes exactly when the build can"
+        );
+        let census =
+            PurgeConfig::from_lookup(|n| (n == "PURGE_DRY_RUN").then(|| "true".into())).unwrap();
+        assert!(
+            census.mode.is_census(),
+            "PURGE_DRY_RUN=true keeps the census"
+        );
         assert_eq!(cfg.base_url.as_deref(), Some(DEFAULT_PG_LISTS_BASE_URL));
         assert_eq!(
             cfg.min_age_secs,

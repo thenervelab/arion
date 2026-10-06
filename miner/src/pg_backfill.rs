@@ -2,15 +2,23 @@
 //!
 //! Mirror of `pg_purge`. Every `BACKFILL_PASS_INTERVAL_SECS` a pass walks
 //! the owned PGs of the current signed generation from the persisted
-//! cursor, streams one PG list at a time, and collects the listed blobs
-//! whose hash is absent from the SQLite inventory (a point lookup per
-//! record; the filesystem is never scanned). When `BACKFILL_MAX_PENDING`
-//! candidates are collected or the walk reaches the end, the pass fetches
-//! them from up to `BACKFILL_PEERS_PER_BLOB` peers placed on the same PG,
-//! verifies blake3 and the listed length, and stores under the per-hash
-//! write lock. The cursor advances past every fully scanned PG so the
-//! next pass resumes there; a PG cut by the cap is rescanned (its fetched
-//! blobs are then in the inventory and no longer candidates).
+//! cursor and collects the listed blobs this miner holds whose hash is
+//! absent from the SQLite inventory (the filesystem is never scanned).
+//! Up to `BACKFILL_DISCOVERY_CONCURRENCY` lists are fetched, verified,
+//! decoded and looked up at once (one batched lookup per list on a
+//! read-only inventory connection, in the blocking pool), but their
+//! results are consumed in PG order, so the cursor semantics are those of
+//! a sequential walk. Candidates are fetched while discovery goes on: each
+//! is first looked up in the set-aside local flat roots
+//! (`BACKFILL_LOCAL_SOURCE_DIRS`, direct path probes, own concurrency),
+//! then, if unresolved, fetched from up to `BACKFILL_PEERS_PER_BLOB` peers
+//! placed on the same PG; either way blake3 and the listed length are
+//! verified and the blob is stored under the per-hash write lock. A pass
+//! collects at most `BACKFILL_MAX_PENDING` candidates. The cursor advances
+//! past every fully scanned PG so the next pass resumes there; a PG cut by
+//! the cap is rescanned (its fetched blobs are then in the inventory and
+//! no longer candidates). A move of the epoch stops the discovery (the
+//! owned set is stale) but the candidates already collected are fetched.
 //!
 //! Interaction with the purge: none on data (the purge only deletes
 //! unlisted blobs, the backfill only stores listed ones, both from the
@@ -21,12 +29,13 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tracing::{debug, error, info, warn};
 
 use miner::backfill::{
-    BackfillConfig, BackfillMetrics, Candidate, Cursor, FetchError, PauseReason, Peer,
-    holders_for_pg, peers_for_uids, verify_payload,
+    BackfillConfig, BackfillMetrics, Candidate, Cursor, FetchError, LocalCopy, LocalLookup,
+    LocalSources, PauseReason, Peer, RemoveOutcome, SourceMode, holders_for_pg, peers_for_uids,
+    verify_payload,
 };
 use miner::pg_lists::{self, ListExpectation, ListSource, MAX_LIST_BYTES, Manifest};
 use miner::purge::{PurgeConfig, RateLimiter, generation_is_fresh};
@@ -46,8 +55,10 @@ pub fn metrics() -> &'static BackfillMetrics {
 /// inventory, fixed holders and a scripted fetch.
 #[async_trait::async_trait]
 pub trait PassEnv: Send + Sync {
-    /// The inventory holds `hash_hex` as a live (not trashed) shard.
-    fn has_live(&self, hash_hex: &str) -> Result<bool>;
+    /// Which of `hashes` the inventory holds as live (not trashed)
+    /// shards, in order. Blocking: discovery calls it from the blocking
+    /// pool, several lists at once.
+    fn live_among(&self, hashes: &[[u8; 32]]) -> Result<Vec<bool>>;
     /// Peers to try for a blob of `pg_id`, at most `max`, best first: the
     /// holders `listed` for the same blob by the list, then the miners
     /// placed on the PG by the current map.
@@ -60,13 +71,15 @@ pub trait PassEnv: Send + Sync {
     /// Exclusive on the hash while the blob lands (writers: Store,
     /// PullFromPeer, backfill; the purge skips a locked hash).
     async fn lock_write(&self, hash_hex: &str) -> state::HashWriteLock;
-    /// The blob is in the store: record its inventory row.
-    fn record_stored(&self, hash_hex: &str);
+    /// The blob is in the store: record its inventory row. An error means
+    /// the row may be missing (a moved local source is then kept).
+    fn record_stored(&self, hash_hex: &str) -> Result<()>;
     /// Free bytes on the blob volume.
     fn free_bytes(&self) -> u64;
     /// A purge pass is deleting right now.
     fn purge_active(&self) -> bool;
-    /// Current cluster-map epoch; a change mid-pass aborts the pass.
+    /// Current cluster-map epoch; a change mid-discovery stops the
+    /// discovery (the candidates collected are still fetched).
     async fn current_epoch(&self) -> u64;
 }
 
@@ -78,8 +91,8 @@ pub struct LiveEnv {
 
 #[async_trait::async_trait]
 impl PassEnv for LiveEnv {
-    fn has_live(&self, hash_hex: &str) -> Result<bool> {
-        Ok(inventory::live_stored_at(hash_hex)?.is_some())
+    fn live_among(&self, hashes: &[[u8; 32]]) -> Result<Vec<bool>> {
+        inventory::live_among(hashes)
     }
     async fn holders(&self, pg_id: u32, listed: &[u32], max: usize) -> Vec<Peer> {
         let Some(map) = state::get_cluster_map().read().await.clone() else {
@@ -115,13 +128,11 @@ impl PassEnv for LiveEnv {
     async fn lock_write(&self, hash_hex: &str) -> state::HashWriteLock {
         state::lock_hash_write(hash_hex).await
     }
-    fn record_stored(&self, hash_hex: &str) {
-        if let Err(e) = inventory::insert_shard(hash_hex) {
-            warn!(hash = %hash_hex, error = %e, "backfill: inventory insert failed");
-        }
+    fn record_stored(&self, hash_hex: &str) -> Result<()> {
+        inventory::insert_shard(hash_hex)
     }
     fn free_bytes(&self) -> u64 {
-        fs2::available_space(&self.blobs_dir).unwrap_or(0)
+        crate::helpers::blocking(|| fs2::available_space(&self.blobs_dir)).unwrap_or(0)
     }
     fn purge_active(&self) -> bool {
         state::purge_pass_active()
@@ -140,32 +151,77 @@ pub struct PassSummary {
     pub uncovered_pgs: u64,
     /// Lists that failed to fetch or verify (skipped this pass).
     pub list_errors: u64,
+    /// Records of the lists consumed by the walk (complete or cut).
+    pub records: u64,
     /// Listed records whose holder is another miner of the PG: not this
     /// miner's obligation, never fetched.
     pub other_holder: u64,
     pub candidates: u64,
+    /// Wall time of the discovery (the fetch overlaps it).
+    pub discovery_ms: u64,
     pub fetched: u64,
     pub fetched_bytes: u64,
     pub no_peer: u64,
     pub bad_peer: u64,
     pub already_present: u64,
     pub store_errors: u64,
+    /// Local source lookups: verified copy found, no copy, bad copy only.
+    pub local_hit: u64,
+    pub local_miss: u64,
+    pub local_bad: u64,
+    /// Bytes stored from a local source.
+    pub local_bytes: u64,
+    /// `BACKFILL_LOCAL_SOURCE_DELETE`: source files unlinked after the
+    /// blob was confirmed in the live store; source files kept because
+    /// the confirmation or the unlink failed.
+    pub local_deleted: u64,
+    pub local_delete_errors: u64,
     /// The scan stopped at `BACKFILL_MAX_PENDING` before the last PG.
     pub truncated: bool,
     /// The walk reached the last owned PG: the next pass starts over.
     pub walk_complete: bool,
-    /// The epoch moved while scanning: stopped before fetching.
-    pub aborted_epoch_change: bool,
+    /// The epoch moved while scanning: the discovery stopped there (the
+    /// owned set is stale), the candidates collected were still fetched.
+    pub epoch_changed: bool,
     /// Where the next pass resumes.
     pub next_cursor: Cursor,
 }
 
-/// One pass: discovery from `cursor` over `owned` (sorted), then fetch.
-/// `epoch_at_start` is the epoch the owned set was computed on.
+impl PassSummary {
+    /// Discovery rate: (PGs/s, records/s) over `discovery_ms`.
+    pub fn discovery_rates(&self) -> (f64, f64) {
+        let secs = (self.discovery_ms.max(1) as f64) / 1000.0;
+        (
+            (self.scanned_pgs + self.uncovered_pgs) as f64 / secs,
+            self.records as f64 / secs,
+        )
+    }
+
+    fn add(&mut self, o: &FetchOutcome) {
+        self.fetched += o.fetched;
+        self.fetched_bytes += o.fetched_bytes;
+        self.no_peer += o.no_peer;
+        self.bad_peer += o.bad_peer;
+        self.already_present += o.already_present;
+        self.store_errors += o.store_errors;
+        self.local_hit += o.local_hit;
+        self.local_miss += o.local_miss;
+        self.local_bad += o.local_bad;
+        self.local_bytes += o.local_bytes;
+        self.local_deleted += o.local_deleted;
+        self.local_delete_errors += o.local_delete_errors;
+    }
+}
+
+/// One pass: discovery from `cursor` over `owned` (sorted), with the
+/// fetch (local sources first, then peers) of every candidate starting as
+/// soon as discovery emits it. `epoch_at_start` is the epoch the owned set
+/// was computed on.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_pass(
     store: Arc<dyn BlobStore>,
     env: Arc<dyn PassEnv>,
+    local: Arc<LocalSources>,
     source: &dyn ListSource,
     manifest: &Manifest,
     owned: &[u32],
@@ -176,179 +232,213 @@ pub async fn run_pass(
 ) -> PassSummary {
     let mut summary = PassSummary::default();
     let generation = manifest.generation;
-    let mut idx = cursor.start_index(generation, owned.len());
-    let mut candidates: Vec<Candidate> = Vec::new();
+    let start = cursor.start_index(generation, owned);
+    metrics.pending.store(0, Ordering::Relaxed);
 
-    // Phase 1: discovery, one list in memory at a time.
-    while idx < owned.len() && candidates.len() < cfg.max_pending {
+    // Discovery feeds the fetch stages through an unbounded channel: a
+    // pass never emits more than `max_pending` candidates, the bound the
+    // former collect-then-fetch Vec had.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let discovery = discover(
+        source,
+        manifest,
+        owned,
+        start,
+        &env,
+        cfg,
+        epoch_at_start,
+        metrics,
+        tx,
+        &mut summary,
+    );
+    let fetch = fetch_stages(&store, &env, &local, rx, cfg, metrics);
+    let (idx, fetched) = tokio::join!(discovery, fetch);
+
+    summary.add(&fetched);
+    summary.walk_complete = !summary.epoch_changed && idx >= owned.len();
+    summary.next_cursor = Cursor::at(generation, owned, idx, summary.walk_complete);
+    metrics.pending.store(0, Ordering::Relaxed);
+    summary
+}
+
+/// Phase 1: walk `owned[start..]`, at most `discovery_concurrency` lists
+/// in flight, consuming their results strictly in PG order; send every
+/// candidate to `sink` as soon as its PG is consumed. Returns the index of
+/// the first PG not fully scanned (the cursor). A PG counts as scanned
+/// only once all its candidates are sent; one cut by the cap is not.
+/// `sink` is dropped on return, which ends the fetch stages once drained.
+#[allow(clippy::too_many_arguments)]
+async fn discover(
+    source: &dyn ListSource,
+    manifest: &Manifest,
+    owned: &[u32],
+    start: usize,
+    env: &Arc<dyn PassEnv>,
+    cfg: &BackfillConfig,
+    epoch_at_start: u64,
+    metrics: &'static BackfillMetrics,
+    sink: tokio::sync::mpsc::UnboundedSender<Candidate>,
+    summary: &mut PassSummary,
+) -> usize {
+    use futures::StreamExt;
+
+    let generation = manifest.generation;
+    let my_uid = env.my_uid();
+    let started = tokio::time::Instant::now();
+    // `buffered` keeps up to N scans running and yields them in input
+    // order. Dropping the stream (cap, epoch move) drops the scans still
+    // in flight (a list body already in the blocking pool finishes there
+    // and is discarded: nothing of it was sent).
+    let mut scans = futures::stream::iter(owned.get(start..).unwrap_or_default().iter().copied())
+        .map(|pg_id| scan_pg(source, manifest, pg_id, env, my_uid))
+        .buffered(cfg.discovery_concurrency.max(1));
+    let mut idx = start;
+    let mut emitted = 0usize;
+    while idx < owned.len() && emitted < cfg.max_pending {
         if env.current_epoch().await != epoch_at_start {
-            summary.aborted_epoch_change = true;
+            // The owned set is stale: stop walking it. What was collected
+            // stays a candidate: each is a blob a signed list names THIS
+            // miner as the holder of, so storing it is safe whatever the
+            // epoch (the purge keeps listed blobs; ownership only decides
+            // which lists are walked). The cursor stays on the first PG
+            // not consumed, even if later lists were already scanned.
+            summary.epoch_changed = true;
             break;
         }
-        let pg_id = owned[idx];
-        let Some(obj) = manifest.object_for_pg(pg_id) else {
-            summary.uncovered_pgs += 1;
-            idx += 1;
-            continue;
+        let Some((pg_id, job)) = scans.next().await else {
+            break;
         };
-        let mut skips = ScanSkips::default();
-        let scanned = scan_pg_list(
-            source,
-            manifest,
-            pg_id,
-            obj,
-            env.as_ref(),
-            cfg.max_pending - candidates.len(),
-            &mut candidates,
-            &mut skips,
-        )
-        .await;
-        summary.other_holder += skips.other_holder;
-        match scanned {
-            Ok(ScanOutcome::Complete) => {
-                summary.scanned_pgs += 1;
+        debug_assert_eq!(pg_id, owned[idx], "results are consumed in PG order");
+        match job {
+            PgJob::Uncovered => {
+                summary.uncovered_pgs += 1;
                 idx += 1;
             }
-            Ok(ScanOutcome::Truncated) => {
-                // Rescanned next pass: what this pass fetches is then in
-                // the inventory, the remainder becomes the new candidates.
-                summary.truncated = true;
-                break;
+            PgJob::Scanned(Ok(scan)) => {
+                summary.records += scan.records;
+                summary.other_holder += scan.other_holder;
+                metrics
+                    .discovery_records
+                    .fetch_add(scan.records, Ordering::Relaxed);
+                let room = cfg.max_pending - emitted;
+                let cut = scan.missing.len() > room;
+                let take = scan.missing.len().min(room);
+                debug!(
+                    pg_id,
+                    listed = scan.records,
+                    other_holder = scan.other_holder,
+                    missing = scan.missing.len(),
+                    truncated = cut,
+                    "backfill: list scanned"
+                );
+                for candidate in scan.missing.into_iter().take(take) {
+                    metrics.pending.fetch_add(1, Ordering::Relaxed);
+                    // The receiver lives until this sender is dropped.
+                    let _ = sink.send(candidate);
+                }
+                emitted += take;
+                metrics.candidates.fetch_add(take as u64, Ordering::Relaxed);
+                if cut {
+                    // Rescanned next pass: what this pass fetches is then
+                    // in the inventory, the remainder becomes the new
+                    // candidates.
+                    summary.truncated = true;
+                    break;
+                }
+                summary.scanned_pgs += 1;
+                metrics.discovery_pgs.fetch_add(1, Ordering::Relaxed);
+                idx += 1;
             }
-            Err(e) => {
+            PgJob::Scanned(Err(e)) => {
                 warn!(pg_id, generation, error = %format!("{e:#}"), "backfill: list skipped");
                 summary.list_errors += 1;
                 metrics.list_errors.fetch_add(1, Ordering::Relaxed);
                 idx += 1;
             }
         }
-    }
-    summary.candidates = candidates.len() as u64;
-    metrics
-        .candidates
-        .fetch_add(summary.candidates, Ordering::Relaxed);
-    summary.walk_complete = !summary.aborted_epoch_change && idx >= owned.len();
-    summary.next_cursor = Cursor {
-        generation,
-        next_index: if summary.walk_complete { 0 } else { idx },
-    };
-    if summary.aborted_epoch_change {
-        info!(
-            generation,
-            epoch_at_start,
-            candidates = summary.candidates,
-            "backfill: epoch changed during discovery, pass aborted before fetching"
-        );
-        return summary;
-    }
-
-    // Phase 2: fetch, at most `max_concurrent` in flight, paced by the
-    // byte budget (charged with the listed length) and paused while a
-    // purge pass runs or free space is below the floor.
-    // Only the byte budget bounds the backfill; the operation bucket is
-    // left effectively unbounded.
-    const UNBOUNDED_OPS_PER_SEC: u64 = 1 << 40;
-    let limiter = Arc::new(tokio::sync::Mutex::new(RateLimiter::new(
-        UNBOUNDED_OPS_PER_SEC,
-        cfg.max_bytes_per_sec,
-    )));
-    let sem = Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent));
-    let mut tasks = tokio::task::JoinSet::new();
-    let total = candidates.len();
-    metrics.pending.store(total as u64, Ordering::Relaxed);
-    for (n, candidate) in candidates.into_iter().enumerate() {
-        wait_while_paused(env.as_ref(), cfg, metrics).await;
-        limiter.lock().await.acquire(candidate.shard_length).await;
-        let permit = Arc::clone(&sem)
-            .acquire_owned()
-            .await
-            .expect("semaphore open");
-        let (store, env) = (Arc::clone(&store), Arc::clone(&env));
-        let peers_per_blob = cfg.peers_per_blob;
-        tasks.spawn(async move {
-            let outcome = fetch_one(
-                store.as_ref(),
-                env.as_ref(),
-                &candidate,
-                peers_per_blob,
-                metrics,
-            )
-            .await;
-            drop(permit);
-            outcome
-        });
-        while let Some(joined) = tasks.try_join_next() {
-            fold_outcome(&mut summary, joined, metrics);
-        }
-        if (n + 1) % 1_000 == 0 {
+        let consumed = idx - start;
+        if consumed > 0 && consumed.is_multiple_of(DISCOVERY_PROGRESS_EVERY) {
+            summary.discovery_ms = started.elapsed().as_millis() as u64;
+            let (pgs_per_sec, records_per_sec) = summary.discovery_rates();
             info!(
                 generation,
-                dispatched = n + 1,
-                total,
-                fetched = summary.fetched,
-                no_peer = summary.no_peer,
-                "backfill: progress"
+                consumed,
+                remaining = owned.len() - idx,
+                records = summary.records,
+                candidates = emitted,
+                pgs_per_sec = format!("{pgs_per_sec:.2}"),
+                records_per_sec = format!("{records_per_sec:.0}"),
+                "backfill: discovery progress"
             );
         }
     }
-    while let Some(joined) = tasks.join_next().await {
-        fold_outcome(&mut summary, joined, metrics);
-    }
-    metrics.pending.store(0, Ordering::Relaxed);
-    summary
+    summary.candidates = emitted as u64;
+    summary.discovery_ms = started.elapsed().as_millis() as u64;
+    let (pgs_per_sec, records_per_sec) = summary.discovery_rates();
+    info!(
+        generation,
+        epoch_at_start,
+        epoch_changed = summary.epoch_changed,
+        truncated = summary.truncated,
+        scanned_pgs = summary.scanned_pgs,
+        uncovered_pgs = summary.uncovered_pgs,
+        list_errors = summary.list_errors,
+        records = summary.records,
+        candidates = summary.candidates,
+        discovery_ms = summary.discovery_ms,
+        pgs_per_sec = format!("{pgs_per_sec:.2}"),
+        records_per_sec = format!("{records_per_sec:.0}"),
+        next_pg = owned.get(idx).copied(),
+        "backfill: discovery finished"
+    );
+    idx
 }
 
-fn fold_outcome(
-    summary: &mut PassSummary,
-    joined: Result<FetchOutcome, tokio::task::JoinError>,
-    metrics: &BackfillMetrics,
-) {
-    metrics.pending.fetch_sub(1, Ordering::Relaxed);
-    match joined {
-        Ok(o) => {
-            summary.fetched += o.fetched;
-            summary.fetched_bytes += o.fetched_bytes;
-            summary.no_peer += o.no_peer;
-            summary.bad_peer += o.bad_peer;
-            summary.already_present += o.already_present;
-            summary.store_errors += o.store_errors;
-        }
-        Err(e) => {
-            error!(error = %e, "backfill: fetch task panicked");
-            summary.store_errors += 1;
-            metrics.store_errors.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+/// PGs consumed between two discovery progress lines.
+const DISCOVERY_PROGRESS_EVERY: usize = 256;
+
+/// One PG of the walk, scanned ahead of its turn.
+enum PgJob {
+    /// The generation does not list this PG.
+    Uncovered,
+    Scanned(Result<PgScan>),
 }
 
-enum ScanOutcome {
-    Complete,
-    Truncated,
-}
-
-/// Records of one list scan that were not candidates.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct ScanSkips {
+/// What one list contributes.
+#[derive(Debug, Default)]
+struct PgScan {
+    /// Records in the list.
+    records: u64,
+    /// Records naming another holder.
     other_holder: u64,
+    /// This miner's blobs absent from the inventory, in list order.
+    missing: Vec<Candidate>,
 }
 
-/// Fetch, verify and decode one PG list, appending to `out` the blobs
-/// this miner holds according to the list (records whose `holder_uid` is
-/// this miner) but that are absent from the inventory, at most `room` of
-/// them. The whole list is still decoded (its digest is checked as one
-/// body); only the collection stops at `room`. Records of other holders
-/// are counted, not fetched.
-#[allow(clippy::too_many_arguments)]
+async fn scan_pg(
+    source: &dyn ListSource,
+    manifest: &Manifest,
+    pg_id: u32,
+    env: &Arc<dyn PassEnv>,
+    my_uid: u32,
+) -> (u32, PgJob) {
+    let job = match manifest.object_for_pg(pg_id) {
+        None => PgJob::Uncovered,
+        Some(obj) => PgJob::Scanned(scan_pg_list(source, manifest, pg_id, obj, env, my_uid).await),
+    };
+    (pg_id, job)
+}
+
+/// Fetch one PG list, then, in the blocking pool, verify and decode it
+/// and look this miner's blobs up in the inventory (one batch).
 async fn scan_pg_list(
     source: &dyn ListSource,
     manifest: &Manifest,
     pg_id: u32,
     obj: &pg_lists::ObjectEntry,
-    env: &dyn PassEnv,
-    room: usize,
-    out: &mut Vec<Candidate>,
-    skips: &mut ScanSkips,
-) -> Result<ScanOutcome> {
+    env: &Arc<dyn PassEnv>,
+    my_uid: u32,
+) -> Result<PgScan> {
     if obj.size > MAX_LIST_BYTES {
         anyhow::bail!(
             "list declares {} bytes, above the {MAX_LIST_BYTES} byte limit",
@@ -364,121 +454,403 @@ async fn scan_pg_list(
             bytes.len()
         );
     }
-    let expect = ListExpectation {
-        pg_id,
-        generation: manifest.generation,
-        ec_k: manifest.ec_k,
-        ec_m: manifest.ec_m,
-        sha256_hex: &obj.sha256,
-    };
-    let mut scan = ListScan {
-        pg_id,
-        my_uid: env.my_uid(),
-        room,
-        found: 0,
-        truncated: false,
-        lookup_error: None,
-        other_holder: 0,
-    };
-    // Records are sorted by (blob hash, holder): the holders of one blob
-    // are consecutive, so a blob is decided once all its holders are seen.
-    let mut group: Option<BlobGroup> = None;
-    let header = pg_lists::decode_list(&bytes, expect, &mut |record| match group.as_mut() {
-        Some(g) if g.hash == record.blob_hash => g.holders.push(record.holder_uid),
-        _ => {
-            if let Some(done) = group.replace(BlobGroup {
-                hash: record.blob_hash,
-                shard_length: record.shard_length,
-                holders: vec![record.holder_uid],
-            }) {
-                scan.decide(done, env, out);
-            }
-        }
-    })?;
-    if let Some(done) = group.take() {
-        scan.decide(done, env, out);
-    }
-    let ListScan {
-        found,
-        truncated,
-        lookup_error,
-        other_holder,
-        ..
-    } = scan;
-    skips.other_holder += other_holder;
-    if let Some(e) = lookup_error {
-        // A failed inventory read leaves the PG's candidates unknown:
-        // drop what this list contributed and skip it.
-        out.truncate(out.len() - found);
-        return Err(e.context("inventory lookup"));
-    }
-    debug!(
-        pg_id,
-        listed = header.count,
-        other_holder,
-        missing = found,
-        truncated,
-        "backfill: list scanned"
-    );
-    Ok(if truncated {
-        ScanOutcome::Truncated
-    } else {
-        ScanOutcome::Complete
+    let (generation, ec_k, ec_m) = (manifest.generation, manifest.ec_k, manifest.ec_m);
+    let sha256 = obj.sha256.clone();
+    let env = Arc::clone(env);
+    tokio::task::spawn_blocking(move || {
+        let expect = ListExpectation {
+            pg_id,
+            generation,
+            ec_k,
+            ec_m,
+            sha256_hex: &sha256,
+        };
+        let own = collect_own(&bytes, expect, my_uid)?;
+        missing_from_inventory(own, env.as_ref())
+    })
+    .await
+    .context("list scan task")?
+}
+
+/// This miner's blobs of one list, before the inventory lookup.
+struct OwnBlobs {
+    records: u64,
+    other_holder: u64,
+    /// Blobs whose holders include this miner, with the other listed
+    /// holders, in list (hash) order.
+    own: Vec<Candidate>,
+}
+
+/// Verify and decode one list (`decode_list`: digest, header, order) and
+/// keep the blobs whose holders include `my_uid`. Records are sorted by
+/// (blob hash, holder): the holders of one blob are consecutive, so a
+/// blob is decided once all its holders are seen. A record of another
+/// holder costs a hash compare and a push into a reused buffer; only this
+/// miner's blobs allocate.
+fn collect_own(bytes: &[u8], expect: ListExpectation<'_>, my_uid: u32) -> Result<OwnBlobs> {
+    let mut groups = OwnCollector::new(expect.pg_id, my_uid);
+    let header = pg_lists::decode_list(bytes, expect, &mut |record| groups.push(record))?;
+    groups.close();
+    Ok(OwnBlobs {
+        records: u64::from(header.count),
+        other_holder: groups.other_holder,
+        own: groups.own,
     })
 }
 
-/// Every holder one list names for one blob hash.
-struct BlobGroup {
-    hash: [u8; 32],
-    shard_length: u32,
-    holders: Vec<u32>,
+/// Keep the `own` blobs the inventory does not hold live.
+fn missing_from_inventory(own: OwnBlobs, env: &dyn PassEnv) -> Result<PgScan> {
+    let hashes: Vec<[u8; 32]> = own.own.iter().map(|c| c.hash).collect();
+    // A failed inventory read leaves the PG's candidates unknown: the PG
+    // is skipped (list error), nothing of it is a candidate.
+    let live = env.live_among(&hashes).context("inventory lookup")?;
+    anyhow::ensure!(
+        live.len() == hashes.len(),
+        "inventory lookup answered {} of {} hashes",
+        live.len(),
+        hashes.len()
+    );
+    Ok(PgScan {
+        records: own.records,
+        other_holder: own.other_holder,
+        missing: own
+            .own
+            .into_iter()
+            .zip(live)
+            .filter_map(|(c, live)| (!live).then_some(c))
+            .collect(),
+    })
 }
 
-/// State of one list scan (see [`scan_pg_list`]).
-struct ListScan {
+/// Groups consecutive records by blob hash (see [`collect_own`]).
+struct OwnCollector {
     pg_id: u32,
     my_uid: u32,
-    room: usize,
-    found: usize,
-    truncated: bool,
-    lookup_error: Option<anyhow::Error>,
-    /// Records naming another holder.
+    /// The open group: hash and listed length; its holders so far are in
+    /// `holders`.
+    open: Option<([u8; 32], u32)>,
+    holders: Vec<u32>,
     other_holder: u64,
+    own: Vec<Candidate>,
 }
 
-impl ListScan {
-    /// A blob this miner is listed for and lacks becomes a candidate,
-    /// with the other listed holders as its first sources.
-    fn decide(&mut self, group: BlobGroup, env: &dyn PassEnv, out: &mut Vec<Candidate>) {
-        let mine = group.holders.contains(&self.my_uid);
-        self.other_holder += group
-            .holders
-            .iter()
-            .filter(|uid| **uid != self.my_uid)
-            .count() as u64;
-        if !mine || self.truncated || self.lookup_error.is_some() {
-            return;
+impl OwnCollector {
+    fn new(pg_id: u32, my_uid: u32) -> Self {
+        Self {
+            pg_id,
+            my_uid,
+            open: None,
+            holders: Vec::with_capacity(32),
+            other_holder: 0,
+            own: Vec::new(),
         }
-        match env.has_live(&hex::encode(group.hash)) {
-            Ok(true) => {}
-            Ok(false) => {
-                if self.found >= self.room {
-                    self.truncated = true;
-                    return;
-                }
-                self.found += 1;
-                out.push(Candidate {
-                    pg_id: self.pg_id,
-                    hash: group.hash,
-                    shard_length: u64::from(group.shard_length),
-                    listed_holders: group
-                        .holders
-                        .into_iter()
-                        .filter(|uid| *uid != self.my_uid)
-                        .collect(),
-                });
+    }
+
+    fn push(&mut self, record: &pg_lists::Record) {
+        match self.open {
+            Some((hash, _)) if hash == record.blob_hash => {}
+            _ => {
+                self.close();
+                self.open = Some((record.blob_hash, record.shard_length));
             }
-            Err(e) => self.lookup_error = Some(e),
+        }
+        self.holders.push(record.holder_uid);
+    }
+
+    /// Decide the open group: a blob whose holders include this miner is
+    /// kept, with the other listed holders as its first sources.
+    fn close(&mut self) {
+        let Some((hash, shard_length)) = self.open.take() else {
+            return;
+        };
+        let me = self.my_uid;
+        let others = self.holders.iter().filter(|uid| **uid != me).count();
+        self.other_holder += others as u64;
+        if others < self.holders.len() {
+            self.own.push(Candidate {
+                pg_id: self.pg_id,
+                hash,
+                shard_length: u64::from(shard_length),
+                listed_holders: self.holders.iter().copied().filter(|u| *u != me).collect(),
+            });
+        }
+        self.holders.clear();
+    }
+}
+
+/// Phases 2a/2b, fed by discovery: local sources (if any), then peers.
+/// Returns the fetch counters.
+async fn fetch_stages(
+    store: &Arc<dyn BlobStore>,
+    env: &Arc<dyn PassEnv>,
+    local: &Arc<LocalSources>,
+    candidates: tokio::sync::mpsc::UnboundedReceiver<Candidate>,
+    cfg: &BackfillConfig,
+    metrics: &'static BackfillMetrics,
+) -> FetchOutcome {
+    if local.is_empty() {
+        return peer_stage(store, env, candidates, cfg, metrics).await;
+    }
+    let (to_peers, for_peers) = tokio::sync::mpsc::unbounded_channel();
+    let (mut total, peers) = tokio::join!(
+        local_stage(store, env, local, candidates, to_peers, cfg, metrics),
+        peer_stage(store, env, for_peers, cfg, metrics),
+    );
+    total.add(&peers);
+    total
+}
+
+/// Phase 2b: fetch from peers, at most `max_concurrent` in flight, paced
+/// by the byte budget (charged with the listed length) and paused while a
+/// purge pass runs or free space is below the floor.
+async fn peer_stage(
+    store: &Arc<dyn BlobStore>,
+    env: &Arc<dyn PassEnv>,
+    mut candidates: tokio::sync::mpsc::UnboundedReceiver<Candidate>,
+    cfg: &BackfillConfig,
+    metrics: &'static BackfillMetrics,
+) -> FetchOutcome {
+    // Only the byte budget bounds the backfill; the operation bucket is
+    // left effectively unbounded.
+    const UNBOUNDED_OPS_PER_SEC: u64 = 1 << 40;
+    let mut total = FetchOutcome::default();
+    let limiter = Arc::new(tokio::sync::Mutex::new(RateLimiter::new(
+        UNBOUNDED_OPS_PER_SEC,
+        cfg.max_bytes_per_sec,
+    )));
+    let sem = Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent));
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut dispatched = 0u64;
+    loop {
+        // Resolve finished fetches while waiting for the next candidate,
+        // so `pending` and the counters do not wait for it.
+        let candidate = tokio::select! {
+            biased;
+            Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
+                fold_outcome(&mut total, joined, metrics);
+                continue;
+            }
+            next = candidates.recv() => match next {
+                Some(candidate) => candidate,
+                None => break,
+            },
+        };
+        wait_while_paused(env.as_ref(), cfg, metrics).await;
+        limiter.lock().await.acquire(candidate.shard_length).await;
+        let permit = Arc::clone(&sem)
+            .acquire_owned()
+            .await
+            .expect("semaphore open");
+        let (store, env) = (Arc::clone(store), Arc::clone(env));
+        let peers_per_blob = cfg.peers_per_blob;
+        tasks.spawn(async move {
+            let outcome = fetch_one(
+                store.as_ref(),
+                env.as_ref(),
+                &candidate,
+                peers_per_blob,
+                metrics,
+            )
+            .await;
+            drop(permit);
+            outcome
+        });
+        while let Some(joined) = tasks.try_join_next() {
+            fold_outcome(&mut total, joined, metrics);
+        }
+        dispatched += 1;
+        if dispatched.is_multiple_of(1_000) {
+            info!(
+                dispatched,
+                fetched = total.fetched,
+                no_peer = total.no_peer,
+                "backfill: progress"
+            );
+        }
+    }
+    while let Some(joined) = tasks.join_next().await {
+        fold_outcome(&mut total, joined, metrics);
+    }
+    total
+}
+
+/// Phase 2a: look every candidate up in the local sources, at most
+/// `local_concurrency` in flight; store the verified copies. Disk-bound:
+/// not charged to the network byte budget. The candidates left for the
+/// peers (no local copy, or only bad ones) go to `to_peers`, in
+/// completion order.
+#[allow(clippy::too_many_arguments)]
+async fn local_stage(
+    store: &Arc<dyn BlobStore>,
+    env: &Arc<dyn PassEnv>,
+    local: &Arc<LocalSources>,
+    mut candidates: tokio::sync::mpsc::UnboundedReceiver<Candidate>,
+    to_peers: tokio::sync::mpsc::UnboundedSender<Candidate>,
+    cfg: &BackfillConfig,
+    metrics: &'static BackfillMetrics,
+) -> FetchOutcome {
+    let mut total = FetchOutcome::default();
+    let sem = Arc::new(tokio::sync::Semaphore::new(cfg.local_concurrency));
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut dispatched = 0u64;
+    loop {
+        // Forward unresolved lookups to the peers while waiting for the
+        // next candidate: a miss must not wait for discovery to emit
+        // another one.
+        let candidate = tokio::select! {
+            biased;
+            Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
+                fold_local(&mut total, joined, &to_peers, metrics);
+                continue;
+            }
+            next = candidates.recv() => match next {
+                Some(candidate) => candidate,
+                None => break,
+            },
+        };
+        wait_while_paused(env.as_ref(), cfg, metrics).await;
+        let permit = Arc::clone(&sem)
+            .acquire_owned()
+            .await
+            .expect("semaphore open");
+        let (store, env, local) = (Arc::clone(store), Arc::clone(env), Arc::clone(local));
+        tasks.spawn(async move {
+            let outcome = local_one(store.as_ref(), env.as_ref(), &local, candidate, metrics).await;
+            drop(permit);
+            outcome
+        });
+        while let Some(joined) = tasks.try_join_next() {
+            fold_local(&mut total, joined, &to_peers, metrics);
+        }
+        dispatched += 1;
+        if dispatched.is_multiple_of(10_000) {
+            info!(
+                dispatched,
+                local_hit = total.local_hit,
+                local_miss = total.local_miss,
+                local_bad = total.local_bad,
+                "backfill: local progress"
+            );
+        }
+    }
+    while let Some(joined) = tasks.join_next().await {
+        fold_local(&mut total, joined, &to_peers, metrics);
+    }
+    total
+}
+
+/// A local lookup's outcome, and the candidate when the peers must be
+/// tried.
+struct LocalOutcome {
+    outcome: FetchOutcome,
+    unresolved: Option<Candidate>,
+}
+
+fn fold_local(
+    total: &mut FetchOutcome,
+    joined: Result<LocalOutcome, tokio::task::JoinError>,
+    to_peers: &tokio::sync::mpsc::UnboundedSender<Candidate>,
+    metrics: &BackfillMetrics,
+) {
+    match joined {
+        Ok(LocalOutcome {
+            outcome,
+            unresolved: Some(candidate),
+        }) => {
+            // Still pending: the peer stage resolves it (its receiver
+            // outlives this sender).
+            total.add(&outcome);
+            let _ = to_peers.send(candidate);
+        }
+        Ok(LocalOutcome {
+            outcome,
+            unresolved: None,
+        }) => fold_outcome(total, Ok(outcome), metrics),
+        Err(e) => fold_outcome(total, Err(e), metrics),
+    }
+}
+
+/// One candidate against the local sources.
+async fn local_one(
+    store: &dyn BlobStore,
+    env: &dyn PassEnv,
+    local: &LocalSources,
+    candidate: Candidate,
+    metrics: &BackfillMetrics,
+) -> LocalOutcome {
+    let mut out = FetchOutcome::default();
+    match local.lookup(&candidate.hash, candidate.shard_length).await {
+        LocalLookup::Hit { data, copy } => {
+            out.local_hit += 1;
+            metrics.local_hit.fetch_add(1, Ordering::Relaxed);
+            let source = local.is_removable(&copy).then_some(MoveSource {
+                local,
+                copy: &copy,
+                hash: &candidate.hash,
+                shard_length: candidate.shard_length,
+            });
+            let hash_hex = candidate.hash_hex();
+            if store_verified(store, env, &hash_hex, &data, source, metrics, &mut out).await {
+                out.local_bytes += data.len() as u64;
+                metrics
+                    .local_bytes
+                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+            }
+            LocalOutcome {
+                outcome: out,
+                unresolved: None,
+            }
+        }
+        LocalLookup::Miss => {
+            out.local_miss += 1;
+            metrics.local_miss.fetch_add(1, Ordering::Relaxed);
+            LocalOutcome {
+                outcome: out,
+                unresolved: Some(candidate),
+            }
+        }
+        LocalLookup::Bad(reason) => {
+            debug!(hash = %candidate.hash_hex(), reason = %reason, "backfill: local copy rejected");
+            out.local_bad += 1;
+            metrics.local_bad.fetch_add(1, Ordering::Relaxed);
+            LocalOutcome {
+                outcome: out,
+                unresolved: Some(candidate),
+            }
+        }
+    }
+}
+
+impl FetchOutcome {
+    fn add(&mut self, o: &FetchOutcome) {
+        self.fetched += o.fetched;
+        self.fetched_bytes += o.fetched_bytes;
+        self.no_peer += o.no_peer;
+        self.bad_peer += o.bad_peer;
+        self.already_present += o.already_present;
+        self.store_errors += o.store_errors;
+        self.local_hit += o.local_hit;
+        self.local_miss += o.local_miss;
+        self.local_bad += o.local_bad;
+        self.local_bytes += o.local_bytes;
+        self.local_deleted += o.local_deleted;
+        self.local_delete_errors += o.local_delete_errors;
+    }
+}
+
+/// A candidate is resolved: count it and release its `pending` slot.
+fn fold_outcome(
+    total: &mut FetchOutcome,
+    joined: Result<FetchOutcome, tokio::task::JoinError>,
+    metrics: &BackfillMetrics,
+) {
+    metrics.pending.fetch_sub(1, Ordering::Relaxed);
+    match joined {
+        Ok(o) => total.add(&o),
+        Err(e) => {
+            error!(error = %e, "backfill: fetch task panicked");
+            total.store_errors += 1;
+            metrics.store_errors.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -530,6 +902,12 @@ struct FetchOutcome {
     bad_peer: u64,
     already_present: u64,
     store_errors: u64,
+    local_hit: u64,
+    local_miss: u64,
+    local_bad: u64,
+    local_bytes: u64,
+    local_deleted: u64,
+    local_delete_errors: u64,
 }
 
 /// Try the holders of the candidate's PG in order until one payload
@@ -582,29 +960,142 @@ async fn fetch_one(
         return out;
     };
 
-    let _lock = env.lock_write(&hash_hex).await;
-    if store.has(&hash_hex) {
-        out.already_present += 1;
-        metrics.already_present.fetch_add(1, Ordering::Relaxed);
-        return out;
-    }
-    match store.store(&hash_hex, &data).await {
-        Ok(()) => {
-            env.record_stored(&hash_hex);
-            out.fetched += 1;
-            out.fetched_bytes += data.len() as u64;
-            metrics.fetched.fetch_add(1, Ordering::Relaxed);
-            metrics
-                .fetched_bytes
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
-        }
-        Err(e) => {
-            warn!(hash = %hash_hex, error = %e, "backfill: store failed");
-            out.store_errors += 1;
-            metrics.store_errors.fetch_add(1, Ordering::Relaxed);
-        }
+    if store_verified(store, env, &hash_hex, &data, None, metrics, &mut out).await {
+        out.fetched += 1;
+        out.fetched_bytes += data.len() as u64;
+        metrics.fetched.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .fetched_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
     }
     out
+}
+
+/// A local hit whose source file is unlinked once the blob is confirmed in
+/// the live store (`BACKFILL_LOCAL_SOURCE_DELETE`).
+struct MoveSource<'a> {
+    local: &'a LocalSources,
+    copy: &'a LocalCopy,
+    hash: &'a [u8; 32],
+    shard_length: u64,
+}
+
+/// Store a verified payload under the per-hash write lock, unless it
+/// landed meanwhile (`already_present`), then record its inventory row.
+/// Both sources (local and peer) go through here. `true` when this call
+/// stored it; `already_present` / `store_errors` are counted here.
+///
+/// With `source` (a local hit in move mode), still under the same lock:
+/// once the store returned success (durable on such a store) and the
+/// inventory row was written, or the live store already held the blob
+/// with a live inventory row, the live copy is read back and verified,
+/// and only then is the source file unlinked. A store error, an inventory
+/// error or missing row, or a failed read-back keeps the source.
+async fn store_verified(
+    store: &dyn BlobStore,
+    env: &dyn PassEnv,
+    hash_hex: &str,
+    data: &[u8],
+    source: Option<MoveSource<'_>>,
+    metrics: &BackfillMetrics,
+    out: &mut FetchOutcome,
+) -> bool {
+    let _lock = env.lock_write(hash_hex).await;
+    let (stored, settled) = if store.has(hash_hex) {
+        out.already_present += 1;
+        metrics.already_present.fetch_add(1, Ordering::Relaxed);
+        // Another writer landed it; a move also needs its live inventory
+        // row (a Store or PullFromPeer writes one). Only asked in move
+        // mode: one SQLite point query, off the runtime workers.
+        let settled = match &source {
+            None => Ok(()),
+            Some(src) => match crate::helpers::blocking(|| env.live_among(&[*src.hash])) {
+                Ok(live) if live.first() == Some(&true) => Ok(()),
+                Ok(_) => Err("held by the live store without a live inventory row".to_string()),
+                Err(e) => Err(format!("inventory lookup failed: {e:#}")),
+            },
+        };
+        (false, settled)
+    } else {
+        match store.store(hash_hex, data).await {
+            Ok(()) => match env.record_stored(hash_hex) {
+                Ok(()) => (true, Ok(())),
+                Err(e) => {
+                    warn!(hash = %hash_hex, error = %format!("{e:#}"), "backfill: inventory insert failed");
+                    (true, Err("inventory row not written".to_string()))
+                }
+            },
+            Err(e) => {
+                warn!(hash = %hash_hex, error = %e, "backfill: store failed");
+                out.store_errors += 1;
+                metrics.store_errors.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        }
+    };
+    if let Some(source) = source {
+        match settled {
+            Ok(()) => move_source(store, hash_hex, &source, metrics, out).await,
+            Err(reason) => {
+                warn!(hash = %hash_hex, path = %source.copy.path.display(), reason = %reason, "backfill: local source kept");
+                out.local_delete_errors += 1;
+                metrics.local_delete_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    stored
+}
+
+/// Unlink a local source file whose blob the live store holds: only on a
+/// durable store, and only once the live copy reads back and verifies
+/// (blake3 and listed length). Called under the per-hash write lock, so
+/// no Delete, purge or other writer of the hash interleaves between the
+/// read-back and the unlink. Any doubt keeps the source and counts
+/// `local_delete_errors`; nothing here fails the pass.
+async fn move_source(
+    store: &dyn BlobStore,
+    hash_hex: &str,
+    source: &MoveSource<'_>,
+    metrics: &BackfillMetrics,
+    out: &mut FetchOutcome,
+) {
+    let kept = |out: &mut FetchOutcome, reason: String| {
+        warn!(hash = %hash_hex, path = %source.copy.path.display(), reason = %reason, "backfill: local source kept");
+        out.local_delete_errors += 1;
+        metrics.local_delete_errors.fetch_add(1, Ordering::Relaxed);
+    };
+    if !store.store_is_durable() {
+        kept(
+            out,
+            "the live store does not sync before acknowledging a write".to_string(),
+        );
+        return;
+    }
+    // The packed store's read is a synchronous `pread` inside its future:
+    // run it on the blocking side, not on a runtime worker.
+    let read_back = crate::helpers::blocking(|| {
+        futures::executor::block_on(store.read_at_most(hash_hex, source.shard_length))
+    });
+    let confirmed = match read_back {
+        Ok(bytes) => verify_payload(&bytes, source.hash, source.shard_length)
+            .map_err(|e| format!("live copy does not verify: {e}")),
+        Err(e) => Err(format!("live copy unreadable: {e}")),
+    };
+    if let Err(reason) = confirmed {
+        kept(out, reason);
+        return;
+    }
+    match source.local.remove_copy(source.hash, source.copy).await {
+        RemoveOutcome::Removed => {
+            debug!(hash = %hash_hex, path = %source.copy.path.display(), "backfill: local source removed");
+            out.local_deleted += 1;
+            metrics.local_deleted.fetch_add(1, Ordering::Relaxed);
+        }
+        RemoveOutcome::Gone => {
+            debug!(hash = %hash_hex, path = %source.copy.path.display(), "backfill: local source already gone");
+        }
+        RemoveOutcome::Failed(reason) => kept(out, reason),
+    }
 }
 
 // ============================================================================
@@ -650,10 +1141,31 @@ pub async fn run_loop(
         pass_interval_secs = cfg.pass_interval_secs,
         min_free_bytes = cfg.min_free_bytes,
         peers_per_blob = cfg.peers_per_blob,
+        local_source_dirs = ?cfg.local_source_dirs,
+        local_source_delete = cfg.local_source_delete,
+        local_concurrency = cfg.local_concurrency,
+        discovery_concurrency = cfg.discovery_concurrency,
         "backfill: enabled"
     );
 
     let metrics = metrics();
+    let mode = source_mode(&cfg, store.as_ref(), &blobs_dir);
+    let local = {
+        let dirs = cfg.local_source_dirs.clone();
+        let mode = mode.clone();
+        Arc::new(crate::helpers::blocking(move || {
+            LocalSources::open(&dirs, &mode)
+        }))
+    };
+    if !cfg.local_source_dirs.is_empty() {
+        info!(
+            usable = local.len(),
+            configured = cfg.local_source_dirs.len(),
+            removable = local.removable_roots(),
+            mode = ?mode,
+            "backfill: local sources opened"
+        );
+    }
     let env: Arc<dyn PassEnv> = Arc::new(LiveEnv {
         endpoint,
         blobs_dir,
@@ -662,7 +1174,7 @@ pub async fn run_loop(
     if cursor != Cursor::default() {
         info!(
             generation = cursor.generation,
-            next_index = cursor.next_index,
+            next_pg = cursor.next_pg,
             "backfill: cursor restored"
         );
     }
@@ -770,13 +1282,14 @@ pub async fn run_loop(
             generation = current.generation,
             epoch,
             owned_pgs = owned.len(),
-            start_index = cursor.start_index(current.generation, owned.len()),
+            start_index = cursor.start_index(current.generation, &owned),
             "backfill: pass starting"
         );
         let started = tokio::time::Instant::now();
         let summary = run_pass(
             Arc::clone(&store),
             Arc::clone(&env),
+            Arc::clone(&local),
             source.as_ref(),
             current,
             &owned,
@@ -790,30 +1303,66 @@ pub async fn run_loop(
         if let Err(e) = cursor.persist_to(&data_dir) {
             warn!(error = %e, "backfill: cursor not persisted");
         }
-        if !summary.aborted_epoch_change {
-            metrics.passes.fetch_add(1, Ordering::Relaxed);
+        metrics.passes.fetch_add(1, Ordering::Relaxed);
+        if !summary.epoch_changed {
+            // A discovery stopped by an epoch move resumes at the next
+            // tick on the new owned set, not after a full interval.
             last_pass_at = Some(tokio::time::Instant::now());
         }
+        let (pgs_per_sec, records_per_sec) = summary.discovery_rates();
         info!(
             generation = current.generation,
             elapsed_secs = started.elapsed().as_secs(),
-            aborted = summary.aborted_epoch_change,
+            epoch_changed = summary.epoch_changed,
             scanned_pgs = summary.scanned_pgs,
             uncovered_pgs = summary.uncovered_pgs,
             list_errors = summary.list_errors,
+            records = summary.records,
             other_holder = summary.other_holder,
             candidates = summary.candidates,
+            discovery_ms = summary.discovery_ms,
+            pgs_per_sec = format!("{pgs_per_sec:.2}"),
+            records_per_sec = format!("{records_per_sec:.0}"),
             fetched = summary.fetched,
             fetched_bytes = summary.fetched_bytes,
             no_peer = summary.no_peer,
             bad_peer = summary.bad_peer,
+            local_hit = summary.local_hit,
+            local_miss = summary.local_miss,
+            local_bad = summary.local_bad,
+            local_bytes = summary.local_bytes,
+            local_deleted = summary.local_deleted,
+            local_delete_errors = summary.local_delete_errors,
             already_present = summary.already_present,
             store_errors = summary.store_errors,
             truncated = summary.truncated,
             walk_complete = summary.walk_complete,
-            next_index = cursor.next_index,
+            next_pg = cursor.next_pg,
             "backfill: pass finished"
         );
+    }
+}
+
+/// Copy or move for the local sources: move only when
+/// `BACKFILL_LOCAL_SOURCE_DELETE` is set AND the live store's `store` is
+/// durable (synced before it returns); otherwise a source file could be
+/// unlinked while its only other copy is still in the page cache.
+fn source_mode(
+    cfg: &BackfillConfig,
+    store: &dyn BlobStore,
+    blobs_dir: &std::path::Path,
+) -> SourceMode {
+    if !cfg.local_source_delete {
+        return SourceMode::ReadOnly;
+    }
+    if !store.store_is_durable() {
+        warn!(
+            "backfill: BACKFILL_LOCAL_SOURCE_DELETE=true ignored: the live store does not sync a write before acknowledging it (flat backend), the local sources are only copied"
+        );
+        return SourceMode::ReadOnly;
+    }
+    SourceMode::Move {
+        live_root: blobs_dir.to_path_buf(),
     }
 }
 
@@ -994,6 +1543,12 @@ mod tests {
         /// This miner's uid (default `MY_UID`, the holder of every
         /// record of `write_generation`).
         my_uid: u32,
+        /// Batched inventory lookups served.
+        lookup_calls: AtomicU64,
+        /// A lookup batch holding this hash fails.
+        fail_lookup_of: Mutex<Option<[u8; 32]>>,
+        /// `record_stored` fails (inventory insert error).
+        fail_record: AtomicBool,
     }
 
     impl FakeEnv {
@@ -1016,14 +1571,25 @@ mod tests {
                 epoch: AtomicU64::new(5),
                 bump_epoch_after_calls: Mutex::new(None),
                 my_uid: MY_UID,
+                lookup_calls: AtomicU64::new(0),
+                fail_lookup_of: Mutex::new(None),
+                fail_record: AtomicBool::new(false),
             }
         }
     }
 
     #[async_trait::async_trait]
     impl PassEnv for FakeEnv {
-        fn has_live(&self, hash_hex: &str) -> Result<bool> {
-            Ok(self.live.lock().unwrap().contains(hash_hex))
+        fn live_among(&self, hashes: &[[u8; 32]]) -> Result<Vec<bool>> {
+            self.lookup_calls.fetch_add(1, Ordering::Relaxed);
+            let live = self.live.lock().unwrap();
+            if let Some(bad) = *self.fail_lookup_of.lock().unwrap() {
+                anyhow::ensure!(!hashes.contains(&bad), "injected inventory error");
+            }
+            Ok(hashes
+                .iter()
+                .map(|h| live.contains(&hex::encode(h)))
+                .collect())
         }
         async fn holders(&self, _pg_id: u32, listed: &[u32], max: usize) -> Vec<Peer> {
             let mut peers: Vec<Peer> = listed.iter().map(|uid| peer(*uid)).collect();
@@ -1058,8 +1624,13 @@ mod tests {
         async fn lock_write(&self, hash_hex: &str) -> state::HashWriteLock {
             state::lock_hash_write(hash_hex).await
         }
-        fn record_stored(&self, hash_hex: &str) {
+        fn record_stored(&self, hash_hex: &str) -> Result<()> {
+            anyhow::ensure!(
+                !self.fail_record.load(Ordering::Relaxed),
+                "injected inventory insert failure"
+            );
             self.live.lock().unwrap().insert(hash_hex.to_string());
+            Ok(())
         }
         fn free_bytes(&self) -> u64 {
             self.free_bytes.load(Ordering::Relaxed)
@@ -1091,6 +1662,10 @@ mod tests {
             min_free_bytes: 0,
             peers_per_blob: 3,
             pause_poll_secs: 1,
+            local_source_dirs: Vec::new(),
+            local_source_delete: false,
+            local_concurrency: 4,
+            discovery_concurrency: 4,
         }
     }
 
@@ -1139,11 +1714,55 @@ mod tests {
         cursor: Cursor,
         cfg: &BackfillConfig,
     ) -> PassSummary {
+        run_with_local(rig, env, owned, cursor, cfg, LocalSources::default()).await
+    }
+
+    async fn run_with_local(
+        rig: &Rig,
+        env: &Arc<FakeEnv>,
+        owned: &[u32],
+        cursor: Cursor,
+        cfg: &BackfillConfig,
+        local: LocalSources,
+    ) -> PassSummary {
+        run_full(rig, env, &rig.source, owned, cursor, cfg, local).await
+    }
+
+    async fn run_on(
+        rig: &Rig,
+        env: &Arc<FakeEnv>,
+        source: &dyn ListSource,
+        owned: &[u32],
+        cursor: Cursor,
+        cfg: &BackfillConfig,
+    ) -> PassSummary {
+        run_full(
+            rig,
+            env,
+            source,
+            owned,
+            cursor,
+            cfg,
+            LocalSources::default(),
+        )
+        .await
+    }
+
+    async fn run_full(
+        rig: &Rig,
+        env: &Arc<FakeEnv>,
+        source: &dyn ListSource,
+        owned: &[u32],
+        cursor: Cursor,
+        cfg: &BackfillConfig,
+        local: LocalSources,
+    ) -> PassSummary {
         let env_dyn: Arc<dyn PassEnv> = Arc::clone(env) as Arc<dyn PassEnv>;
         run_pass(
             rig.store.clone() as Arc<dyn BlobStore>,
             env_dyn,
-            &rig.source,
+            Arc::new(local),
+            source,
             &rig.manifest,
             owned,
             cursor,
@@ -1209,7 +1828,7 @@ mod tests {
         for i in 0..2 {
             let (data, hash) = blob(1, i);
             rig.store.store(&hex::encode(hash), &data).await.unwrap();
-            env.record_stored(&hex::encode(hash));
+            env.record_stored(&hex::encode(hash)).unwrap();
         }
         let owned = [1u32, 2, 3, 4];
         let mut cfg = fast_cfg();
@@ -1225,7 +1844,7 @@ mod tests {
             first.next_cursor,
             Cursor {
                 generation: GENERATION,
-                next_index: 1
+                next_pg: 2
             },
             "resume at pg 2, which is rescanned"
         );
@@ -1238,13 +1857,13 @@ mod tests {
         assert_eq!(second.fetched, 2);
         assert!(!second.truncated, "pg 3 was scanned to its end");
         assert!(!second.walk_complete, "the cap was reached before pg 4");
-        assert_eq!(second.next_cursor.next_index, 3);
+        assert_eq!(second.next_cursor.next_pg, 4);
 
         let third = run(&rig, &env, &owned, second.next_cursor, &cfg).await;
         assert_eq!(third.candidates, 0);
         assert_eq!(third.uncovered_pgs, 1, "pg 4 is owned but not listed");
         assert!(third.walk_complete);
-        assert_eq!(third.next_cursor.next_index, 0);
+        assert_eq!(third.next_cursor.next_pg, 0);
 
         // Every listed blob is now in the store with the exact payload.
         for &(pg, count) in &pgs {
@@ -1412,6 +2031,7 @@ mod tests {
         let s = run_pass(
             store.clone() as Arc<dyn BlobStore>,
             Arc::clone(&env) as Arc<dyn PassEnv>,
+            Arc::new(LocalSources::default()),
             &source,
             &manifest,
             &[5],
@@ -1494,11 +2114,12 @@ mod tests {
         assert_eq!(metrics.paused_low_free_space.load(Ordering::Relaxed), 0);
     }
 
-    /// The epoch moving during discovery aborts before any fetch; the
-    /// cursor keeps the PGs already scanned.
+    /// The epoch moving during discovery stops the walk there, but the
+    /// candidates already collected are fetched; the cursor stays on the
+    /// first PG not scanned, so nothing is skipped.
     #[tokio::test]
-    async fn epoch_change_aborts_before_fetching() {
-        let pgs = [(1u32, 1u32), (2, 1), (3, 1)];
+    async fn epoch_change_keeps_the_candidates_collected() {
+        let pgs = [(1u32, 2u32), (2, 1), (3, 1)];
         let rig = rig(&pgs).await;
         let env = Arc::new(FakeEnv::new(
             vec![peer(1)],
@@ -1508,11 +2129,910 @@ mod tests {
         // First check passes (pg 1), second check (before pg 2) bumps.
         *env.bump_epoch_after_calls.lock().unwrap() = Some(1);
         let s = run(&rig, &env, &[1, 2, 3], Cursor::default(), &fast_cfg()).await;
-        assert!(s.aborted_epoch_change);
+        assert!(s.epoch_changed);
         assert_eq!(s.scanned_pgs, 1);
-        assert_eq!(s.fetched, 0);
-        assert!(env.fetches.lock().unwrap().is_empty());
-        assert_eq!(s.next_cursor.next_index, 1);
+        assert_eq!(s.candidates, 2, "pg 1's two blobs were collected");
+        assert_eq!(s.fetched, 2, "and fetched despite the epoch move");
+        for i in 0..2 {
+            let (data, hash) = blob(1, i);
+            assert_eq!(rig.store.read(&hex::encode(hash)).await.unwrap(), data);
+        }
+        assert_eq!(s.next_cursor.next_pg, 2, "resume at pg 2");
         assert!(!s.walk_complete);
+        assert_eq!(rig.metrics.pending.load(Ordering::Relaxed), 0);
+
+        // The next pass (computed on the new epoch, which `run` passes as
+        // `epoch_at_start` = 5) resumes at pg 2 and finishes the walk.
+        env.epoch.store(5, Ordering::Relaxed);
+        let s2 = run(&rig, &env, &[1, 2, 3], s.next_cursor, &fast_cfg()).await;
+        assert!(!s2.epoch_changed);
+        assert_eq!((s2.candidates, s2.fetched), (2, 2));
+        assert!(s2.walk_complete);
+    }
+
+    /// A set-aside flat root with the listed blobs at either layout: each
+    /// candidate is read from it (no peer dialled) unless absent or bad,
+    /// in which case the peers are tried; counters tell which.
+    #[tokio::test]
+    async fn local_source_is_preferred_and_peers_take_the_rest() {
+        let pgs = [(4u32, 5u32)];
+        let rig = rig(&pgs).await;
+        let env = Arc::new(FakeEnv::new(
+            vec![peer(1)],
+            HashMap::from([(1, Serve::Honest)]),
+            &pgs,
+        ));
+        let aside = tempfile::tempdir().unwrap();
+        let hex_of = |i: u32| hex::encode(blob(4, i).1);
+        // 0: sharded layout, 1: legacy root layout, 2: absent,
+        // 3: wrong bytes under its name, 4: listed length exceeded.
+        let sharded = |h: &str| aside.path().join(&h[0..2]).join(&h[2..4]);
+        std::fs::create_dir_all(sharded(&hex_of(0))).unwrap();
+        std::fs::write(
+            sharded(&hex_of(0)).join(format!("{}.bin", hex_of(0))),
+            blob(4, 0).0,
+        )
+        .unwrap();
+        std::fs::write(
+            aside.path().join(format!("{}.bin", hex_of(1))),
+            blob(4, 1).0,
+        )
+        .unwrap();
+        std::fs::write(aside.path().join(format!("{}.bin", hex_of(3))), b"bit rot").unwrap();
+        let mut longer = blob(4, 4).0;
+        longer.push(0);
+        std::fs::write(aside.path().join(format!("{}.bin", hex_of(4))), longer).unwrap();
+        let local = LocalSources::open(&[aside.path().to_path_buf()], &SourceMode::ReadOnly);
+        assert_eq!(local.len(), 1);
+
+        let s = run_with_local(&rig, &env, &[4], Cursor::default(), &fast_cfg(), local).await;
+        assert_eq!(s.candidates, 5);
+        assert_eq!((s.local_hit, s.local_miss, s.local_bad), (2, 1, 2), "{s:?}");
+        assert_eq!(
+            s.fetched, 3,
+            "the miss and the two bad copies came from the peer"
+        );
+        assert_eq!(
+            s.local_bytes,
+            (blob(4, 0).0.len() + blob(4, 1).0.len()) as u64
+        );
+        assert_eq!(rig.metrics.local_hit.load(Ordering::Relaxed), 2);
+        assert_eq!(rig.metrics.pending.load(Ordering::Relaxed), 0);
+        let dialled: HashSet<String> = env
+            .fetches
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, h)| h.clone())
+            .collect();
+        assert_eq!(
+            dialled,
+            HashSet::from([hex_of(2), hex_of(3), hex_of(4)]),
+            "local hits never reach the network"
+        );
+        for i in 0..5 {
+            let (data, hash) = blob(4, i);
+            assert_eq!(rig.store.read(&hex::encode(hash)).await.unwrap(), data);
+            assert!(
+                env.live.lock().unwrap().contains(&hex::encode(hash)),
+                "inventory row"
+            );
+        }
+        assert!(
+            !aside.path().join("trash").exists() && !aside.path().join(".tmp").exists(),
+            "the set-aside root is read-only"
+        );
+    }
+
+    fn pg_of_path(rel_path: &str) -> Option<u32> {
+        rel_path
+            .rsplit('/')
+            .next()?
+            .strip_suffix(".list")?
+            .parse()
+            .ok()
+    }
+
+    /// A bucket mirror that delays each PG list by `delay_ms(pg)` and
+    /// counts the list fetches in flight.
+    struct SlowSource {
+        inner: DirListSource,
+        delay_ms: fn(u32) -> u64,
+        in_flight: AtomicU64,
+        max_in_flight: AtomicU64,
+    }
+
+    impl SlowSource {
+        fn new(root: &std::path::Path, delay_ms: fn(u32) -> u64) -> Self {
+            Self {
+                inner: DirListSource::new(root),
+                delay_ms,
+                in_flight: AtomicU64::new(0),
+                max_in_flight: AtomicU64::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ListSource for SlowSource {
+        async fn fetch(&self, rel_path: &str, max_len: u64) -> Result<bytes::Bytes> {
+            let Some(pg) = pg_of_path(rel_path) else {
+                return self.inner.fetch(rel_path, max_len).await;
+            };
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis((self.delay_ms)(pg))).await;
+            let out = self.inner.fetch(rel_path, max_len).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            out
+        }
+    }
+
+    /// Several lists in flight, later PGs answering first, a pending cap
+    /// cutting PGs and uncovered PGs on the way: every pass ends exactly
+    /// as the sequential walk's (candidates, fetched, scanned, uncovered,
+    /// truncated, cursor), down to the end of the walk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_discovery_keeps_the_sequential_cursor() {
+        // PG 5 and 13 are owned but not listed.
+        let pgs: Vec<(u32, u32)> = (1..=12)
+            .filter(|pg| *pg != 5)
+            .map(|pg| (pg, 1 + pg % 3))
+            .collect();
+        let owned: Vec<u32> = (1..=13).collect();
+        let mut runs = Vec::new();
+        for concurrency in [1usize, 8] {
+            let rig = rig(&pgs).await;
+            let env = Arc::new(FakeEnv::new(
+                vec![peer(11)],
+                HashMap::from([(11, Serve::Honest)]),
+                &pgs,
+            ));
+            let source = SlowSource::new(rig._bucket.path(), |pg| u64::from(20 - pg.min(20)) * 3);
+            let mut cfg = fast_cfg();
+            cfg.max_pending = 4;
+            cfg.discovery_concurrency = concurrency;
+            let mut cursor = Cursor::default();
+            let mut passes = Vec::new();
+            loop {
+                let s = run_on(&rig, &env, &source, &owned, cursor, &cfg).await;
+                assert_eq!(s.list_errors, 0);
+                assert_eq!(rig.metrics.pending.load(Ordering::Relaxed), 0);
+                passes.push((
+                    s.candidates,
+                    s.fetched,
+                    s.scanned_pgs,
+                    s.uncovered_pgs,
+                    s.truncated,
+                    s.walk_complete,
+                    s.next_cursor,
+                ));
+                cursor = s.next_cursor;
+                if s.walk_complete {
+                    break;
+                }
+                assert!(passes.len() < 50, "the walk ends");
+            }
+            for &(pg, count) in &pgs {
+                for i in 0..count {
+                    let (data, hash) = blob(pg, i);
+                    assert_eq!(rig.store.read(&hex::encode(hash)).await.unwrap(), data);
+                }
+            }
+            let again = run_on(&rig, &env, &source, &owned, cursor, &cfg).await;
+            assert_eq!((again.candidates, again.walk_complete), (0, true));
+            runs.push((passes, source.max_in_flight.load(Ordering::SeqCst)));
+        }
+        assert_eq!(runs[0].0, runs[1].0, "same passes whatever the concurrency");
+        assert!(runs[0].0.len() > 3, "the cap cut the walk: {:?}", runs[0].0);
+        assert_eq!(runs[0].1, 1, "one list at a time");
+        assert!(runs[1].1 > 1, "several lists in flight");
+    }
+
+    /// An epoch move while later lists are already scanned: the walk
+    /// stops at the first PG not consumed, the candidates consumed are
+    /// fetched, nothing of the PGs scanned ahead is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn epoch_move_with_lists_scanned_ahead_keeps_the_cursor() {
+        let pgs: Vec<(u32, u32)> = (1..=8).map(|pg| (pg, 2)).collect();
+        let owned: Vec<u32> = (1..=8).collect();
+        let rig = rig(&pgs).await;
+        let env = Arc::new(FakeEnv::new(
+            vec![peer(1)],
+            HashMap::from([(1, Serve::Honest)]),
+            &pgs,
+        ));
+        // Checks before pg 1 and pg 2 pass, the one before pg 3 bumps.
+        *env.bump_epoch_after_calls.lock().unwrap() = Some(2);
+        let source = SlowSource::new(rig._bucket.path(), |pg| if pg <= 2 { 100 } else { 0 });
+        let mut cfg = fast_cfg();
+        cfg.discovery_concurrency = 8;
+        let s = run_on(&rig, &env, &source, &owned, Cursor::default(), &cfg).await;
+        assert!(s.epoch_changed);
+        assert_eq!((s.scanned_pgs, s.candidates, s.fetched), (2, 4, 4), "{s:?}");
+        assert_eq!(s.next_cursor.next_pg, 3);
+        assert!(!s.walk_complete);
+        assert!(source.max_in_flight.load(Ordering::SeqCst) > 2);
+        for pg in 3..=8 {
+            for i in 0..2 {
+                assert!(!rig.store.has(&hex::encode(blob(pg, i).1)), "pg {pg}");
+            }
+        }
+    }
+
+    /// A bucket mirror whose list of `gate_pg` is only served once the
+    /// blob `wait_for` is in the inventory: a pass that fetched only after
+    /// discovery would time out on it.
+    struct GatedSource {
+        inner: DirListSource,
+        env: Arc<FakeEnv>,
+        gate_pg: u32,
+        wait_for: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ListSource for GatedSource {
+        async fn fetch(&self, rel_path: &str, max_len: u64) -> Result<bytes::Bytes> {
+            if pg_of_path(rel_path) == Some(self.gate_pg) {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while !self.env.live.lock().unwrap().contains(&self.wait_for) {
+                    anyhow::ensure!(
+                        tokio::time::Instant::now() < deadline,
+                        "gate: {} never stored",
+                        self.wait_for
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+            self.inner.fetch(rel_path, max_len).await
+        }
+    }
+
+    /// The candidates of a consumed PG are fetched while discovery goes
+    /// on (pipeline), for the peer path and through the local stage.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fetch_starts_while_discovery_continues() {
+        let pgs = [(1u32, 1u32), (2, 1)];
+        for with_local in [false, true] {
+            let rig = rig(&pgs).await;
+            let env = Arc::new(FakeEnv::new(
+                vec![peer(1)],
+                HashMap::from([(1, Serve::Honest)]),
+                &pgs,
+            ));
+            let source = GatedSource {
+                inner: DirListSource::new(rig._bucket.path()),
+                env: Arc::clone(&env),
+                gate_pg: 2,
+                wait_for: hex::encode(blob(1, 0).1),
+            };
+            let mut cfg = fast_cfg();
+            cfg.discovery_concurrency = 1;
+            let aside = tempfile::tempdir().unwrap();
+            let local = if with_local {
+                // Present nowhere locally: the miss goes on to the peers.
+                LocalSources::open(&[aside.path().to_path_buf()], &SourceMode::ReadOnly)
+            } else {
+                LocalSources::default()
+            };
+            let s = run_full(&rig, &env, &source, &[1, 2], Cursor::default(), &cfg, local).await;
+            assert_eq!(
+                s.list_errors, 0,
+                "pg 1 was stored before pg 2's list: {s:?}"
+            );
+            assert_eq!((s.candidates, s.fetched), (2, 2));
+            assert_eq!(s.local_miss, if with_local { 2 } else { 0 });
+            assert!(s.walk_complete);
+        }
+    }
+
+    /// A failed inventory lookup skips that PG only (a list error, none of
+    /// its blobs a candidate); one batched lookup per list.
+    #[tokio::test]
+    async fn inventory_error_skips_only_its_pg() {
+        let pgs = [(1u32, 2u32), (2, 2), (3, 2)];
+        let rig = rig(&pgs).await;
+        let env = Arc::new(FakeEnv::new(
+            vec![peer(1)],
+            HashMap::from([(1, Serve::Honest)]),
+            &pgs,
+        ));
+        *env.fail_lookup_of.lock().unwrap() = Some(blob(2, 0).1);
+        let s = run(&rig, &env, &[1, 2, 3], Cursor::default(), &fast_cfg()).await;
+        assert_eq!((s.list_errors, s.scanned_pgs), (1, 2));
+        assert_eq!((s.candidates, s.fetched), (4, 4));
+        assert!(s.walk_complete);
+        assert_eq!(env.lookup_calls.load(Ordering::Relaxed), 3, "one per list");
+        for i in 0..2 {
+            assert!(!rig.store.has(&hex::encode(blob(2, i).1)));
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Micro-benchmark
+    // ------------------------------------------------------------------
+
+    /// The live miner's discovery against a real SQLite inventory file:
+    /// read-only connections of `crate::inventory`, optional simulated
+    /// per-lookup latency (a cold disk), fetches recorded and refused.
+    struct BenchEnv {
+        path: std::path::PathBuf,
+        readers: Mutex<Vec<rusqlite::Connection>>,
+        latency: Duration,
+        fetched: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PassEnv for BenchEnv {
+        fn live_among(&self, hashes: &[[u8; 32]]) -> Result<Vec<bool>> {
+            let popped = self.readers.lock().unwrap().pop();
+            let conn = match popped {
+                Some(c) => c,
+                None => crate::inventory::open_reader(&self.path)?,
+            };
+            if !self.latency.is_zero() {
+                std::thread::sleep(self.latency * hashes.len() as u32);
+            }
+            let out = crate::inventory::live_among_on(&conn, hashes);
+            self.readers.lock().unwrap().push(conn);
+            out
+        }
+        async fn holders(&self, _pg_id: u32, _listed: &[u32], _max: usize) -> Vec<Peer> {
+            vec![peer(1)]
+        }
+        fn my_uid(&self) -> u32 {
+            MY_UID
+        }
+        async fn fetch(&self, _peer: &Peer, hash_hex: &str) -> Result<Vec<u8>, FetchError> {
+            self.fetched.lock().unwrap().push(hash_hex.to_string());
+            Err(FetchError::NotFound)
+        }
+        async fn lock_write(&self, hash_hex: &str) -> state::HashWriteLock {
+            state::lock_hash_write(hash_hex).await
+        }
+        fn record_stored(&self, _hash_hex: &str) -> Result<()> {
+            Ok(())
+        }
+        fn free_bytes(&self) -> u64 {
+            u64::MAX
+        }
+        fn purge_active(&self) -> bool {
+            false
+        }
+        async fn current_epoch(&self) -> u64 {
+            5
+        }
+    }
+
+    fn bench_hash(pg: u32, i: u32) -> [u8; 32] {
+        let mut seed = [0u8; 8];
+        seed[..4].copy_from_slice(&pg.to_le_bytes());
+        seed[4..].copy_from_slice(&i.to_le_bytes());
+        *blake3::hash(&seed).as_bytes()
+    }
+
+    /// The former discovery, kept here as the benchmark baseline: one
+    /// list at a time decoded on the async worker, a holders `Vec` per
+    /// blob, one inventory point query per own blob through the shared
+    /// connection lock (`inventory::with_db`: `block_in_place`, mutex,
+    /// prepared statement).
+    async fn legacy_discovery(
+        source: &dyn ListSource,
+        manifest: &Manifest,
+        owned: &[u32],
+        conn: &Mutex<rusqlite::Connection>,
+        latency: Duration,
+    ) -> (u64, Vec<String>) {
+        fn decide(
+            conn: &Mutex<rusqlite::Connection>,
+            latency: Duration,
+            hash: [u8; 32],
+            holders: Vec<u32>,
+            missing: &mut Vec<String>,
+        ) {
+            if !holders.contains(&MY_UID) {
+                return;
+            }
+            let hex = hex::encode(hash);
+            let live = crate::helpers::blocking(|| {
+                let c = conn.lock().unwrap();
+                if !latency.is_zero() {
+                    std::thread::sleep(latency);
+                }
+                let mut stmt = c
+                    .prepare_cached(
+                        "SELECT stored_at FROM shards WHERE hash = ?1 AND trashed_at IS NULL",
+                    )
+                    .unwrap();
+                let mut rows = stmt.query(rusqlite::params![hex]).unwrap();
+                rows.next().unwrap().is_some()
+            });
+            if !live {
+                missing.push(hex);
+            }
+        }
+        let mut records = 0u64;
+        let mut missing = Vec::new();
+        for &pg_id in owned {
+            let obj = manifest.object_for_pg(pg_id).unwrap();
+            let path = format!("gen/{}/{}", manifest.generation, Manifest::list_path(pg_id));
+            let bytes = pg_lists::fetch_sized(source, &path, obj.size)
+                .await
+                .unwrap();
+            let expect = ListExpectation {
+                pg_id,
+                generation: manifest.generation,
+                ec_k: manifest.ec_k,
+                ec_m: manifest.ec_m,
+                sha256_hex: &obj.sha256,
+            };
+            let mut group: Option<([u8; 32], Vec<u32>)> = None;
+            let header =
+                pg_lists::decode_list(&bytes, expect, &mut |record| match group.as_mut() {
+                    Some((h, holders)) if *h == record.blob_hash => holders.push(record.holder_uid),
+                    _ => {
+                        if let Some((h, holders)) =
+                            group.replace((record.blob_hash, vec![record.holder_uid]))
+                        {
+                            decide(conn, latency, h, holders, &mut missing);
+                        }
+                    }
+                })
+                .unwrap();
+            if let Some((h, holders)) = group.take() {
+                decide(conn, latency, h, holders, &mut missing);
+            }
+            records += u64::from(header.count);
+        }
+        (records, missing)
+    }
+
+    /// Discovery throughput, former path vs this one, on lists of 250 000
+    /// records (2 % this miner's, half of those in an inventory of 1 M
+    /// other rows), with and without a simulated per-lookup disk latency.
+    /// Run: `cargo test -p miner --release -- --ignored --nocapture
+    /// discovery_benchmark`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "micro-benchmark, run on demand"]
+    async fn discovery_benchmark() {
+        const PGS: u32 = 8;
+        const RECORDS: u32 = 250_000;
+        const OWN_EVERY: u32 = 50;
+        const FILLER_ROWS: u32 = 1_000_000;
+        let pgs: Vec<(u32, u32)> = (1..=PGS).map(|pg| (pg, RECORDS)).collect();
+        let owned: Vec<u32> = (1..=PGS).collect();
+        let bucket = tempfile::tempdir().unwrap();
+        let validator_hex = write_generation_records(bucket.path(), &pgs, &|pg, count| {
+            (0..count)
+                .map(|i| Record {
+                    blob_hash: bench_hash(pg, i),
+                    shard_length: 1000,
+                    holder_uid: if i % OWN_EVERY == 0 {
+                        MY_UID
+                    } else {
+                        10_000 + i % 29
+                    },
+                })
+                .collect()
+        });
+        let source = DirListSource::new(bucket.path());
+        let manifest = fetch_manifest(&source, GENERATION, &validator_hex)
+            .await
+            .unwrap();
+
+        // Inventory: the miner's schema, filler rows, half of the own
+        // blobs live.
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("inventory.db");
+        let writer = rusqlite::Connection::open(&db_path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
+                 CREATE TABLE shards (hash TEXT PRIMARY KEY, stored_at INTEGER NOT NULL,
+                   trashed_at INTEGER);
+                 CREATE INDEX idx_stored_at ON shards(stored_at);
+                 CREATE INDEX idx_trashed_at ON shards(trashed_at) WHERE trashed_at IS NOT NULL;",
+            )
+            .unwrap();
+        {
+            let tx = writer.unchecked_transaction().unwrap();
+            let mut ins = tx
+                .prepare("INSERT INTO shards (hash, stored_at) VALUES (?1, 1)")
+                .unwrap();
+            for i in 0..FILLER_ROWS {
+                ins.execute([hex::encode(blake3::hash(&i.to_be_bytes()).as_bytes())])
+                    .unwrap();
+            }
+            for pg in 1..=PGS {
+                for i in (0..RECORDS).step_by((OWN_EVERY * 2) as usize) {
+                    ins.execute([hex::encode(bench_hash(pg, i))]).unwrap();
+                }
+            }
+            drop(ins);
+            tx.commit().unwrap();
+        }
+        let shared = Mutex::new(writer);
+        let mut expected: Vec<String> = (1..=PGS)
+            .flat_map(|pg| {
+                (OWN_EVERY..RECORDS)
+                    .step_by((OWN_EVERY * 2) as usize)
+                    .map(move |i| hex::encode(bench_hash(pg, i)))
+            })
+            .collect();
+        expected.sort_unstable();
+        let total_records = u64::from(PGS * RECORDS);
+
+        let mut lines = Vec::new();
+        for latency_us in [0u64, 200] {
+            let latency = Duration::from_micros(latency_us);
+            let t = std::time::Instant::now();
+            let (records, mut legacy) =
+                legacy_discovery(&source, &manifest, &owned, &shared, latency).await;
+            let legacy_secs = t.elapsed().as_secs_f64();
+            assert_eq!(records, total_records);
+            legacy.sort_unstable();
+            assert_eq!(legacy, expected, "baseline finds the absent own blobs");
+            lines.push(format!(
+                "latency {latency_us:>3} us | former   : {legacy_secs:7.3} s, {:>10.0} records/s, {:6.2} PGs/s",
+                records as f64 / legacy_secs,
+                f64::from(PGS) / legacy_secs
+            ));
+            for concurrency in [1usize, 8] {
+                let env = Arc::new(BenchEnv {
+                    path: db_path.clone(),
+                    readers: Mutex::new(Vec::new()),
+                    latency,
+                    fetched: Mutex::new(Vec::new()),
+                });
+                let store_dir = tempfile::tempdir().unwrap();
+                let store = Arc::new(FlatBlobStore::new(store_dir.path()).unwrap());
+                let mut cfg = fast_cfg();
+                cfg.max_pending = 1_000_000;
+                cfg.max_concurrent = 64;
+                cfg.peers_per_blob = 1;
+                cfg.discovery_concurrency = concurrency;
+                let s = run_pass(
+                    store as Arc<dyn BlobStore>,
+                    Arc::clone(&env) as Arc<dyn PassEnv>,
+                    Arc::new(LocalSources::default()),
+                    &source,
+                    &manifest,
+                    &owned,
+                    Cursor::default(),
+                    &cfg,
+                    5,
+                    fresh_metrics(),
+                )
+                .await;
+                assert_eq!(s.records, total_records);
+                assert_eq!(s.candidates, expected.len() as u64);
+                let mut fetched = env.fetched.lock().unwrap().clone();
+                fetched.sort_unstable();
+                assert_eq!(fetched, expected, "same candidates as the baseline");
+                let secs = s.discovery_ms.max(1) as f64 / 1000.0;
+                lines.push(format!(
+                    "latency {latency_us:>3} us | new (c={concurrency}): {secs:7.3} s, {:>10.0} records/s, {:6.2} PGs/s, x{:.1}",
+                    s.records as f64 / secs,
+                    f64::from(PGS) / secs,
+                    legacy_secs / secs
+                ));
+            }
+        }
+        println!(
+            "discovery benchmark: {PGS} lists x {RECORDS} records, 1/{OWN_EVERY} own, {} absent, inventory {} rows",
+            expected.len(),
+            FILLER_ROWS + PGS * RECORDS / (OWN_EVERY * 2)
+        );
+        for line in lines {
+            println!("{line}");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // BACKFILL_LOCAL_SOURCE_DELETE (move semantics)
+    // ------------------------------------------------------------------
+
+    /// A set-aside root plus a durable (packed) live store for the move
+    /// tests.
+    struct MoveRig {
+        aside: tempfile::TempDir,
+        live_dir: tempfile::TempDir,
+        live: Arc<crate::packed_store::PackedStore>,
+    }
+
+    fn move_rig() -> MoveRig {
+        let aside = tempfile::tempdir().unwrap();
+        let live_dir = tempfile::tempdir().unwrap();
+        let live = crate::packed_store::PackedStore::open(live_dir.path().join("packed")).unwrap();
+        MoveRig {
+            aside,
+            live_dir,
+            live,
+        }
+    }
+
+    impl MoveRig {
+        fn sharded_path(&self, hash: &[u8; 32]) -> std::path::PathBuf {
+            let h = hex::encode(hash);
+            self.aside
+                .path()
+                .join(&h[0..2])
+                .join(&h[2..4])
+                .join(format!("{h}.bin"))
+        }
+        fn legacy_path(&self, hash: &[u8; 32]) -> std::path::PathBuf {
+            self.aside.path().join(format!("{}.bin", hex::encode(hash)))
+        }
+        fn put_sharded(&self, hash: &[u8; 32], data: &[u8]) -> std::path::PathBuf {
+            let path = self.sharded_path(hash);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, data).unwrap();
+            path
+        }
+        fn put_legacy(&self, hash: &[u8; 32], data: &[u8]) -> std::path::PathBuf {
+            let path = self.legacy_path(hash);
+            std::fs::write(&path, data).unwrap();
+            path
+        }
+        fn mode(&self) -> SourceMode {
+            SourceMode::Move {
+                live_root: self.live_dir.path().to_path_buf(),
+            }
+        }
+        fn sources(&self, mode: &SourceMode) -> LocalSources {
+            LocalSources::open(&[self.aside.path().to_path_buf()], mode)
+        }
+    }
+
+    async fn run_live(
+        rig: &Rig,
+        live: Arc<dyn BlobStore>,
+        env: &Arc<FakeEnv>,
+        owned: &[u32],
+        local: LocalSources,
+    ) -> PassSummary {
+        let env_dyn: Arc<dyn PassEnv> = Arc::clone(env) as Arc<dyn PassEnv>;
+        run_pass(
+            live,
+            env_dyn,
+            Arc::new(local),
+            &rig.source,
+            &rig.manifest,
+            owned,
+            Cursor::default(),
+            &fast_cfg(),
+            5,
+            rig.metrics,
+        )
+        .await
+    }
+
+    /// Move mode: each verified local copy (sharded and legacy layouts) is
+    /// unlinked once the durable live store holds it and its inventory row
+    /// is written; the shard directories stay; the live copies read back.
+    #[tokio::test]
+    async fn local_move_removes_the_source_after_store_and_inventory() {
+        let pgs = [(4u32, 2u32)];
+        let rig = rig(&pgs).await;
+        let env = Arc::new(FakeEnv::new(vec![peer(1)], HashMap::new(), &pgs));
+        let m = move_rig();
+        let sharded = m.put_sharded(&blob(4, 0).1, &blob(4, 0).0);
+        let legacy = m.put_legacy(&blob(4, 1).1, &blob(4, 1).0);
+        let local = m.sources(&m.mode());
+        assert_eq!(local.removable_roots(), 1);
+
+        let s = run_live(&rig, m.live.clone(), &env, &[4], local).await;
+        assert_eq!(
+            (s.local_hit, s.local_deleted, s.local_delete_errors),
+            (2, 2, 0),
+            "{s:?}"
+        );
+        assert_eq!(rig.metrics.local_deleted.load(Ordering::Relaxed), 2);
+        assert!(!sharded.exists() && !legacy.exists(), "sources unlinked");
+        assert!(
+            sharded.parent().unwrap().is_dir(),
+            "directories are left alone"
+        );
+        for i in 0..2 {
+            let (data, hash) = blob(4, i);
+            assert_eq!(m.live.read(&hex::encode(hash)).await.unwrap(), data);
+            assert!(env.live.lock().unwrap().contains(&hex::encode(hash)));
+        }
+        assert!(env.fetches.lock().unwrap().is_empty(), "no peer dialled");
+    }
+
+    /// Flag off (read-only mode): the copy lands in the live store and
+    /// the source file stays.
+    #[tokio::test]
+    async fn local_move_off_keeps_the_source() {
+        let pgs = [(4u32, 1u32)];
+        let rig = rig(&pgs).await;
+        let env = Arc::new(FakeEnv::new(vec![peer(1)], HashMap::new(), &pgs));
+        let m = move_rig();
+        let src = m.put_sharded(&blob(4, 0).1, &blob(4, 0).0);
+        let local = m.sources(&SourceMode::ReadOnly);
+        assert_eq!(local.removable_roots(), 0);
+
+        let s = run_live(&rig, m.live.clone(), &env, &[4], local).await;
+        assert_eq!(
+            (s.local_hit, s.local_deleted, s.local_delete_errors),
+            (1, 0, 0)
+        );
+        assert!(m.live.has(&hex::encode(blob(4, 0).1)));
+        assert_eq!(std::fs::read(&src).unwrap(), blob(4, 0).0, "source kept");
+    }
+
+    /// Copies that fail verification (wrong bytes, longer than listed)
+    /// are never removed, even in move mode; the peers serve them.
+    #[tokio::test]
+    async fn local_move_never_removes_a_bad_copy() {
+        let pgs = [(4u32, 2u32)];
+        let rig = rig(&pgs).await;
+        let env = Arc::new(FakeEnv::new(
+            vec![peer(1)],
+            HashMap::from([(1, Serve::Honest)]),
+            &pgs,
+        ));
+        let m = move_rig();
+        let rotten = m.put_sharded(&blob(4, 0).1, b"bit rot");
+        let mut longer_bytes = blob(4, 1).0;
+        longer_bytes.push(0);
+        let longer = m.put_legacy(&blob(4, 1).1, &longer_bytes);
+
+        let s = run_live(&rig, m.live.clone(), &env, &[4], m.sources(&m.mode())).await;
+        assert_eq!((s.local_bad, s.fetched), (2, 2), "{s:?}");
+        assert_eq!((s.local_deleted, s.local_delete_errors), (0, 0));
+        assert_eq!(std::fs::read(&rotten).unwrap(), b"bit rot");
+        assert_eq!(std::fs::read(&longer).unwrap(), longer_bytes);
+    }
+
+    /// The live store already holds the blob: the local duplicate is
+    /// removed only when the live store has it with a live inventory row
+    /// and the live copy reads back and verifies; without the row the
+    /// source is kept (counted).
+    #[tokio::test]
+    async fn local_move_removes_a_duplicate_only_when_the_live_store_has_it() {
+        let pgs = [(4u32, 2u32)];
+        let rig = rig(&pgs).await;
+        let env = Arc::new(FakeEnv::new(vec![peer(1)], HashMap::new(), &pgs));
+        let m = move_rig();
+        let (good, good_h) = blob(4, 0);
+        let (other, other_h) = blob(4, 1);
+        // Both in the live store; only blob 0 has its live inventory row
+        // (blob 1 stands for a copy the inventory does not know). Driven
+        // through `local_one` directly: discovery would not emit blob 0.
+        m.live.store(&hex::encode(good_h), &good).await.unwrap();
+        m.live.store(&hex::encode(other_h), &other).await.unwrap();
+        let dup = m.put_sharded(&good_h, &good);
+        let kept = m.put_legacy(&other_h, &other);
+        let local = m.sources(&m.mode());
+        let blob0 = Candidate {
+            pg_id: 4,
+            hash: good_h,
+            shard_length: good.len() as u64,
+            listed_holders: Vec::new(),
+        };
+        let blob1 = Candidate {
+            pg_id: 4,
+            hash: other_h,
+            shard_length: other.len() as u64,
+            listed_holders: Vec::new(),
+        };
+        env.record_stored(&hex::encode(good_h)).unwrap();
+
+        let a = local_one(m.live.as_ref(), env.as_ref(), &local, blob0, rig.metrics).await;
+        assert!(a.unresolved.is_none());
+        assert_eq!(
+            (
+                a.outcome.already_present,
+                a.outcome.local_deleted,
+                a.outcome.local_delete_errors
+            ),
+            (1, 1, 0)
+        );
+        assert!(
+            !dup.exists(),
+            "duplicate of a recorded, verified live copy removed"
+        );
+
+        let b = local_one(m.live.as_ref(), env.as_ref(), &local, blob1, rig.metrics).await;
+        assert_eq!(
+            (
+                b.outcome.already_present,
+                b.outcome.local_deleted,
+                b.outcome.local_delete_errors
+            ),
+            (1, 0, 1)
+        );
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            other,
+            "no live inventory row: source kept"
+        );
+    }
+
+    /// A live store whose answers may come from unsynced flat files or a
+    /// mover that re-trashes (the migrating store) is not durable: no move.
+    #[tokio::test]
+    async fn local_move_is_off_on_a_migrating_store() {
+        let m = move_rig();
+        let flat = Arc::new(FlatBlobStore::new(m.live_dir.path()).unwrap());
+        let migrating = crate::migrating_store::MigratingStore {
+            flat,
+            packed: m.live.clone(),
+        };
+        let mut cfg = fast_cfg();
+        cfg.local_source_delete = true;
+        assert!(m.live.store_is_durable());
+        assert!(!migrating.store_is_durable());
+        assert_eq!(
+            source_mode(&cfg, &migrating, m.live_dir.path()),
+            SourceMode::ReadOnly
+        );
+    }
+
+    /// A failed unlink (here the source is a symlink, which the move
+    /// refuses to touch) and a failed inventory insert are counted, keep
+    /// the source, and do not stop the pass.
+    #[tokio::test]
+    async fn local_move_errors_are_counted_and_do_not_fail_the_pass() {
+        let pgs = [(4u32, 3u32)];
+        let rig = rig(&pgs).await;
+        let env = Arc::new(FakeEnv::new(vec![peer(1)], HashMap::new(), &pgs));
+        let m = move_rig();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("target.bin");
+        std::fs::write(&target, blob(4, 0).0).unwrap();
+        let link = m.sharded_path(&blob(4, 0).1);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let fine = m.put_sharded(&blob(4, 1).1, &blob(4, 1).0);
+
+        let s = run_live(&rig, m.live.clone(), &env, &[4], m.sources(&m.mode())).await;
+        assert_eq!(s.local_hit, 2);
+        assert_eq!((s.local_deleted, s.local_delete_errors), (1, 1), "{s:?}");
+        assert_eq!(rig.metrics.local_delete_errors.load(Ordering::Relaxed), 1);
+        assert!(
+            link.symlink_metadata().is_ok() && target.exists(),
+            "symlink and target kept"
+        );
+        assert!(!fine.exists());
+        assert_eq!(s.local_miss, 1, "the pass went on to the third blob");
+
+        // Inventory insert failure: stored, but the source is kept.
+        let rig2 = rig_held(&[(5u32, 1u32)], &|_, _| MY_UID).await;
+        let env2 = Arc::new(FakeEnv::new(vec![peer(1)], HashMap::new(), &[(5, 1)]));
+        env2.fail_record.store(true, Ordering::Relaxed);
+        let src = m.put_sharded(&blob(5, 0).1, &blob(5, 0).0);
+        let s2 = run_live(&rig2, m.live.clone(), &env2, &[5], m.sources(&m.mode())).await;
+        assert_eq!(
+            (s2.local_hit, s2.local_deleted, s2.local_delete_errors),
+            (1, 0, 1),
+            "{s2:?}"
+        );
+        assert!(m.live.has(&hex::encode(blob(5, 0).1)));
+        assert!(src.exists(), "no inventory row: source kept");
+    }
+
+    /// The flag is honoured only on a durable live store.
+    #[tokio::test]
+    async fn local_move_requires_a_durable_live_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let flat = FlatBlobStore::new(dir.path()).unwrap();
+        let mut cfg = fast_cfg();
+        assert_eq!(source_mode(&cfg, &flat, dir.path()), SourceMode::ReadOnly);
+        cfg.local_source_delete = true;
+        assert_eq!(
+            source_mode(&cfg, &flat, dir.path()),
+            SourceMode::ReadOnly,
+            "flat store: no sync before the ACK"
+        );
+        let packed = crate::packed_store::PackedStore::open(dir.path().join("packed")).unwrap();
+        assert_eq!(
+            source_mode(&cfg, packed.as_ref(), dir.path()),
+            SourceMode::Move {
+                live_root: dir.path().to_path_buf()
+            }
+        );
     }
 }

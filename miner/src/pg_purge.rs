@@ -20,8 +20,10 @@
 //! inventory in hash order (`inventory::live_shards_page`), which also
 //! carries the age of each blob.
 //!
-//! On by default as a census (`PURGE_ENABLED=true`, `PURGE_DRY_RUN=true`):
-//! nothing is deleted unless the operator sets `PURGE_DRY_RUN=false`.
+//! On by default and, since 0.1.36, deleting by default (`PURGE_ENABLED=true`,
+//! `PURGE_DRY_RUN=false`) in a `purge-enforce` build, behind every gate
+//! (age, ownership window, coverage, view freshness, two-phase trash).
+//! `PURGE_DRY_RUN=true` keeps the census: nothing is deleted.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -3202,6 +3204,8 @@ mod tests {
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         PurgeConfig {
             lists_cache_dir: Some(root.path().join(format!("cfg-{n}"))),
+            // Fixtures that want deletions ask for them explicitly.
+            mode: Mode::Census,
             ..PurgeConfig::default()
         }
     }

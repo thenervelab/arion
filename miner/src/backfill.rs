@@ -16,11 +16,12 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 
+use crate::flat_store::{FileId, FlatBlobStore};
 use crate::purge::lookup_bool;
 
 /// Backfill knobs, all environment-driven (`BACKFILL_*`). The generation
@@ -49,6 +50,26 @@ pub struct BackfillConfig {
     /// `BACKFILL_PAUSE_POLL_SECS` (default 30): re-check cadence while
     /// paused (purge pass running, low free space).
     pub pause_poll_secs: u64,
+    /// `BACKFILL_LOCAL_SOURCE_DIRS` (default none): comma-separated
+    /// absolute paths of flat store roots set aside on this node (an
+    /// operator who resets a node to the packed store can import the
+    /// shards it still holds from the set-aside directory). Each candidate
+    /// is looked up there by direct path before any peer is asked.
+    pub local_source_dirs: Vec<PathBuf>,
+    /// `BACKFILL_LOCAL_SOURCE_DELETE` (default false, strict boolean):
+    /// move instead of copy. A source file is unlinked once its bytes are
+    /// durably in the live store, readable there and recorded in the
+    /// inventory (or were already held by the live store), so the import
+    /// does not double the disk usage. Honoured only on a live store whose
+    /// `store` is durable ([`crate::store::BlobStore::store_is_durable`]).
+    pub local_source_delete: bool,
+    /// `BACKFILL_LOCAL_CONCURRENCY` (default 64, 1..256): local lookups in
+    /// flight. Disk-bound, not charged to the network byte budget.
+    pub local_concurrency: usize,
+    /// `BACKFILL_DISCOVERY_CONCURRENCY` (default 8, 1..64): PG lists
+    /// fetched, decoded and looked up in the inventory at once during
+    /// discovery. Results are still consumed in PG order (cursor).
+    pub discovery_concurrency: usize,
 }
 
 impl Default for BackfillConfig {
@@ -62,6 +83,10 @@ impl Default for BackfillConfig {
             min_free_bytes: 50 << 30,
             peers_per_blob: 3,
             pause_poll_secs: 30,
+            local_source_dirs: Vec::new(),
+            local_source_delete: false,
+            local_concurrency: 64,
+            discovery_concurrency: 8,
         }
     }
 }
@@ -95,6 +120,9 @@ impl BackfillConfig {
         if let Some(v) = lookup_bool(&lookup, "BACKFILL_ENABLED")? {
             cfg.enabled = v;
         }
+        if let Some(v) = lookup_bool(&lookup, "BACKFILL_LOCAL_SOURCE_DELETE")? {
+            cfg.local_source_delete = v;
+        }
         parse(&lookup, "BACKFILL_MAX_PENDING", &mut cfg.max_pending);
         parse(
             &lookup,
@@ -114,11 +142,331 @@ impl BackfillConfig {
             "BACKFILL_PAUSE_POLL_SECS",
             &mut cfg.pause_poll_secs,
         );
+        parse(
+            &lookup,
+            "BACKFILL_LOCAL_CONCURRENCY",
+            &mut cfg.local_concurrency,
+        );
+        parse(
+            &lookup,
+            "BACKFILL_DISCOVERY_CONCURRENCY",
+            &mut cfg.discovery_concurrency,
+        );
+        if let Some(raw) = lookup("BACKFILL_LOCAL_SOURCE_DIRS") {
+            cfg.local_source_dirs = parse_local_source_dirs(&raw);
+        }
+        cfg.local_concurrency = cfg.local_concurrency.clamp(1, 256);
+        cfg.discovery_concurrency = cfg.discovery_concurrency.clamp(1, 64);
         cfg.max_pending = cfg.max_pending.max(1);
         cfg.max_concurrent = cfg.max_concurrent.clamp(1, 64);
         cfg.peers_per_blob = cfg.peers_per_blob.max(1);
         cfg.pause_poll_secs = cfg.pause_poll_secs.max(1);
         Ok(cfg)
+    }
+}
+
+/// The absolute paths of a comma-separated list, in order, without
+/// duplicates; empty items are skipped and relative ones are refused
+/// (logged at warn): a relative path would resolve against the service's
+/// working directory, not the operator's intent.
+fn parse_local_source_dirs(raw: &str) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for item in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let path = PathBuf::from(item);
+        if !path.is_absolute() {
+            tracing::warn!(
+                path = item,
+                "backfill: BACKFILL_LOCAL_SOURCE_DIRS entry is not absolute, ignored"
+            );
+            continue;
+        }
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+// ============================================================================
+// Local sources
+// ============================================================================
+
+/// Set-aside flat store roots read before the peers. Lookups are direct
+/// path probes through [`FlatBlobStore::read_at_most_located`]: the
+/// sharded path `ab/cd/<hash>.bin`, then the legacy root path
+/// `<hash>.bin`; a directory is never listed (such roots hold millions of
+/// entries, often behind a FUSE union mount). Nothing is ever created or
+/// written in them. In [`SourceMode::ReadOnly`] nothing is removed either;
+/// in [`SourceMode::Move`] the exact file a verified copy was read from
+/// may be unlinked ([`remove_copy`](Self::remove_copy)), never a
+/// directory, never a path outside the root.
+#[derive(Debug, Default)]
+pub struct LocalSources {
+    roots: Vec<SourceRoot>,
+}
+
+#[derive(Debug)]
+struct SourceRoot {
+    store: FlatBlobStore,
+    /// The root's canonical path at open, when its files may be unlinked
+    /// after a move (`None`: read-only).
+    removable: Option<PathBuf>,
+}
+
+/// How the set-aside roots are opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceMode {
+    /// Copy: the roots are only read.
+    ReadOnly,
+    /// Move (`BACKFILL_LOCAL_SOURCE_DELETE=true` on a durable live store):
+    /// a source file may be unlinked once its blob is in the live store.
+    /// A root that overlaps `live_root` (the live store's directory: same,
+    /// inside or containing it) stays read-only, since its files may be
+    /// the live copies themselves.
+    Move { live_root: PathBuf },
+}
+
+/// Where a verified local copy was read: root index, exact path, and the
+/// identity of the file whose bytes were verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalCopy {
+    pub root: usize,
+    pub path: PathBuf,
+    pub file: FileId,
+}
+
+/// Result of one local lookup over every source root.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LocalLookup {
+    /// A copy that verifies (blake3, then the listed length), and where
+    /// it was read.
+    Hit { data: bytes::Bytes, copy: LocalCopy },
+    /// No source root has a file for the hash.
+    Miss,
+    /// Some root has a file for it, but none verifies or reads (wrong
+    /// hash, wrong length, I/O error); the reason of the last one.
+    Bad(String),
+}
+
+/// Outcome of [`LocalSources::remove_copy`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum RemoveOutcome {
+    /// The source file was unlinked.
+    Removed,
+    /// It was already gone (another candidate of the same hash moved it).
+    Gone,
+    /// Not removed: refused (read-only root, path not the blob's path in
+    /// that root, path resolving elsewhere, not the file that was read,
+    /// not a regular file) or the unlink failed.
+    Failed(String),
+}
+
+/// The canonical form of `root` if it overlaps neither way with
+/// `live_root` (equal, or one inside the other); `None` when they overlap
+/// or either cannot be canonicalized (the safe answer for a deletion
+/// guard).
+fn removable_root(root: &Path, live_root: &Path) -> Option<PathBuf> {
+    let root = std::fs::canonicalize(root).ok()?;
+    let live = std::fs::canonicalize(live_root).ok()?;
+    (!root.starts_with(&live) && !live.starts_with(&root)).then_some(root)
+}
+
+impl LocalSources {
+    /// The roots of `dirs` that are existing directories (one `stat`
+    /// each); the others are logged at warn and left out. Blocking
+    /// (`stat`, `canonicalize`): call it off the runtime workers.
+    pub fn open(dirs: &[PathBuf], mode: &SourceMode) -> Self {
+        let roots = dirs
+            .iter()
+            .filter_map(|dir| match FlatBlobStore::open_read_only(dir) {
+                Ok(store) => {
+                    let removable = match mode {
+                        SourceMode::ReadOnly => None,
+                        SourceMode::Move { live_root } => {
+                            let canonical = removable_root(dir, live_root);
+                            if canonical.is_none() {
+                                tracing::warn!(
+                                    path = %dir.display(),
+                                    live_root = %live_root.display(),
+                                    "backfill: local source overlaps the live store (or cannot be resolved), its files are never removed"
+                                );
+                            }
+                            canonical
+                        }
+                    };
+                    Some(SourceRoot { store, removable })
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        error = %e,
+                        "backfill: local source unusable, ignored"
+                    );
+                    None
+                }
+            })
+            .collect();
+        Self { roots }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.roots.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.roots.len()
+    }
+
+    /// Roots whose files may be unlinked after a move.
+    pub fn removable_roots(&self) -> usize {
+        self.roots.iter().filter(|r| r.removable.is_some()).count()
+    }
+
+    /// Whether a file read from `copy` may be unlinked (its root is in
+    /// move mode).
+    pub fn is_removable(&self, copy: &LocalCopy) -> bool {
+        self.roots
+            .get(copy.root)
+            .is_some_and(|r| r.removable.is_some())
+    }
+
+    /// Look `hash` up in every root, in order, reading at most
+    /// `shard_length` bytes (a longer file is refused before it is
+    /// buffered) and verifying with [`verify_payload`]. The first copy that
+    /// verifies wins; a bad copy in one root does not hide a good one in
+    /// the next.
+    pub async fn lookup(&self, hash: &[u8; 32], shard_length: u64) -> LocalLookup {
+        let hash_hex = hex::encode(hash);
+        let mut bad: Option<String> = None;
+        for (idx, root) in self.roots.iter().enumerate() {
+            let dir = root.store.data_dir();
+            match root
+                .store
+                .read_at_most_located(&hash_hex, shard_length)
+                .await
+            {
+                Ok((data, path, file)) => match verify_payload(&data, hash, shard_length) {
+                    Ok(()) => {
+                        return LocalLookup::Hit {
+                            data,
+                            copy: LocalCopy {
+                                root: idx,
+                                path,
+                                file,
+                            },
+                        };
+                    }
+                    Err(e) => bad = Some(format!("{}: {e}", dir.display())),
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => bad = Some(format!("{}: {e}", dir.display())),
+            }
+        }
+        match bad {
+            Some(reason) => LocalLookup::Bad(reason),
+            None => LocalLookup::Miss,
+        }
+    }
+
+    /// Unlink the source file a verified copy of `hash` was read from.
+    /// Refused unless all of these hold, checked in the blocking pool right
+    /// before the unlink:
+    /// - the copy's root is removable (move mode, no overlap with the live
+    ///   store) and still resolves to the canonical path it had at open
+    ///   (a root symlink retargeted since is refused);
+    /// - `copy.path` is exactly one of the two paths that root stores
+    ///   `hash` at, and its directory resolves to the root itself (legacy)
+    ///   or to the root's own `ab/cd` (sharded): a symlinked shard
+    ///   directory pointing elsewhere is refused;
+    /// - the entry is a regular file (`symlink_metadata`: no directory, no
+    ///   symlink) and is still the file whose bytes were verified (same
+    ///   device and inode).
+    ///
+    /// The unlink goes through the resolved path. The caller decides WHEN
+    /// (after the live copy is durable, readable and recorded).
+    pub async fn remove_copy(&self, hash: &[u8; 32], copy: &LocalCopy) -> RemoveOutcome {
+        let hash_hex = hex::encode(hash);
+        let Some(root) = self.roots.get(copy.root) else {
+            return RemoveOutcome::Failed(format!("no source root #{}", copy.root));
+        };
+        let Some(canonical_root) = root.removable.clone() else {
+            return RemoveOutcome::Failed(format!(
+                "{} is read-only",
+                root.store.data_dir().display()
+            ));
+        };
+        if !root.store.is_blob_path(&hash_hex, &copy.path) {
+            return RemoveOutcome::Failed(format!(
+                "{} is not the path of {hash_hex} under {}",
+                copy.path.display(),
+                root.store.data_dir().display()
+            ));
+        }
+        let legacy = copy.path.parent() == Some(root.store.data_dir());
+        let expected_dir = if legacy {
+            canonical_root.clone()
+        } else {
+            canonical_root.join(&hash_hex[0..2]).join(&hash_hex[2..4])
+        };
+        let root_dir = root.store.data_dir().to_path_buf();
+        let path = copy.path.clone();
+        let file = copy.file;
+        let file_name = format!("{hash_hex}.bin");
+        let unlink = move || -> std::io::Result<RemoveOutcome> {
+            if std::fs::canonicalize(&root_dir)? != canonical_root {
+                return Ok(RemoveOutcome::Failed(format!(
+                    "{} no longer resolves to {}",
+                    root_dir.display(),
+                    canonical_root.display()
+                )));
+            }
+            let dir = match path.parent().map(std::fs::canonicalize) {
+                Some(Ok(dir)) => dir,
+                Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(RemoveOutcome::Gone);
+                }
+                Some(Err(e)) => return Err(e),
+                None => return Ok(RemoveOutcome::Failed("no parent directory".into())),
+            };
+            if dir != expected_dir {
+                return Ok(RemoveOutcome::Failed(format!(
+                    "{} resolves to {}, outside {}",
+                    path.display(),
+                    dir.display(),
+                    expected_dir.display()
+                )));
+            }
+            let target = dir.join(&file_name);
+            match std::fs::symlink_metadata(&target) {
+                Ok(m) if !m.file_type().is_file() => {
+                    return Ok(RemoveOutcome::Failed(format!(
+                        "{} is not a regular file",
+                        target.display()
+                    )));
+                }
+                Ok(m) if FileId::of(&m) != file => {
+                    return Ok(RemoveOutcome::Failed(format!(
+                        "{} is no longer the file that was read",
+                        target.display()
+                    )));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(RemoveOutcome::Gone);
+                }
+                Err(e) => return Err(e),
+            }
+            match std::fs::remove_file(&target) {
+                Ok(()) => Ok(RemoveOutcome::Removed),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RemoveOutcome::Gone),
+                Err(e) => Err(e),
+            }
+        };
+        match tokio::task::spawn_blocking(unlink).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(e)) => RemoveOutcome::Failed(format!("{}: {e}", copy.path.display())),
+            Err(e) => RemoveOutcome::Failed(format!("unlink task failed: {e}")),
+        }
     }
 }
 
@@ -145,30 +493,41 @@ impl Candidate {
     }
 }
 
-/// Where the PG walk resumes: the first PG (in owned order) of
-/// `generation` that has not been fully scanned. A different generation
-/// restarts the walk at the first owned PG.
+/// Where the PG walk resumes: the first PG of `generation` that has not
+/// been fully scanned, by PG id (the walk is in ascending PG order). An
+/// id, not a position: the owned set changes with the epoch, and a
+/// position into a list that gained or lost a PG below it would skip or
+/// rescan PGs until the walk wraps. A different generation restarts the
+/// walk at the first owned PG.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Cursor {
     pub generation: u64,
-    /// Index into the sorted owned-PG list of the next PG to scan.
-    pub next_index: usize,
+    /// The next PG to scan: the walk resumes at the first owned PG at or
+    /// above it.
+    pub next_pg: u32,
 }
 
 const CURSOR_FILE: &str = "backfill_cursor";
+/// Format tag of the cursor file (`v2 <generation> <next_pg>`). The
+/// former `<generation> <index>` file is read as absent: the walk restarts,
+/// which only rescans lists.
+const CURSOR_FORMAT: &str = "v2";
 
 impl Cursor {
-    /// `Cursor::default()` when absent or malformed.
+    /// `Cursor::default()` when absent, malformed or of the former format.
     pub fn load_from(data_dir: &Path) -> Self {
         std::fs::read_to_string(data_dir.join(CURSOR_FILE))
             .ok()
             .and_then(|s| {
                 let mut parts = s.split_whitespace();
+                if parts.next()? != CURSOR_FORMAT {
+                    return None;
+                }
                 let generation = parts.next()?.parse().ok()?;
-                let next_index = parts.next()?.parse().ok()?;
+                let next_pg = parts.next()?.parse().ok()?;
                 Some(Self {
                     generation,
-                    next_index,
+                    next_pg,
                 })
             })
             .unwrap_or_default()
@@ -178,19 +537,36 @@ impl Cursor {
     pub fn persist_to(&self, data_dir: &Path) -> Result<()> {
         let path = data_dir.join(CURSOR_FILE);
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, format!("{} {}\n", self.generation, self.next_index))
-            .and_then(|_| std::fs::rename(&tmp, &path))
-            .with_context(|| format!("persist backfill cursor to {}", path.display()))
+        std::fs::write(
+            &tmp,
+            format!("{CURSOR_FORMAT} {} {}\n", self.generation, self.next_pg),
+        )
+        .and_then(|_| std::fs::rename(&tmp, &path))
+        .with_context(|| format!("persist backfill cursor to {}", path.display()))
     }
 
-    /// Position to start scanning `owned` for `generation`: the persisted
-    /// index when it belongs to this generation and is still in range,
-    /// zero otherwise.
-    pub fn start_index(&self, generation: u64, owned_len: usize) -> usize {
-        if self.generation == generation && self.next_index < owned_len {
-            self.next_index
-        } else {
+    /// Position to start scanning `owned` (sorted ascending) for
+    /// `generation`: the first PG at or above `next_pg` when the cursor
+    /// belongs to this generation and such a PG is owned, zero otherwise.
+    pub fn start_index(&self, generation: u64, owned: &[u32]) -> usize {
+        if self.generation != generation {
+            return 0;
+        }
+        let idx = owned.partition_point(|pg| *pg < self.next_pg);
+        if idx < owned.len() { idx } else { 0 }
+    }
+
+    /// The cursor resuming at `owned[idx]`, or at the start when the walk
+    /// is complete.
+    pub fn at(generation: u64, owned: &[u32], idx: usize, walk_complete: bool) -> Self {
+        let next_pg = if walk_complete {
             0
+        } else {
+            owned.get(idx).copied().unwrap_or(0)
+        };
+        Self {
+            generation,
+            next_pg,
         }
     }
 }
@@ -376,6 +752,19 @@ pub struct BackfillMetrics {
     pub bad_peer_length_mismatch: AtomicU64,
     /// Candidates given up: no eligible peer, or every tried peer failed.
     pub no_peer: AtomicU64,
+    /// Local source lookups (`BACKFILL_LOCAL_SOURCE_DIRS`): a copy that
+    /// verified (then stored, or found already present), none in any
+    /// root, or only copies that failed verification or the read.
+    pub local_hit: AtomicU64,
+    pub local_miss: AtomicU64,
+    pub local_bad: AtomicU64,
+    /// Bytes stored from a local source (not in `fetched_bytes`).
+    pub local_bytes: AtomicU64,
+    /// `BACKFILL_LOCAL_SOURCE_DELETE`: source files unlinked once their
+    /// blob was confirmed in the live store, and source files kept because
+    /// the confirmation or the unlink failed.
+    pub local_deleted: AtomicU64,
+    pub local_delete_errors: AtomicU64,
     /// Candidates found already present under the write lock (a Store or
     /// PullFromPeer landed the blob first).
     pub already_present: AtomicU64,
@@ -395,6 +784,10 @@ pub struct BackfillMetrics {
     /// Exposed as
     /// `miner_backfill_refused_empty_ownership_total`.
     pub refused_empty_ownership: AtomicU64,
+    /// PG lists scanned to the end by discovery, and the records they
+    /// held: their rate is the discovery rate.
+    pub discovery_pgs: AtomicU64,
+    pub discovery_records: AtomicU64,
 }
 
 impl BackfillMetrics {
@@ -442,6 +835,12 @@ impl BackfillMetrics {
              miner_backfill_bad_peer_total{{reason=\"hash_mismatch\"}} {}\n\
              miner_backfill_bad_peer_total{{reason=\"length_mismatch\"}} {}\n\
              miner_backfill_no_peer_total {}\n\
+             miner_backfill_local_total{{outcome=\"hit\"}} {}\n\
+             miner_backfill_local_total{{outcome=\"miss\"}} {}\n\
+             miner_backfill_local_total{{outcome=\"bad\"}} {}\n\
+             miner_backfill_local_bytes_total {}\n\
+             miner_backfill_local_source_deleted_total {}\n\
+             miner_backfill_local_source_delete_errors_total {}\n\
              miner_backfill_already_present_total {}\n\
              miner_backfill_store_errors_total {}\n\
              miner_backfill_list_errors_total {}\n\
@@ -450,7 +849,9 @@ impl BackfillMetrics {
              miner_backfill_paused{{reason=\"low_free_space\"}} {}\n\
              miner_backfill_pending {}\n\
              miner_backfill_generation {}\n\
-             miner_backfill_refused_empty_ownership_total {}\n",
+             miner_backfill_refused_empty_ownership_total {}\n\
+             miner_backfill_discovery_pgs_total {}\n\
+             miner_backfill_discovery_records_total {}\n",
             g(&self.candidates),
             g(&self.fetched),
             g(&self.fetched_bytes),
@@ -460,6 +861,12 @@ impl BackfillMetrics {
             g(&self.bad_peer_hash_mismatch),
             g(&self.bad_peer_length_mismatch),
             g(&self.no_peer),
+            g(&self.local_hit),
+            g(&self.local_miss),
+            g(&self.local_bad),
+            g(&self.local_bytes),
+            g(&self.local_deleted),
+            g(&self.local_delete_errors),
             g(&self.already_present),
             g(&self.store_errors),
             g(&self.list_errors),
@@ -469,6 +876,8 @@ impl BackfillMetrics {
             g(&self.pending),
             g(&self.generation),
             g(&self.refused_empty_ownership),
+            g(&self.discovery_pgs),
+            g(&self.discovery_records),
         )
     }
 }
@@ -541,15 +950,31 @@ pub(crate) mod tests {
         assert_eq!(Cursor::load_from(dir.path()), Cursor::default());
         let c = Cursor {
             generation: 7,
-            next_index: 42,
+            next_pg: 42,
         };
         c.persist_to(dir.path()).unwrap();
         assert_eq!(Cursor::load_from(dir.path()), c);
-        assert_eq!(c.start_index(7, 100), 42);
-        assert_eq!(c.start_index(8, 100), 0, "new generation restarts");
-        assert_eq!(c.start_index(7, 42), 0, "index past the owned set restarts");
+        let owned = [3u32, 10, 42, 50, 99];
+        assert_eq!(c.start_index(7, &owned), 2);
+        assert_eq!(c.start_index(8, &owned), 0, "new generation restarts");
+        // The owned set changed: PG 42 is no longer owned, 20 and 41 were
+        // gained below it. The walk resumes at the first PG at or above 42.
+        assert_eq!(c.start_index(7, &[3, 20, 41, 50, 99]), 3);
+        assert_eq!(
+            c.start_index(7, &[3, 10, 41]),
+            0,
+            "nothing left above: restart"
+        );
+        assert_eq!(Cursor::at(7, &owned, 3, false).next_pg, 50);
+        assert_eq!(Cursor::at(7, &owned, 5, true).next_pg, 0);
         std::fs::write(dir.path().join(CURSOR_FILE), "garbage").unwrap();
         assert_eq!(Cursor::load_from(dir.path()), Cursor::default());
+        std::fs::write(dir.path().join(CURSOR_FILE), "7 42\n").unwrap();
+        assert_eq!(
+            Cursor::load_from(dir.path()),
+            Cursor::default(),
+            "the former index format restarts the walk"
+        );
     }
 
     #[test]
@@ -712,5 +1137,299 @@ pub(crate) mod tests {
             m.render_prometheus()
                 .contains("miner_backfill_refused_empty_ownership_total 3\n")
         );
+        m.discovery_pgs.fetch_add(2, Ordering::Relaxed);
+        m.discovery_records.fetch_add(440_000, Ordering::Relaxed);
+        let text = m.render_prometheus();
+        assert!(text.contains("miner_backfill_discovery_pgs_total 2\n"));
+        assert!(text.contains("miner_backfill_discovery_records_total 440000\n"));
+    }
+
+    #[tokio::test]
+    async fn local_sources_probe_both_layouts_and_verify() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let blob = |tag: &str| {
+            let data = format!("local-{tag}").repeat(7).into_bytes();
+            let hash = *blake3::hash(&data).as_bytes();
+            (data, hash)
+        };
+        let write_sharded = |root: &Path, hash: &[u8; 32], data: &[u8]| {
+            let h = hex::encode(hash);
+            let dir = root.join(&h[0..2]).join(&h[2..4]);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{h}.bin")), data).unwrap();
+        };
+        let write_legacy = |root: &Path, hash: &[u8; 32], data: &[u8]| {
+            std::fs::write(root.join(format!("{}.bin", hex::encode(hash))), data).unwrap();
+        };
+        let (sharded, sharded_h) = blob("sharded");
+        let (legacy, legacy_h) = blob("legacy");
+        let (rotten, rotten_h) = blob("rotten");
+        let (healed, healed_h) = blob("healed");
+        let (_, absent_h) = blob("absent");
+        write_sharded(a.path(), &sharded_h, &sharded);
+        write_legacy(a.path(), &legacy_h, &legacy);
+        write_sharded(a.path(), &rotten_h, b"rotten bytes");
+        // A bad copy in the first root does not hide a good one in the next.
+        write_legacy(a.path(), &healed_h, b"bad copy");
+        write_sharded(b.path(), &healed_h, &healed);
+
+        let sharded_path = |root: &Path, hash: &[u8; 32]| {
+            let h = hex::encode(hash);
+            root.join(&h[0..2]).join(&h[2..4]).join(format!("{h}.bin"))
+        };
+        let hit = |data: &[u8], root: usize, path: PathBuf| LocalLookup::Hit {
+            data: data.to_vec().into(),
+            copy: LocalCopy {
+                root,
+                file: FileId::of(&std::fs::metadata(&path).unwrap()),
+                path,
+            },
+        };
+        let missing = a.path().join("does-not-exist");
+        let local = LocalSources::open(
+            &[a.path().to_path_buf(), missing, b.path().to_path_buf()],
+            &SourceMode::ReadOnly,
+        );
+        assert_eq!(local.len(), 2, "a missing root is left out");
+        let len = |d: &[u8]| d.len() as u64;
+        assert_eq!(
+            local.lookup(&sharded_h, len(&sharded)).await,
+            hit(&sharded, 0, sharded_path(a.path(), &sharded_h))
+        );
+        assert_eq!(
+            local.lookup(&legacy_h, len(&legacy)).await,
+            hit(
+                &legacy,
+                0,
+                a.path().join(format!("{}.bin", hex::encode(legacy_h)))
+            )
+        );
+        assert_eq!(local.lookup(&absent_h, 10).await, LocalLookup::Miss);
+        assert!(matches!(
+            local.lookup(&rotten_h, len(&rotten)).await,
+            LocalLookup::Bad(_)
+        ));
+        assert_eq!(
+            local.lookup(&healed_h, len(&healed)).await,
+            hit(&healed, 1, sharded_path(b.path(), &healed_h))
+        );
+        // A listed length shorter than the file: refused before buffering.
+        assert!(matches!(
+            local.lookup(&sharded_h, len(&sharded) - 1).await,
+            LocalLookup::Bad(_)
+        ));
+        // Longer than the file: the bytes verify by hash, not by length.
+        assert!(matches!(
+            local.lookup(&sharded_h, len(&sharded) + 1).await,
+            LocalLookup::Bad(_)
+        ));
+        assert!(
+            !a.path().join("trash").exists() && !a.path().join(".tmp").exists(),
+            "opened read-only"
+        );
+        assert!(LocalSources::default().is_empty());
+    }
+
+    /// `remove_copy` unlinks only the exact file of the hash under a
+    /// removable root: never a path outside the roots, another hash's
+    /// file, a directory, a file of a read-only root or of a root that
+    /// overlaps the live store.
+    #[tokio::test]
+    async fn remove_copy_is_confined_to_the_blob_file_of_a_removable_root() {
+        let root = tempfile::tempdir().unwrap();
+        let live = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let data = b"moved blob".to_vec();
+        let hash = *blake3::hash(&data).as_bytes();
+        let h = hex::encode(hash);
+        let other = *blake3::hash(b"other").as_bytes();
+        let sharded = root
+            .path()
+            .join(&h[0..2])
+            .join(&h[2..4])
+            .join(format!("{h}.bin"));
+        std::fs::create_dir_all(sharded.parent().unwrap()).unwrap();
+        std::fs::write(&sharded, &data).unwrap();
+        let legacy = root.path().join(format!("{h}.bin"));
+        std::fs::write(&legacy, &data).unwrap();
+        let foreign = outside.path().join(format!("{h}.bin"));
+        std::fs::write(&foreign, &data).unwrap();
+        let move_mode = SourceMode::Move {
+            live_root: live.path().to_path_buf(),
+        };
+        let local = LocalSources::open(&[root.path().to_path_buf()], &move_mode);
+        assert_eq!(local.removable_roots(), 1);
+        // The identity of whatever the path names now (a placeholder when
+        // nothing does).
+        let copy = |path: PathBuf| LocalCopy {
+            root: 0,
+            file: std::fs::symlink_metadata(&path)
+                .map(|m| FileId::of(&m))
+                .unwrap_or(FileId { dev: 0, ino: 0 }),
+            path,
+        };
+        let failed = |o: RemoveOutcome| matches!(o, RemoveOutcome::Failed(_));
+
+        // Outside the root, a sibling dir, another hash, a bad root index.
+        assert!(failed(
+            local.remove_copy(&hash, &copy(foreign.clone())).await
+        ));
+        assert!(failed(
+            local
+                .remove_copy(
+                    &hash,
+                    &copy(root.path().join("..").join(format!("{h}.bin")))
+                )
+                .await
+        ));
+        assert!(failed(
+            local.remove_copy(&other, &copy(sharded.clone())).await
+        ));
+        assert!(failed(
+            local
+                .remove_copy(
+                    &hash,
+                    &LocalCopy {
+                        root: 7,
+                        ..copy(sharded.clone())
+                    }
+                )
+                .await
+        ));
+        assert!(foreign.exists() && sharded.exists());
+
+        // A directory at the blob's path is never removed.
+        let dir_hash = *blake3::hash(b"dir").as_bytes();
+        let dh = hex::encode(dir_hash);
+        let as_dir = root.path().join(format!("{dh}.bin"));
+        std::fs::create_dir(&as_dir).unwrap();
+        assert!(failed(
+            local.remove_copy(&dir_hash, &copy(as_dir.clone())).await
+        ));
+        assert!(as_dir.is_dir());
+
+        // A shard directory that is a symlink to elsewhere: the path is
+        // lexically the blob's, but resolves outside the root.
+        let linked_data = b"linked".to_vec();
+        let linked_hash = *blake3::hash(&linked_data).as_bytes();
+        let lh = hex::encode(linked_hash);
+        let away = outside.path().join("away");
+        std::fs::create_dir(&away).unwrap();
+        std::fs::write(away.join(format!("{lh}.bin")), &linked_data).unwrap();
+        std::fs::create_dir_all(root.path().join(&lh[0..2])).unwrap();
+        std::os::unix::fs::symlink(&away, root.path().join(&lh[0..2]).join(&lh[2..4])).unwrap();
+        let linked = root
+            .path()
+            .join(&lh[0..2])
+            .join(&lh[2..4])
+            .join(format!("{lh}.bin"));
+        assert!(failed(
+            local.remove_copy(&linked_hash, &copy(linked.clone())).await
+        ));
+        assert!(away.join(format!("{lh}.bin")).exists());
+
+        // The file at the path was replaced after it was read.
+        let read_then = copy(sharded.clone());
+        let tmp = root.path().join("replacement");
+        std::fs::write(&tmp, &data).unwrap();
+        std::fs::rename(&tmp, &sharded).unwrap();
+        assert!(failed(local.remove_copy(&hash, &read_then).await));
+        assert!(sharded.exists());
+
+        // The real files go, a second removal reports them gone.
+        assert_eq!(
+            local.remove_copy(&hash, &copy(sharded.clone())).await,
+            RemoveOutcome::Removed
+        );
+        assert_eq!(
+            local.remove_copy(&hash, &copy(legacy.clone())).await,
+            RemoveOutcome::Removed
+        );
+        assert_eq!(
+            local.remove_copy(&hash, &copy(sharded.clone())).await,
+            RemoveOutcome::Gone
+        );
+        assert!(sharded.parent().unwrap().is_dir(), "directories stay");
+
+        // Read-only mode, and a root overlapping the live store.
+        std::fs::write(&legacy, &data).unwrap();
+        let ro = LocalSources::open(&[root.path().to_path_buf()], &SourceMode::ReadOnly);
+        assert!(!ro.is_removable(&copy(legacy.clone())));
+        assert!(failed(ro.remove_copy(&hash, &copy(legacy.clone())).await));
+        for live_root in [
+            root.path().to_path_buf(),
+            root.path().join(&h[0..2]),
+            outside.path().join("missing"),
+        ] {
+            let overlapping = LocalSources::open(
+                &[root.path().to_path_buf()],
+                &SourceMode::Move { live_root },
+            );
+            assert_eq!(overlapping.removable_roots(), 0);
+            assert!(failed(
+                overlapping.remove_copy(&hash, &copy(legacy.clone())).await
+            ));
+        }
+        let parent = root.path().parent().unwrap().to_path_buf();
+        let containing = LocalSources::open(
+            &[root.path().to_path_buf()],
+            &SourceMode::Move { live_root: parent },
+        );
+        assert_eq!(
+            containing.removable_roots(),
+            0,
+            "a live root containing the source"
+        );
+        assert!(legacy.exists());
+    }
+
+    #[test]
+    fn local_source_delete_is_a_strict_boolean() {
+        assert!(
+            !BackfillConfig::from_lookup(|_| None)
+                .unwrap()
+                .local_source_delete
+        );
+        let on =
+            BackfillConfig::from_lookup(lookup_of(&[("BACKFILL_LOCAL_SOURCE_DELETE", " Yes ")]));
+        assert!(on.unwrap().local_source_delete);
+        let off = BackfillConfig::from_lookup(lookup_of(&[("BACKFILL_LOCAL_SOURCE_DELETE", "0")]));
+        assert!(!off.unwrap().local_source_delete);
+        assert!(
+            BackfillConfig::from_lookup(lookup_of(&[("BACKFILL_LOCAL_SOURCE_DELETE", "maybe")]))
+                .is_err(),
+            "a deletion switch is never defaulted silently"
+        );
+    }
+
+    #[test]
+    fn local_source_dirs_parse_absolute_unique_paths() {
+        let cfg = BackfillConfig::from_lookup(lookup_of(&[
+            (
+                "BACKFILL_LOCAL_SOURCE_DIRS",
+                " /a/storage.flat-old-1 , relative/dir,,/b/x,/a/storage.flat-old-1 ",
+            ),
+            ("BACKFILL_LOCAL_CONCURRENCY", "0"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            cfg.local_source_dirs,
+            vec![
+                PathBuf::from("/a/storage.flat-old-1"),
+                PathBuf::from("/b/x")
+            ]
+        );
+        assert_eq!(cfg.local_concurrency, 1, "clamped");
+        let d = BackfillConfig::from_lookup(|_| None).unwrap();
+        assert!(d.local_source_dirs.is_empty());
+        assert_eq!(d.local_concurrency, 64);
+        assert_eq!(d.discovery_concurrency, 8);
+        for (raw, want) in [("0", 1), ("16", 16), ("999", 64), ("x", 8)] {
+            let c =
+                BackfillConfig::from_lookup(lookup_of(&[("BACKFILL_DISCOVERY_CONCURRENCY", raw)]))
+                    .unwrap();
+            assert_eq!(c.discovery_concurrency, want, "{raw}");
+        }
     }
 }

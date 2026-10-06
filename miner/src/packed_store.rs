@@ -15,7 +15,8 @@
 //! ```text
 //! {root}/volumes/vol-000001.dat     append-only, sealed once full
 //! {root}/volumes/vol-000002.dat     ... exactly one active (highest id)
-//! {root}/index/snapshot.bin         periodic index snapshot (atomic rename)
+//! {root}/index/snapshot.bin         index snapshot (atomic rename), written
+//!                                   every N mutations and on clean shutdown
 //! {root}/index/journal.log          fsync'd op journal (delete/restore/purge)
 //! ```
 //!
@@ -37,9 +38,29 @@
 //!   batched naturally: the writer task drains its queue, appends every
 //!   pending record, syncs once, then ACKs the whole batch — one sync
 //!   amortizes many stores under load without ever ACKing unsynced data.
+//!   The first ACK of every volume the writer opened also waits for an
+//!   fsync of the volumes directory and the store root, so the volume's
+//!   directory entry is as durable as its records.
 //! - **Torn tails are truncated before reuse.** On open, each volume is
-//!   scanned from its snapshot watermark; the first invalid record marks the
-//!   end, the file is truncated to that boundary, and appends resume there.
+//!   scanned from its snapshot watermark with large sequential buffered
+//!   reads (one small `pread` per record header cost ~500 IOPS and ~0 MB/s
+//!   through a FUSE union mount); the first invalid record marks the end,
+//!   the file is truncated to that boundary, and appends resume there. An
+//!   I/O error during the scan fails the open instead of truncating.
+//! - **A snapshot watermark never covers an unindexed record.** The
+//!   watermark of a volume is the end of its contiguous indexed prefix
+//!   (`IndexState::indexed_len`, advanced by the writer under the index
+//!   lock only after every record of a batch is indexed), never the file
+//!   length: a batch whose append or index insert failed stays past the
+//!   watermark and is re-scanned on the next open. A snapshot may therefore
+//!   be written from any thread at any time, including on clean shutdown
+//!   ([`PackedStore::write_snapshot`]), which makes the next open scan
+//!   nothing but what was appended after it.
+//! - **A snapshot never covers a journal op it does not reflect.** A
+//!   delete/restore/purge holds the journal lock from its append until its
+//!   index mutation is done, and the snapshot holds the same lock while it
+//!   reads the journal length and serializes the index (lock order: journal,
+//!   then index).
 //! - **Deletes are two-phase and durable.** `delete`/`restore`/
 //!   `purge_trashed` append to a small fsync'd journal (a few ops per
 //!   second at most) and are replayed over the volume scan on open, so a
@@ -51,7 +72,7 @@
 //! - **Writer admission is bounded by BYTES in flight.** Every queued
 //!   `StoreReq` owns a full payload copy, so an unbounded queue turns any
 //!   producer that outruns the fsync-bound writer into unbounded heap
-//!   growth (measured in production as multi-GB RSS whose per-blob cost
+//!   growth (measured on a test bench as multi-GB RSS whose per-blob cost
 //!   tracked the producer's lead over the writer, not the index size).
 //!   `store()` takes byte-permits before enqueueing and the permits are
 //!   released only when the writer retires the request, so producers stall
@@ -150,6 +171,9 @@ struct IndexState {
     trash: HashMap<u128, TrashEntry>,
     /// Bytes made dead per volume (overwrites + purges) — compaction input.
     dead_bytes: HashMap<u32, u64>,
+    /// Per volume, the end of the contiguous prefix whose every record is
+    /// in `live`/`trash`: the only safe snapshot watermark (module docs).
+    indexed_len: HashMap<u32, u64>,
 }
 
 /// Byte-permits held by a queued write. Dropping it (writer retired the
@@ -199,9 +223,8 @@ pub struct PackedStore {
     journal: Mutex<std::fs::File>,
     /// Read-side FD cache, one handle per volume.
     fds: RwLock<HashMap<u32, Arc<std::fs::File>>>,
-    /// Bytes covered by the snapshot, per volume (persisted watermarks).
-    watermarks: Mutex<HashMap<u32, u64>>,
-    journal_covered: AtomicU64,
+    /// Volume bytes the open-time scan read (0 after a clean shutdown).
+    scanned_on_open: u64,
 }
 
 impl std::fmt::Debug for PackedStore {
@@ -214,6 +237,11 @@ impl std::fmt::Debug for PackedStore {
 
 fn volume_path(dir: &Path, vol: u32) -> PathBuf {
     dir.join(format!("vol-{vol:06}.dat"))
+}
+
+/// fsync a directory, persisting its entries (a file created in it).
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
 
 fn encode_record(name: &str, payload: &[u8]) -> Vec<u8> {
@@ -231,32 +259,55 @@ fn encode_record(name: &str, payload: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Parse one record header at `off`. Returns `(name, payload_len, crc)` on a
-/// structurally valid record, `None` on anything torn or foreign.
-fn read_record_header(f: &std::fs::File, off: u64, vol_len: u64) -> Option<(String, u32, u32)> {
-    if off + REC_HEADER_LEN as u64 > vol_len {
-        return None;
-    }
+/// Read buffer of the volume scans: large sequential reads instead of
+/// one small `pread` per record header.
+const SCAN_BUF_BYTES: usize = 8 << 20;
+
+/// Walk the records of one volume from `start`, calling
+/// `visit(name, offset, payload_len)` for each structurally valid record,
+/// through one buffered sequential reader (payloads are skipped inside the
+/// buffer, or seeked over when larger). Returns the offset of the first
+/// byte that does not start a valid record: `len` for a clean volume, the
+/// torn boundary otherwise. A header that is not a record, a record that
+/// would end past `len` or a name that is not UTF-8 ends the walk there;
+/// an I/O error is returned as such (never mistaken for a torn tail).
+fn scan_volume(
+    f: &std::fs::File,
+    start: u64,
+    len: u64,
+    visit: &mut dyn FnMut(String, u64, u32) -> std::io::Result<()>,
+) -> std::io::Result<u64> {
+    let mut r = std::io::BufReader::with_capacity(SCAN_BUF_BYTES, f);
+    r.seek(SeekFrom::Start(start))?;
+    let mut off = start;
     let mut hdr = [0u8; REC_HEADER_LEN];
-    f.read_exact_at(&mut hdr, off).ok()?;
-    if u32::from_le_bytes(hdr[0..4].try_into().unwrap()) != REC_MAGIC {
-        return None;
+    loop {
+        if off + REC_HEADER_LEN as u64 > len {
+            return Ok(off);
+        }
+        r.read_exact(&mut hdr)?;
+        if u32::from_le_bytes(hdr[0..4].try_into().unwrap()) != REC_MAGIC {
+            return Ok(off);
+        }
+        let name_len = u16::from_le_bytes(hdr[4..6].try_into().unwrap()) as usize;
+        let payload_len = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+        if name_len == 0 || name_len > 4096 {
+            return Ok(off);
+        }
+        let total = record_len(name_len, payload_len as usize);
+        if off + total > len {
+            return Ok(off); // torn tail
+        }
+        let mut name_b = vec![0u8; name_len];
+        r.read_exact(&mut name_b)?;
+        let Ok(name) = String::from_utf8(name_b) else {
+            return Ok(off);
+        };
+        visit(name, off, payload_len)?;
+        let rest = total - (REC_HEADER_LEN + name_len) as u64;
+        r.seek_relative(rest as i64)?;
+        off += total;
     }
-    let name_len = u16::from_le_bytes(hdr[4..6].try_into().unwrap()) as usize;
-    let payload_len = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
-    let crc = u32::from_le_bytes(hdr[12..16].try_into().unwrap());
-    if name_len == 0 || name_len > 4096 {
-        return None;
-    }
-    let total = record_len(name_len, payload_len as usize);
-    if off + total > vol_len {
-        return None; // torn tail
-    }
-    let mut name_b = vec![0u8; name_len];
-    f.read_exact_at(&mut name_b, off + REC_HEADER_LEN as u64)
-        .ok()?;
-    let name = String::from_utf8(name_b).ok()?;
-    Some((name, payload_len, crc))
 }
 
 impl PackedStore {
@@ -306,6 +357,7 @@ impl PackedStore {
             live,
             trash: HashMap::new(),
             dead_bytes: HashMap::new(),
+            indexed_len: HashMap::new(),
         };
         let mut watermarks: HashMap<u32, u64> = HashMap::new();
         let mut journal_covered = 0u64;
@@ -340,6 +392,7 @@ impl PackedStore {
         let mut used = 0u64;
         let mut trashed = 0u64;
         let mut volume_bytes = 0u64;
+        let mut scanned_on_open = 0u64;
         for &vol in &vol_ids {
             let path = volume_path(&volumes_dir, vol);
             let f = std::fs::OpenOptions::new()
@@ -348,8 +401,7 @@ impl PackedStore {
                 .open(&path)?;
             let len = f.metadata()?.len();
             let start = watermarks.get(&vol).copied().unwrap_or(0).min(len);
-            let mut off = start;
-            while let Some((name, payload_len, _crc)) = read_record_header(&f, off, len) {
+            let off = scan_volume(&f, start, len, &mut |name, off, payload_len| {
                 let name_len = name.len() as u16;
                 let key = name_key(&name);
                 let loc = Loc {
@@ -358,15 +410,26 @@ impl PackedStore {
                     name_len,
                     payload_len,
                 };
-                if let Some(old) = idx.live.insert(key, loc)? {
+                // A record the table already holds at this very location
+                // (re-scanned tail) supersedes nothing.
+                if let Some(old) = idx.live.insert(key, loc)?
+                    && old != loc
+                {
                     *idx.dead_bytes.entry(old.vol).or_default() += old.payload_len as u64;
                 }
                 if let Some(t) = idx.trash.remove(&key) {
                     // A re-store after a delete supersedes the trash entry.
                     *idx.dead_bytes.entry(t.loc.vol).or_default() += t.loc.payload_len as u64;
                 }
-                off += record_len(name_len as usize, payload_len as usize);
-            }
+                Ok(())
+            })
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("packed store: scan of {} failed: {e}", path.display()),
+                )
+            })?;
+            scanned_on_open += off - start;
             if off < len {
                 tracing::warn!(
                     vol,
@@ -377,7 +440,7 @@ impl PackedStore {
                 f.set_len(off)?;
                 f.sync_data()?;
             }
-            watermarks.insert(vol, off);
+            idx.indexed_len.insert(vol, off);
             volume_bytes += off;
         }
 
@@ -418,8 +481,7 @@ impl PackedStore {
             inflight_bytes: Arc::new(AtomicU64::new(0)),
             journal: Mutex::new(journal),
             fds: RwLock::new(HashMap::new()),
-            watermarks: Mutex::new(watermarks),
-            journal_covered: AtomicU64::new(jlen),
+            scanned_on_open,
         });
         store.spawn_writer(
             writer_rx,
@@ -431,6 +493,7 @@ impl PackedStore {
             trash = store.idx.read().unwrap().trash.len(),
             volumes = vol_ids.len(),
             volume_bytes,
+            scanned_bytes = store.scanned_on_open(),
             "packed store: opened"
         );
         Ok(store)
@@ -467,6 +530,17 @@ impl PackedStore {
                 }
             };
             let mut vol_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            // Set by a failed batch: this volume's indexed prefix (the
+            // snapshot watermark) stops advancing, so the next open
+            // re-scans from the failure. Cleared on roll.
+            let mut vol_poisoned = false;
+            // `fdatasync` of a file does not persist its directory entry
+            // (POSIX; on most filesystems it happens to): before the first
+            // ACK of a volume this writer opened (created at the first open
+            // of a store, or by a roll), the volumes directory and the store
+            // root are synced once, so an ACKed record can never sit in a
+            // volume file that a power loss unlinks. Cleared on roll.
+            let mut dir_entries_synced = false;
 
             while let Some(first) = rx.blocking_recv() {
                 let Some(store) = store.upgrade() else { return };
@@ -495,6 +569,7 @@ impl PackedStore {
                     buf.extend_from_slice(&rec);
                 }
 
+                let batch_start = vol_len;
                 let append_res = file.write_all(&buf).and_then(|_| file.sync_data());
                 let publish_res = append_res.and_then(|()| {
                     // The append is durable: account it regardless of what
@@ -528,6 +603,13 @@ impl PackedStore {
                             .used_bytes
                             .fetch_add(loc.payload_len as u64, Ordering::Relaxed);
                     }
+                    // Every record of the batch is indexed: the contiguous
+                    // indexed prefix covers it, unless an earlier failure
+                    // left a gap below it.
+                    let covered = idx.indexed_len.entry(vol).or_insert(0);
+                    if !vol_poisoned && *covered == batch_start {
+                        *covered = vol_len;
+                    }
                     Ok(())
                 });
                 match publish_res {
@@ -535,11 +617,38 @@ impl PackedStore {
                         store
                             .ops_since_snapshot
                             .fetch_add(placed.len() as u64, Ordering::Relaxed);
-                        for req in batch {
-                            let _ = req.ack.send(Ok(()));
+                        // Records durable and indexed; the ACK also waits
+                        // for the volume's directory entry. A failed sync
+                        // fails this batch's ACKs only (the records stay
+                        // indexed, a re-store is idempotent) and is retried
+                        // with the next batch.
+                        let entries = if dir_entries_synced {
+                            Ok(())
+                        } else {
+                            sync_dir(&volumes_dir).and_then(|()| match volumes_dir.parent() {
+                                Some(root) => sync_dir(root),
+                                None => Ok(()),
+                            })
+                        };
+                        match entries {
+                            Ok(()) => {
+                                dir_entries_synced = true;
+                                for req in batch {
+                                    let _ = req.ack.send(Ok(()));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, vol, "packed store: volume directory sync failed");
+                                for req in batch {
+                                    let _ = req
+                                        .ack
+                                        .send(Err(std::io::Error::new(e.kind(), e.to_string())));
+                                }
+                            }
                         }
                     }
                     Err(e) => {
+                        vol_poisoned = true;
                         tracing::error!(error = %e, "packed store: batch append/publish failed");
                         // Either nothing was appended (torn batch truncated
                         // at next open) or it was appended but not fully
@@ -567,6 +676,8 @@ impl PackedStore {
                         Ok(f) => {
                             file = f;
                             vol_len = 0;
+                            vol_poisoned = false;
+                            dir_entries_synced = false;
                             tracing::info!(vol, "packed store: rolled to new volume");
                         }
                         Err(e) => {
@@ -576,11 +687,12 @@ impl PackedStore {
                     }
                 }
 
-                if store.ops_since_snapshot.load(Ordering::Relaxed) >= SNAPSHOT_EVERY_OPS {
+                if store.ops_since_snapshot.load(Ordering::Relaxed) >= SNAPSHOT_EVERY_OPS
+                    && let Err(e) = store.write_snapshot()
+                {
+                    // Retried after another full interval, not every batch.
                     store.ops_since_snapshot.store(0, Ordering::Relaxed);
-                    if let Err(e) = store.write_snapshot() {
-                        tracing::warn!(error = %e, "packed store: snapshot write failed");
-                    }
+                    tracing::warn!(error = %e, "packed store: snapshot write failed");
                 }
             }
         });
@@ -643,8 +755,16 @@ impl PackedStore {
     }
 
     /// Append one op to the journal and fsync it. Op rate is a handful per
-    /// second at most (deletes/restores), so per-op sync is cheap.
-    fn journal_op(&self, op: u8, name: &str) -> std::io::Result<()> {
+    /// second at most (deletes/restores), so per-op sync is cheap. The
+    /// journal lock is returned held: the caller applies the op to the
+    /// index before releasing it, so a snapshot (which takes the same lock
+    /// first) never records a journal length covering an op its index does
+    /// not reflect.
+    fn journal_op(
+        &self,
+        op: u8,
+        name: &str,
+    ) -> std::io::Result<std::sync::MutexGuard<'_, std::fs::File>> {
         let mut rec = Vec::with_capacity(4 + name.len());
         rec.push(JOURNAL_MAGIC);
         rec.push(op);
@@ -654,38 +774,28 @@ impl PackedStore {
         let mut j = self.journal.lock().unwrap();
         j.write_all(&rec)?;
         j.sync_data()?;
-        Ok(())
+        Ok(j)
     }
 
     /// Serialize the whole index to `snapshot.bin` (atomic tmp+rename) and
-    /// record the journal length it covers. Pure sequential write.
-    fn write_snapshot(&self) -> std::io::Result<()> {
+    /// record the journal length it covers. Pure sequential write. Safe from
+    /// any thread at any time (module docs): the watermarks are the indexed
+    /// prefixes read under the index lock, and the journal lock is held
+    /// throughout so no journaled op is half applied. Called by the writer
+    /// every `SNAPSHOT_EVERY_OPS` mutations and on clean shutdown.
+    pub fn write_snapshot(&self) -> std::io::Result<()> {
         let tmp = self.index_dir.join("snapshot.tmp");
         let final_path = self.index_dir.join("snapshot.bin");
-        let jlen = self
-            .journal
-            .lock()
-            .unwrap()
-            .metadata()
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let watermarks: Vec<(u32, u64)> = {
-            let wm = self.watermarks.lock().unwrap();
-            let mut v: Vec<_> = wm.iter().map(|(k, l)| (*k, *l)).collect();
-            // The active volume keeps growing past the recorded watermark;
-            // refresh from disk so the snapshot skips as much as possible.
-            for (vol, len) in v.iter_mut() {
-                if let Ok(m) = std::fs::metadata(volume_path(&self.volumes_dir, *vol)) {
-                    *len = m.len();
-                }
-            }
-            v
-        };
+        let journal = self.journal.lock().unwrap();
+        let jlen = journal.metadata()?.len();
         {
             // Write lock: msync of the live table must not interleave with
             // concurrent inserts, and the trash serialization below must be
             // consistent with it. Snapshots are rare (every 500k ops).
             let mut idx = self.idx.write().unwrap();
+            let mut watermarks: Vec<(u32, u64)> =
+                idx.indexed_len.iter().map(|(v, l)| (*v, *l)).collect();
+            watermarks.sort_unstable();
             // Order matters: the live table is stamped+synced BEFORE the
             // watermarks that declare what it covers. A crash in between
             // only makes the next open re-scan a longer volume tail.
@@ -713,14 +823,15 @@ impl PackedStore {
             f.sync_data()?;
         }
         std::fs::rename(&tmp, &final_path)?;
-        {
-            let mut wm = self.watermarks.lock().unwrap();
-            for (vol, len) in watermarks {
-                wm.insert(vol, len);
-            }
-        }
+        drop(journal);
+        self.ops_since_snapshot.store(0, Ordering::Relaxed);
         tracing::info!("packed store: index snapshot written");
         Ok(())
+    }
+
+    /// Volume bytes the open-time scan read (tests, startup log).
+    pub fn scanned_on_open(&self) -> u64 {
+        self.scanned_on_open
     }
 }
 
@@ -864,7 +975,18 @@ fn replay_journal(journal: &mut std::fs::File, from: u64, idx: &mut IndexState) 
             let key = name_key(name);
             match op {
                 OP_DELETE => {
-                    if let Some(loc) = idx.live.remove(key) {
+                    // The mmap table is written back on the kernel's own
+                    // schedule, so it may already reflect a delete made
+                    // after the snapshot: the entry is then a tombstone,
+                    // which still carries its location.
+                    let removed = idx.live.remove(key).or_else(|| {
+                        if idx.trash.contains_key(&key) {
+                            None
+                        } else {
+                            idx.live.tombstoned(key)
+                        }
+                    });
+                    if let Some(loc) = removed {
                         idx.trash.insert(
                             key,
                             TrashEntry {
@@ -983,7 +1105,7 @@ impl crate::store::BlobStore for PackedStore {
         if !self.idx.read().unwrap().live.contains_key(key) {
             return Ok(());
         }
-        self.journal_op(OP_DELETE, hash_hex)?;
+        let _journal = self.journal_op(OP_DELETE, hash_hex)?;
         let mut idx = self.idx.write().unwrap();
         if let Some(loc) = idx.live.remove(key) {
             self.used_bytes
@@ -1013,7 +1135,7 @@ impl crate::store::BlobStore for PackedStore {
         if !self.idx.read().unwrap().trash.contains_key(&key) {
             return Ok(false);
         }
-        self.journal_op(OP_RESTORE, hash_hex)?;
+        let _journal = self.journal_op(OP_RESTORE, hash_hex)?;
         let mut idx = self.idx.write().unwrap();
         if let Some(t) = idx.trash.remove(&key) {
             self.trash_bytes
@@ -1032,7 +1154,7 @@ impl crate::store::BlobStore for PackedStore {
         if !self.idx.read().unwrap().trash.contains_key(&key) {
             return Ok(());
         }
-        self.journal_op(OP_PURGE, hash_hex)?;
+        let _journal = self.journal_op(OP_PURGE, hash_hex)?;
         let mut idx = self.idx.write().unwrap();
         if let Some(t) = idx.trash.remove(&key) {
             self.trash_bytes
@@ -1070,18 +1192,20 @@ impl crate::store::BlobStore for PackedStore {
                 continue;
             };
             let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-            let mut off = 0u64;
-            while let Some((name, payload_len, _)) = read_record_header(&f, off, len) {
+            let scanned = scan_volume(&f, 0, len, &mut |name, _, _| {
                 let key = name_key(&name);
                 if seen.insert(key) && !trash_keys.contains(&key) {
                     // Later records supersede earlier ones for the same key,
                     // but the payload location is irrelevant for a listing —
                     // only liveness matters, and live-ness is keyed.
                     if self.idx.read().unwrap().live.contains_key(key) {
-                        out.push(name.clone());
+                        out.push(name);
                     }
                 }
-                off += record_len(name.len(), payload_len as usize);
+                Ok(())
+            });
+            if let Err(e) = scanned {
+                tracing::warn!(vol, error = %e, "packed store: listing scan of a volume failed");
             }
         }
         out
@@ -1148,6 +1272,16 @@ impl crate::store::BlobStore for PackedStore {
 
     async fn migrate_legacy_layout(&self, _batch: usize, _pause: Duration) -> u64 {
         0 // no legacy layout of its own; flat->packed migration is separate
+    }
+
+    fn persist_on_clean_shutdown(&self) -> std::io::Result<()> {
+        self.write_snapshot()
+    }
+
+    /// The writer ACKs a store only after `fdatasync` of its volume (module
+    /// docs, first invariant).
+    fn store_is_durable(&self) -> bool {
+        true
     }
 }
 
@@ -1453,6 +1587,35 @@ mod tests {
         assert_eq!(store.read(H2).await.unwrap().as_ref(), b"after-snap");
     }
 
+    /// A delete made after a snapshot of a record the snapshot covers:
+    /// the mmap table already holds its tombstone at the next open, and the
+    /// journal replay still rebuilds the trash entry (restorable), after a
+    /// crash (no further snapshot) as after another clean stop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_after_snapshot_stays_restorable() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = open_small(dir.path());
+            store.store(H1, b"covered").await.unwrap();
+            store.store(H2, b"also-covered").await.unwrap();
+            store.persist_on_clean_shutdown().unwrap();
+            store.delete(H1).await.unwrap();
+        } // crash-like: no snapshot after the delete
+        let store = open_small(dir.path());
+        assert_eq!(store.scanned_on_open(), 0);
+        assert!(
+            !store.has(H1) && store.has_trashed(H1),
+            "trash entry rebuilt"
+        );
+        assert!(store.restore(H1).await.unwrap());
+        assert_eq!(store.read(H1).await.unwrap().as_ref(), b"covered");
+        store.delete(H2).await.unwrap();
+        store.persist_on_clean_shutdown().unwrap();
+        drop(store);
+        let store = open_small(dir.path());
+        assert!(store.has(H1) && store.has_trashed(H2));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn volumes_roll_at_target() {
         let dir = tempfile::tempdir().unwrap();
@@ -1497,5 +1660,115 @@ mod tests {
         let store = open_small(dir.path());
         let err = store.read(H1).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// A clean shutdown writes the snapshot: the next open scans no volume
+    /// byte, and every blob, delete and restore is still there. Without
+    /// it the whole volume is rescanned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clean_shutdown_snapshot_makes_reopen_scan_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = open_small(dir.path());
+            store.store(H1, b"kept").await.unwrap();
+            store.store(H2, b"trashed").await.unwrap();
+            store.delete(H2).await.unwrap();
+        } // no snapshot: the reopen rescans everything
+        let store = open_small(dir.path());
+        let vol_len = std::fs::metadata(dir.path().join("volumes/vol-000001.dat"))
+            .unwrap()
+            .len();
+        assert_eq!(
+            store.scanned_on_open(),
+            vol_len,
+            "full scan without a snapshot"
+        );
+        store.persist_on_clean_shutdown().unwrap();
+        drop(store);
+
+        let store = open_small(dir.path());
+        assert_eq!(
+            store.scanned_on_open(),
+            0,
+            "nothing rescanned after a clean stop"
+        );
+        assert_eq!(store.read(H1).await.unwrap().as_ref(), b"kept");
+        assert!(store.has_trashed(H2) && !store.has(H2));
+
+        // Appends after the shutdown snapshot are the only bytes scanned.
+        let h3 = format!("{:064x}", 3);
+        store.store(&h3, b"after").await.unwrap();
+        store.persist_on_clean_shutdown().unwrap();
+        let h4 = format!("{:064x}", 4);
+        store.store(&h4, b"after-snapshot").await.unwrap();
+        drop(store);
+        let store = open_small(dir.path());
+        assert_eq!(
+            store.scanned_on_open(),
+            record_len(h4.len(), b"after-snapshot".len()),
+            "only the record appended after the snapshot"
+        );
+        assert!(store.has(&h3) && store.has(&h4));
+    }
+
+    /// The watermark is the indexed prefix, not the file length: a record
+    /// appended but not indexed (simulated: bytes appended behind the
+    /// writer's back) is not covered by a snapshot and is found by the
+    /// next open's scan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_never_covers_an_unindexed_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let vol = dir.path().join("volumes/vol-000001.dat");
+        {
+            let store = open_small(dir.path());
+            store.store(H1, b"indexed").await.unwrap();
+            {
+                use std::io::Write as _;
+                let mut f = std::fs::OpenOptions::new().append(true).open(&vol).unwrap();
+                f.write_all(&encode_record(H2, b"not-indexed")).unwrap();
+            }
+            store.write_snapshot().unwrap();
+        }
+        let store = open_small(dir.path());
+        assert_eq!(store.read(H2).await.unwrap().as_ref(), b"not-indexed");
+        assert_eq!(store.scanned_on_open(), record_len(H2.len(), 11));
+    }
+
+    /// The buffered scan reads records whose payloads are larger than its
+    /// buffer, and stops at a torn record exactly like the per-record one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn buffered_scan_skips_large_payloads_and_finds_the_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = vec![0x5au8; SCAN_BUF_BYTES + 12_345];
+        {
+            let store = PackedStore::open_with_target(dir.path(), 1 << 30).unwrap();
+            store.store(H1, b"small").await.unwrap();
+            store.store(H2, &big).await.unwrap();
+            store.store(&format!("{:064x}", 9), b"tail").await.unwrap();
+        }
+        let vol = dir.path().join("volumes/vol-000001.dat");
+        let good = std::fs::metadata(&vol).unwrap().len();
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&vol).unwrap();
+            let mut torn = encode_record(&format!("{:064x}", 10), b"cut short");
+            torn.truncate(torn.len() - 3);
+            f.write_all(&torn).unwrap();
+        }
+        let store = PackedStore::open_with_target(dir.path(), 1 << 30).unwrap();
+        assert_eq!(
+            std::fs::metadata(&vol).unwrap().len(),
+            good,
+            "torn tail cut"
+        );
+        assert_eq!(store.read(H2).await.unwrap().len(), big.len());
+        assert_eq!(
+            store.read(&format!("{:064x}", 9)).await.unwrap().as_ref(),
+            b"tail"
+        );
+        assert!(!store.has(&format!("{:064x}", 10)));
+        let mut listed = store.list_hashes();
+        listed.sort();
+        assert_eq!(listed.len(), 3);
     }
 }
