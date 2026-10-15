@@ -133,7 +133,10 @@ touch /var/lib/hippius/miner/data/miner/.no-auto-update
 | `MINER_STORE_CONCURRENCY` | 1024 | Concurrent store operations |
 | `MINER_PULL_CONCURRENCY` | 32 | Concurrent pull operations |
 | `MINER_FETCH_CONCURRENCY` | 256 | Concurrent fetch operations |
-| `PACKED_INFLIGHT_MAX_BYTES` | RAM/8, 256 MiB..4 GiB | In-flight write budget of the packed store (see "Resource limits") |
+| `PACKED_INFLIGHT_MAX_BYTES` | RAM/8, 256 MiB..4 GiB | In-flight write budget of the packed store (see "Resource limits"); with several storage roots, each root gets an equal share (at least 8 MiB) |
+| `STORAGE_PATHS` | - | Comma-separated absolute paths, one storage root per disk; overrides `STORAGE_PATH` (see "Multiple storage roots") |
+| `STORAGE_ROOT_RESERVE_BYTES` | 4294967296 (4 GiB) | Free bytes a storage root keeps out of new writes (multi-root only) |
+| `STORAGE_ROOT_PROBE_SECS` | 15 | Health probe interval of the storage roots (multi-root only) |
 | `MINER_MAX_CONCURRENT_HANDLERS` | budget/3 MiB, 256..8192 | Cap on concurrent inbound P2P stream handlers (see "Resource limits") |
 | `MINER_QUIC_MAX_INCOMING` | 1024 | Inbound QUIC connection attempts queued before the miner handles them; beyond it new attempts get an immediate CONNECTION_REFUSED (>= 1) |
 | `MINER_QUIC_STALE_INCOMING_SECS` | 5 | An attempt that waited this long before being handled is refused (CONNECTION_REFUSED) instead of being dropped silently at the 30 s QUIC idle timeout (1..29); invalid values stop the miner at startup |
@@ -408,6 +411,165 @@ shard, the Store handler answers `RATE_LIMITED {"kind":"Busy","retry_after_ms":N
 (N in 500..5000, longer the fuller the queue) instead of buffering the shard
 and stalling; gateways that predate 0.1.34 see a `RATE_LIMITED` reply and
 retry with their own backoff as before.
+
+## Multiple storage roots
+
+A node with several disks can give each disk its own store instead of
+aggregating them into one mount point (a union filesystem or a stripe). Listing the disks in `STORAGE_PATHS` makes the miner run one
+complete store per disk, like one OSD per disk in Ceph:
+
+```bash
+STORAGE_PATHS=/data/d1/arion,/data/d2/arion,...
+```
+
+Why it matters to the network:
+
+- **Write throughput.** Every root has its own packed volume, writer thread
+  and `fdatasync`; concurrent stores are spread over all of them instead of
+  queueing behind one writer and one sync for the whole node.
+- **Failure domain per disk.** A disk that fails, disappears or turns
+  read-only is taken out on its own: its shards are reported absent (so the
+  network re-places them) and the node keeps serving and storing on the
+  other disks. Behind one aggregated mount, a dead disk silently loses its
+  share of the shards while the node keeps claiming them.
+
+Rules and behaviour:
+
+- Every entry must be an absolute path to an **existing** directory on the
+  mounted disk. The miner never creates a root: a missing directory means
+  the disk is not mounted, and the root starts offline instead of becoming
+  an empty store on the system disk. Create each one once, after mounting:
+  `mkdir -p /data/dN/arion`.
+- A root used for the first time gets a `.arion-root` marker. A root that
+  already holds packed data without a marker (a former `STORAGE_PATH`
+  store, or a branch of a union mount) is refused at startup until
+  `miner split-union-index` has run (below). A single `STORAGE_PATH` store
+  refuses a directory carrying a marker.
+- Writes go to the root that already has the blob (live or in its trash),
+  else to the next writable root by smooth weighted round-robin on free
+  space above `STORAGE_ROOT_RESERVE_BYTES`. Reads try the roots in the
+  order of `STORAGE_PATHS`.
+- Root states: `healthy`; `full` (free space under the reserve or a write
+  failed with no space: still read, no new writes, healthy again with twice
+  the reserve free); `down` (device gone, read-only, repeated I/O errors or
+  two failed probes: not read at all); `offline` (could not be opened, e.g.
+  not mounted). A probe every `STORAGE_ROOT_PROBE_SECS` brings a `down` root
+  back when it answers on the same device, and opens an `offline` root once
+  its directory is there. A root remounted on another device comes back at
+  the next restart.
+- Deletes, removals and trash purges that reach the node while a root is
+  `down` or `offline` are written to `{data_dir}/storage-roots.pending`
+  (synced before the reply) and applied to that root before it serves
+  again, so a returning disk never brings deleted shards back.
+- Capacity sent to the validator is the sum over the usable roots, each
+  filesystem counted once, available space only on writable roots and minus
+  the reserve. The purge never drops an inventory row as absent while a
+  root is unusable.
+- A shard written while a root was away may exist twice once that root
+  returns; both copies are identical. Once every root is usable the miner
+  keeps the copy of the first root whose bytes verify and removes the
+  others (logged as `duplicate suspects resolved`).
+- Per-root status is logged at startup (`storage root opened`), on every
+  state change (`storage root: healthy|full|unusable`) and every 10 minutes
+  (`storage root: summary`).
+
+### Moving from a union mount to one root per disk
+
+With a union filesystem whose create policy puts each new file wholly on
+one branch (no striping of a file across branches), each branch already holds its share of the volume files, e.g.
+`/data/d3/arion/packed/volumes/vol-000123.dat`. Only the
+packed index (`packed/index/`) is shared: it describes every branch's
+volumes and sits on whichever branch received it. The migration therefore
+moves no data: `miner split-union-index` derives one index per branch from
+the union store's exact state (live entries, trash, delete journal), then
+the branches are listed in `STORAGE_PATHS`. Flat-layout files (`ab/cd/*.bin`,
+`trash/`) are already self-contained per branch.
+
+Runbook, as an example, for a 4-disk node whose union is mounted at
+`/data/union/arion` over `/data/d1/arion` .. `/data/d4/arion` (adapt the
+paths, the disk count and the service name):
+
+1. **Upgrade first.** Run this miner version on the union as before
+   (`STORAGE_PATH` unchanged) and check it is healthy. Nothing changes in
+   single-path mode.
+2. **Data directory.** If `storage.data_dir` is on the union mount, its
+   files (`keypair.bin`, `inventory.db`, purge state) are spread over the
+   branches and vanish with the union. Back up the identity
+   (`miner backup --data-dir ...`), and plan to copy the directory off the
+   union in step 4.
+3. **Stop the miner cleanly** and keep it stopped:
+   `systemctl stop arion-miner && systemctl disable arion-miner` (any
+   watchdog or auto-restart included). Wait for `Shutdown complete` in the
+   journal: the clean stop writes the index snapshot the split relies on.
+4. While the union is still mounted, copy the data directory off it if
+   needed (`cp -a /data/union/arion-data /var/lib/arion-miner/data`)
+   and point `storage.data_dir` there.
+5. **Dry run**, union mounted:
+
+   ```bash
+   ROOTS=/data/d1/arion,/data/d2/arion,/data/d3/arion,/data/d4/arion
+   miner split-union-index --union /data/union/arion --roots "$ROOTS" --dry-run
+   ```
+
+   Expect one `split-union-index: branch` line per disk (volumes, live and
+   trashed blobs) and `union_scanned_bytes=0` (a clean stop). It refuses,
+   writing nothing, when a volume sits on two branches (an interrupted
+   relocation by the union filesystem: keep the complete copy, usually the
+   larger, after `cmp -n <smaller size>` shows the smaller is its prefix;
+   remove the other; rerun), when a volume is on no listed branch (a disk
+   missing from `--roots`), or when a branch file is not the length the
+   index covers.
+6. **Split**: the same command without `--dry-run`. It reads the union
+   index once (about 40 bytes per blob) and writes, on every branch,
+   `packed/index/` (live table, snapshot, a copy of the delete journal) and
+   `.arion-root`; the former index directory is kept as
+   `packed/index.union-<id>` on the branch that held it. No volume data is
+   read or moved. Interrupted, it can be rerun: before the first branch is
+   committed it starts over, after it only finishes the remaining branches.
+7. **Unmount the union** and remove it from `/etc/fstab` or its mount unit,
+   so it never comes back: the per-branch indexes and volume ids no longer
+   form a valid union store (a single-path miner refuses it anyway).
+8. **Configure** `STORAGE_PATHS="$ROOTS"`, remove `STORAGE_PATH`, keep
+   `STORE_BACKEND=packed`.
+9. **Start** (`systemctl enable --now arion-miner`). Check for one
+   `storage root opened` line per disk with `state=healthy`,
+   `Initialized multi-root blob storage`, then registration and heartbeats.
+   The first start after the change counts the flat layout once in the
+   background (the inventory's clean-stop marker names the store roots).
+10. After some days of normal operation, delete the backup:
+    `rm -r /data/dN/arion/packed/index.union-<id>`.
+
+**Rollback.** Until the miner has started with `STORAGE_PATHS` (step 9),
+the union store can be restored: on every branch remove `.arion-root` and
+the new `packed/index`, rename `packed/index.union-<id>` back to
+`packed/index` where it exists, remount the union. After the miner has
+written in multi-root mode there is no way back to the union: each root
+numbers its volumes on its own.
+
+**Residual risks.**
+
+- The split copies the union's state as is. After an unclean stop the union
+  open rescans volume tails and replays the delete journal over them, which
+  trashes a shard stored again after its delete (the single-root behaviour
+  of the packed store); hence the clean stop in step 3.
+- The live index of each root is memory-mapped from that root's disk. A
+  disk that dies between two probes can fault a mapped page and stop the
+  process; the next start finds the root unopenable and runs without it.
+- Deferred deletes are keyed by the configured path. Swapping two disks
+  between mount points while one is away applies its deferred deletes to
+  the other disk (they trash, restorably, shards that were deleted network
+  wide, or copies held twice).
+- Roots on the same filesystem are allowed (logged): they share capacity
+  (counted once) and one failure domain.
+
+**What to measure on real disks.** `cargo test -p miner --release --
+--ignored multi_root_write_throughput --nocapture` with
+`MULTI_ROOT_BENCH_DIRS=/data/d1/bench,/data/d2/bench,...` writes
+20 000 blobs of 4 KiB from 64 concurrent writers with 1, 2, 4, ... roots
+(one per listed directory) and prints blobs/s and MiB/s. On the node itself,
+compare before and after the change: stores per second and their ACK
+latency, `fdatasync` time per disk, iowait, read latency under write load,
+and time to `ready to serve` after a restart.
 
 ## Identity
 

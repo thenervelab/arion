@@ -87,6 +87,9 @@ pub trait PassEnv: Send + Sync {
 pub struct LiveEnv {
     pub endpoint: quinn::Endpoint,
     pub blobs_dir: std::path::PathBuf,
+    /// The live store: its [`BlobStore::disk_space`] (a multi-root store
+    /// sums its writable roots) takes precedence over `blobs_dir`.
+    pub store: Arc<dyn BlobStore>,
 }
 
 #[async_trait::async_trait]
@@ -132,7 +135,10 @@ impl PassEnv for LiveEnv {
         inventory::insert_shard(hash_hex)
     }
     fn free_bytes(&self) -> u64 {
-        crate::helpers::blocking(|| fs2::available_space(&self.blobs_dir)).unwrap_or(0)
+        crate::helpers::blocking(|| match self.store.disk_space() {
+            Some(space) => space.available,
+            None => fs2::available_space(&self.blobs_dir).unwrap_or(0),
+        })
     }
     fn purge_active(&self) -> bool {
         state::purge_pass_active()
@@ -1110,7 +1116,7 @@ pub async fn run_loop(
     purge_cfg: PurgeConfig,
     cfg: BackfillConfig,
     endpoint: quinn::Endpoint,
-    blobs_dir: std::path::PathBuf,
+    blobs_dirs: Vec<std::path::PathBuf>,
 ) {
     if !cfg.enabled {
         info!("backfill: disabled (BACKFILL_ENABLED=false)");
@@ -1149,7 +1155,7 @@ pub async fn run_loop(
     );
 
     let metrics = metrics();
-    let mode = source_mode(&cfg, store.as_ref(), &blobs_dir);
+    let mode = source_mode(&cfg, store.as_ref(), &blobs_dirs);
     let local = {
         let dirs = cfg.local_source_dirs.clone();
         let mode = mode.clone();
@@ -1168,7 +1174,8 @@ pub async fn run_loop(
     }
     let env: Arc<dyn PassEnv> = Arc::new(LiveEnv {
         endpoint,
-        blobs_dir,
+        blobs_dir: blobs_dirs.first().cloned().unwrap_or_default(),
+        store: Arc::clone(&store),
     });
     let mut cursor = Cursor::load_from(&data_dir);
     if cursor != Cursor::default() {
@@ -1350,7 +1357,7 @@ pub async fn run_loop(
 fn source_mode(
     cfg: &BackfillConfig,
     store: &dyn BlobStore,
-    blobs_dir: &std::path::Path,
+    blobs_dirs: &[std::path::PathBuf],
 ) -> SourceMode {
     if !cfg.local_source_delete {
         return SourceMode::ReadOnly;
@@ -1362,7 +1369,7 @@ fn source_mode(
         return SourceMode::ReadOnly;
     }
     SourceMode::Move {
-        live_root: blobs_dir.to_path_buf(),
+        live_roots: blobs_dirs.to_vec(),
     }
 }
 
@@ -2776,7 +2783,7 @@ mod tests {
         }
         fn mode(&self) -> SourceMode {
             SourceMode::Move {
-                live_root: self.live_dir.path().to_path_buf(),
+                live_roots: vec![self.live_dir.path().to_path_buf()],
             }
         }
         fn sources(&self, mode: &SourceMode) -> LocalSources {
@@ -2966,7 +2973,7 @@ mod tests {
         assert!(m.live.store_is_durable());
         assert!(!migrating.store_is_durable());
         assert_eq!(
-            source_mode(&cfg, &migrating, m.live_dir.path()),
+            source_mode(&cfg, &migrating, &[m.live_dir.path().to_path_buf()]),
             SourceMode::ReadOnly
         );
     }
@@ -3020,18 +3027,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let flat = FlatBlobStore::new(dir.path()).unwrap();
         let mut cfg = fast_cfg();
-        assert_eq!(source_mode(&cfg, &flat, dir.path()), SourceMode::ReadOnly);
+        assert_eq!(
+            source_mode(&cfg, &flat, &[dir.path().to_path_buf()]),
+            SourceMode::ReadOnly
+        );
         cfg.local_source_delete = true;
         assert_eq!(
-            source_mode(&cfg, &flat, dir.path()),
+            source_mode(&cfg, &flat, &[dir.path().to_path_buf()]),
             SourceMode::ReadOnly,
             "flat store: no sync before the ACK"
         );
         let packed = crate::packed_store::PackedStore::open(dir.path().join("packed")).unwrap();
         assert_eq!(
-            source_mode(&cfg, packed.as_ref(), dir.path()),
+            source_mode(&cfg, packed.as_ref(), &[dir.path().to_path_buf()]),
             SourceMode::Move {
-                live_root: dir.path().to_path_buf()
+                live_roots: vec![dir.path().to_path_buf()]
             }
         );
     }

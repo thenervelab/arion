@@ -154,6 +154,8 @@ fn record_len(name_len: usize, payload_len: usize) -> u64 {
 
 use crate::mmap_index::{Loc, MmapLiveIndex};
 
+pub(crate) mod split;
+
 #[derive(Clone, Debug)]
 struct TrashEntry {
     loc: Loc,
@@ -318,6 +320,16 @@ impl PackedStore {
         Self::open_with_limits(root, volume_target_bytes(), inflight_budget_bytes())
     }
 
+    /// [`open`](Self::open) with an explicit in-flight write budget: each
+    /// root of a multi-root store gets its share of the process-wide one,
+    /// so the total stays what one root would have.
+    pub(crate) fn open_with_budget(
+        root: impl AsRef<Path>,
+        inflight_budget: u64,
+    ) -> std::io::Result<Arc<Self>> {
+        Self::open_with_limits(root, volume_target_bytes(), inflight_budget)
+    }
+
     /// Permits one payload takes from the admission budget: payload plus
     /// the fixed per-request overhead, capped at the budget so one
     /// oversized blob is still admissible (alone). Bounded by `u32::MAX`
@@ -346,124 +358,18 @@ impl PackedStore {
         volume_target: u64,
         inflight_budget: u64,
     ) -> std::io::Result<Arc<Self>> {
-        let root = root.as_ref().to_path_buf();
-        let volumes_dir = root.join("volumes");
-        let index_dir = root.join("index");
-        std::fs::create_dir_all(&volumes_dir)?;
-        std::fs::create_dir_all(&index_dir)?;
-
-        let (live, sweep) = MmapLiveIndex::open(&index_dir.join("live.idx"))?;
-        let mut idx = IndexState {
-            live,
-            trash: HashMap::new(),
-            dead_bytes: HashMap::new(),
-            indexed_len: HashMap::new(),
-        };
-        let mut watermarks: HashMap<u32, u64> = HashMap::new();
-        let mut journal_covered = 0u64;
-        if sweep.torn {
-            // The live table cannot be trusted: ignore the snapshot too and
-            // rebuild everything from the volumes plus the full journal
-            // (which is never truncated), exactly like a missing snapshot.
-            tracing::warn!("packed store: live index rebuilt from volumes (full scan)");
-        } else {
-            load_snapshot(
-                &index_dir.join("snapshot.bin"),
-                &mut idx,
-                &mut watermarks,
-                &mut journal_covered,
-            );
-        }
-
-        // Enumerate volumes, scan each from its watermark, truncate torn
-        // tails. Records override snapshot state (they are the truth).
-        let mut vol_ids: Vec<u32> = std::fs::read_dir(&volumes_dir)?
-            .flatten()
-            .filter_map(|e| {
-                let n = e.file_name().into_string().ok()?;
-                n.strip_prefix("vol-")?
-                    .strip_suffix(".dat")?
-                    .parse::<u32>()
-                    .ok()
-            })
-            .collect();
-        vol_ids.sort_unstable();
-
-        let mut used = 0u64;
-        let mut trashed = 0u64;
-        let mut volume_bytes = 0u64;
-        let mut scanned_on_open = 0u64;
-        for &vol in &vol_ids {
-            let path = volume_path(&volumes_dir, vol);
-            let f = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)?;
-            let len = f.metadata()?.len();
-            let start = watermarks.get(&vol).copied().unwrap_or(0).min(len);
-            let off = scan_volume(&f, start, len, &mut |name, off, payload_len| {
-                let name_len = name.len() as u16;
-                let key = name_key(&name);
-                let loc = Loc {
-                    vol,
-                    off,
-                    name_len,
-                    payload_len,
-                };
-                // A record the table already holds at this very location
-                // (re-scanned tail) supersedes nothing.
-                if let Some(old) = idx.live.insert(key, loc)?
-                    && old != loc
-                {
-                    *idx.dead_bytes.entry(old.vol).or_default() += old.payload_len as u64;
-                }
-                if let Some(t) = idx.trash.remove(&key) {
-                    // A re-store after a delete supersedes the trash entry.
-                    *idx.dead_bytes.entry(t.loc.vol).or_default() += t.loc.payload_len as u64;
-                }
-                Ok(())
-            })
-            .map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!("packed store: scan of {} failed: {e}", path.display()),
-                )
-            })?;
-            scanned_on_open += off - start;
-            if off < len {
-                tracing::warn!(
-                    vol,
-                    good = off,
-                    len,
-                    "packed store: truncating torn volume tail"
-                );
-                f.set_len(off)?;
-                f.sync_data()?;
-            }
-            idx.indexed_len.insert(vol, off);
-            volume_bytes += off;
-        }
-
-        // Replay the op journal past what the snapshot already covers.
-        let journal_path = index_dir.join("journal.log");
-        let mut journal = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&journal_path)?;
-        let jlen = journal.metadata()?.len();
-        if journal_covered > jlen {
-            journal_covered = 0; // snapshot from a future journal: distrust
-        }
-        replay_journal(&mut journal, journal_covered, &mut idx);
-
-        // Seal the rebuilt/updated table now: a clean boot from here on
-        // trusts it and only scans volume tails.
-        idx.live.flush()?;
-        idx.live.for_each(|_, loc| used += loc.payload_len as u64);
-        for t in idx.trash.values() {
-            trashed += t.loc.payload_len as u64;
-        }
+        let LoadedState {
+            root,
+            volumes_dir,
+            index_dir,
+            idx,
+            vol_ids,
+            used,
+            trashed,
+            volume_bytes,
+            journal,
+            scanned_on_open,
+        } = load_state(root.as_ref())?;
 
         let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
         let store = Arc::new(Self {
@@ -800,27 +706,7 @@ impl PackedStore {
             // watermarks that declare what it covers. A crash in between
             // only makes the next open re-scan a longer volume tail.
             idx.live.flush()?;
-            let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-            w.write_all(&SNAP_MAGIC.to_le_bytes())?;
-            w.write_all(&2u32.to_le_bytes())?; // version 2: no live section
-            w.write_all(&jlen.to_le_bytes())?;
-            w.write_all(&(watermarks.len() as u32).to_le_bytes())?;
-            for (vol, len) in &watermarks {
-                w.write_all(&vol.to_le_bytes())?;
-                w.write_all(&len.to_le_bytes())?;
-            }
-            w.write_all(&(idx.trash.len() as u64).to_le_bytes())?;
-            for t in idx.trash.values() {
-                let name_b = t.name.as_bytes();
-                w.write_all(&(name_b.len() as u16).to_le_bytes())?;
-                w.write_all(name_b)?;
-                w.write_all(&t.loc.vol.to_le_bytes())?;
-                w.write_all(&t.loc.off.to_le_bytes())?;
-                w.write_all(&t.loc.name_len.to_le_bytes())?;
-                w.write_all(&t.loc.payload_len.to_le_bytes())?;
-            }
-            let f = w.into_inner().map_err(|e| e.into_error())?;
-            f.sync_data()?;
+            write_snapshot_file(&tmp, jlen, &watermarks, idx.trash.values())?;
         }
         std::fs::rename(&tmp, &final_path)?;
         drop(journal);
@@ -833,6 +719,195 @@ impl PackedStore {
     pub fn scanned_on_open(&self) -> u64 {
         self.scanned_on_open
     }
+}
+
+/// Everything [`PackedStore::open`] rebuilds before the writer starts:
+/// snapshot loaded, volume tails scanned and torn tails truncated, journal
+/// replayed, live table flushed. Shared with the union-index split, which
+/// needs the exact index state without a writer.
+struct LoadedState {
+    root: PathBuf,
+    volumes_dir: PathBuf,
+    index_dir: PathBuf,
+    idx: IndexState,
+    vol_ids: Vec<u32>,
+    used: u64,
+    trashed: u64,
+    volume_bytes: u64,
+    journal: std::fs::File,
+    scanned_on_open: u64,
+}
+
+/// Volume ids present in `volumes_dir`, ascending. One `read_dir` of a
+/// directory holding a few thousand volume files at most (1 GiB each).
+fn list_volume_ids(volumes_dir: &Path) -> std::io::Result<Vec<u32>> {
+    let mut vol_ids: Vec<u32> = std::fs::read_dir(volumes_dir)?
+        .flatten()
+        .filter_map(|e| {
+            let n = e.file_name().into_string().ok()?;
+            n.strip_prefix("vol-")?
+                .strip_suffix(".dat")?
+                .parse::<u32>()
+                .ok()
+        })
+        .collect();
+    vol_ids.sort_unstable();
+    Ok(vol_ids)
+}
+
+fn load_state(root: &Path) -> std::io::Result<LoadedState> {
+    let root = root.to_path_buf();
+    let volumes_dir = root.join("volumes");
+    let index_dir = root.join("index");
+    std::fs::create_dir_all(&volumes_dir)?;
+    std::fs::create_dir_all(&index_dir)?;
+
+    let (live, sweep) = MmapLiveIndex::open(&index_dir.join("live.idx"))?;
+    let mut idx = IndexState {
+        live,
+        trash: HashMap::new(),
+        dead_bytes: HashMap::new(),
+        indexed_len: HashMap::new(),
+    };
+    let mut watermarks: HashMap<u32, u64> = HashMap::new();
+    let mut journal_covered = 0u64;
+    if sweep.torn {
+        // The live table cannot be trusted: ignore the snapshot too and
+        // rebuild everything from the volumes plus the full journal
+        // (which is never truncated), exactly like a missing snapshot.
+        tracing::warn!("packed store: live index rebuilt from volumes (full scan)");
+    } else {
+        load_snapshot(
+            &index_dir.join("snapshot.bin"),
+            &mut idx,
+            &mut watermarks,
+            &mut journal_covered,
+        );
+    }
+
+    // Enumerate volumes, scan each from its watermark, truncate torn
+    // tails. Records override snapshot state (they are the truth).
+    let vol_ids = list_volume_ids(&volumes_dir)?;
+
+    let mut used = 0u64;
+    let mut trashed = 0u64;
+    let mut volume_bytes = 0u64;
+    let mut scanned_on_open = 0u64;
+    for &vol in &vol_ids {
+        let path = volume_path(&volumes_dir, vol);
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let len = f.metadata()?.len();
+        let start = watermarks.get(&vol).copied().unwrap_or(0).min(len);
+        let off = scan_volume(&f, start, len, &mut |name, off, payload_len| {
+            let name_len = name.len() as u16;
+            let key = name_key(&name);
+            let loc = Loc {
+                vol,
+                off,
+                name_len,
+                payload_len,
+            };
+            // A record the table already holds at this very location
+            // (re-scanned tail) supersedes nothing.
+            if let Some(old) = idx.live.insert(key, loc)?
+                && old != loc
+            {
+                *idx.dead_bytes.entry(old.vol).or_default() += old.payload_len as u64;
+            }
+            if let Some(t) = idx.trash.remove(&key) {
+                // A re-store after a delete supersedes the trash entry.
+                *idx.dead_bytes.entry(t.loc.vol).or_default() += t.loc.payload_len as u64;
+            }
+            Ok(())
+        })
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("packed store: scan of {} failed: {e}", path.display()),
+            )
+        })?;
+        scanned_on_open += off - start;
+        if off < len {
+            tracing::warn!(
+                vol,
+                good = off,
+                len,
+                "packed store: truncating torn volume tail"
+            );
+            f.set_len(off)?;
+            f.sync_data()?;
+        }
+        idx.indexed_len.insert(vol, off);
+        volume_bytes += off;
+    }
+
+    // Replay the op journal past what the snapshot already covers.
+    let journal_path = index_dir.join("journal.log");
+    let mut journal = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(&journal_path)?;
+    let jlen = journal.metadata()?.len();
+    if journal_covered > jlen {
+        journal_covered = 0; // snapshot from a future journal: distrust
+    }
+    replay_journal(&mut journal, journal_covered, &mut idx);
+
+    // Seal the rebuilt/updated table now: a clean boot from here on
+    // trusts it and only scans volume tails.
+    idx.live.flush()?;
+    idx.live.for_each(|_, loc| used += loc.payload_len as u64);
+    for t in idx.trash.values() {
+        trashed += t.loc.payload_len as u64;
+    }
+    Ok(LoadedState {
+        root,
+        volumes_dir,
+        index_dir,
+        idx,
+        vol_ids,
+        used,
+        trashed,
+        volume_bytes,
+        journal,
+        scanned_on_open,
+    })
+}
+
+/// Write a version-2 snapshot (journal length covered, per-volume
+/// watermarks, trash entries) to `path` and `fdatasync` it. The caller
+/// renames it into place.
+fn write_snapshot_file<'a>(
+    path: &Path,
+    jlen: u64,
+    watermarks: &[(u32, u64)],
+    trash: impl ExactSizeIterator<Item = &'a TrashEntry>,
+) -> std::io::Result<()> {
+    let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
+    w.write_all(&SNAP_MAGIC.to_le_bytes())?;
+    w.write_all(&2u32.to_le_bytes())?; // version 2: no live section
+    w.write_all(&jlen.to_le_bytes())?;
+    w.write_all(&(watermarks.len() as u32).to_le_bytes())?;
+    for (vol, len) in watermarks {
+        w.write_all(&vol.to_le_bytes())?;
+        w.write_all(&len.to_le_bytes())?;
+    }
+    w.write_all(&(trash.len() as u64).to_le_bytes())?;
+    for t in trash {
+        let name_b = t.name.as_bytes();
+        w.write_all(&(name_b.len() as u16).to_le_bytes())?;
+        w.write_all(name_b)?;
+        w.write_all(&t.loc.vol.to_le_bytes())?;
+        w.write_all(&t.loc.off.to_le_bytes())?;
+        w.write_all(&t.loc.name_len.to_le_bytes())?;
+        w.write_all(&t.loc.payload_len.to_le_bytes())?;
+    }
+    let f = w.into_inner().map_err(|e| e.into_error())?;
+    f.sync_data()
 }
 
 fn load_snapshot(
@@ -1170,37 +1245,32 @@ impl crate::store::BlobStore for PackedStore {
     /// steady-state listings.
     fn list_hashes(&self) -> Vec<String> {
         let mut out = Vec::new();
-        let trash_keys: std::collections::HashSet<u128> = {
-            let idx = self.idx.read().unwrap();
-            out.reserve(idx.live.len() as usize);
-            idx.trash.keys().copied().collect()
+        self.for_each_hash(&mut |h| out.push(h.to_string()));
+        out
+    }
+
+    /// Streams volume record headers (payloads seeked over). A name is
+    /// emitted only for the record its live index entry points at, so each
+    /// live blob comes out exactly once (superseded records, trashed blobs
+    /// and truncated-key collisions are skipped) without a set of every
+    /// name seen.
+    fn for_each_hash(&self, visit: &mut dyn FnMut(&str)) {
+        let vols = match list_volume_ids(&self.volumes_dir) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "packed store: volume listing failed");
+                return;
+            }
         };
-        let mut seen: std::collections::HashSet<u128> = std::collections::HashSet::new();
-        let Ok(entries) = std::fs::read_dir(&self.volumes_dir) else {
-            return out;
-        };
-        let mut vols: Vec<u32> = entries
-            .flatten()
-            .filter_map(|e| {
-                let n = e.file_name().into_string().ok()?;
-                n.strip_prefix("vol-")?.strip_suffix(".dat")?.parse().ok()
-            })
-            .collect();
-        vols.sort_unstable();
         for vol in vols {
             let Ok(f) = std::fs::File::open(volume_path(&self.volumes_dir, vol)) else {
                 continue;
             };
             let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-            let scanned = scan_volume(&f, 0, len, &mut |name, _, _| {
-                let key = name_key(&name);
-                if seen.insert(key) && !trash_keys.contains(&key) {
-                    // Later records supersede earlier ones for the same key,
-                    // but the payload location is irrelevant for a listing —
-                    // only liveness matters, and live-ness is keyed.
-                    if self.idx.read().unwrap().live.contains_key(key) {
-                        out.push(name);
-                    }
+            let scanned = scan_volume(&f, 0, len, &mut |name, off, _| {
+                let live = self.idx.read().unwrap().live.get(name_key(&name));
+                if live.is_some_and(|l| l.vol == vol && l.off == off) {
+                    visit(&name);
                 }
                 Ok(())
             });
@@ -1208,7 +1278,6 @@ impl crate::store::BlobStore for PackedStore {
                 tracing::warn!(vol, error = %e, "packed store: listing scan of a volume failed");
             }
         }
-        out
     }
 
     fn list_trashed_hashes(&self) -> Vec<String> {

@@ -873,9 +873,12 @@ pub fn decode_tombstones(bytes: &[u8], expect: ListExpectation<'_>) -> Result<Ve
 }
 
 /// Upper bound on the tombstone hashes a load keeps in memory (32 bytes
-/// each): 8 M hashes, 256 MiB. Above it the load keeps no tombstones at
-/// all (never a subset) and says so: the tombstone class is an
-/// acceleration, the orphan gates still reclaim the same blobs later.
+/// each): 8 M hashes, 256 MiB. Above it the load keeps the tombstones of
+/// whole PGs up to the cap and leaves the others' blobs under the orphan
+/// gates (the tombstone class is an acceleration: a missing tombstone
+/// never deletes anything, the age clause still reclaims the blob later).
+/// Readers before this kept none at all above the cap, which is why the
+/// writer bounds a whole generation by this figure by default.
 pub const MAX_TOMBSTONE_HASHES: usize = 8 << 20;
 
 // ============================================================================
@@ -1135,9 +1138,9 @@ pub struct LoadedGeneration {
     /// Blob hashes of every shard of every manifest of an owned PG that
     /// the writer saw deleted inside its tombstone window: sorted, unique,
     /// exact (no false positive: a hit is a deletion without the age
-    /// gate). Empty when the generation predates tombstones, when a PG's
-    /// tombstones failed to load, or when they exceed
-    /// [`MAX_TOMBSTONE_HASHES`]; `tombstone_pgs` tells which.
+    /// gate). Empty when the generation predates tombstones or when a PG's
+    /// tombstones failed to load; above [`MAX_TOMBSTONE_HASHES`] only
+    /// whole PGs up to the cap are kept. `tombstone_pgs` tells which.
     pub tombstones: Vec<[u8; 32]>,
     /// Owned PGs whose tombstones were fetched, verified and kept. Less
     /// than `listed_pgs` means some PGs are enforced without tombstones.
@@ -1787,8 +1790,14 @@ pub async fn load_generation(
             "pg-lists: generation declares no holder sets or live filter: loaded, never enforced"
         );
     }
-    let (mut tombstones, tombstone_pgs) =
-        load_tombstones(source, manifest, listed.iter().copied(), concurrency).await;
+    let (mut tombstones, tombstone_pgs) = load_tombstones(
+        source,
+        manifest,
+        listed.iter().copied(),
+        concurrency,
+        MAX_TOMBSTONE_HASHES as u64,
+    )
+    .await;
     let mut tombstones_retained_live_ref = 0u64;
     if let Some(sets) = &sets {
         // A hash any list of the generation names (or the base withholds)
@@ -2367,15 +2376,19 @@ async fn fold_lists_into(
 /// Fetch and verify the tombstones of `pgs`, merged into one sorted,
 /// unique set. Unlike the lists, a failure here never fails the load: a
 /// missing tombstone is a blob kept under the orphan gates, the safe
-/// direction. All-or-nothing though — one PG's failure drops every
-/// tombstone of the load, so the class is never enforced on a partial
-/// view of what the writer saw deleted, and the caller can tell from
-/// `tombstone_pgs == 0` versus `listed_pgs`.
+/// direction. All-or-nothing on integrity — one PG's failure drops every
+/// tombstone of the load (a body that does not verify says nothing
+/// trustworthy about the others), and the caller can tell from
+/// `tombstone_pgs == 0` versus `listed_pgs`. Volume is per PG instead:
+/// above `cap` rows the tombstones of whole PGs are kept up to the cap
+/// ([`fit_tombstone_cap`]) and the others left out (`tombstone_pgs` below
+/// `listed_pgs`); a left-out PG's blobs stay under the orphan gates.
 async fn load_tombstones(
     source: &dyn ListSource,
     manifest: &Manifest,
     pgs: impl Iterator<Item = u32>,
     concurrency: usize,
+    cap: u64,
 ) -> (Vec<[u8; 32]>, usize) {
     let generation = manifest.generation;
     let mut empty_pgs = 0usize;
@@ -2394,20 +2407,20 @@ async fn load_tombstones(
         debug!(generation, "pg-lists: generation carries no tombstones");
         return (Vec::new(), empty_pgs);
     }
-    let declared: u64 = wanted
-        .iter()
-        .map(|(_, obj)| obj.size.saturating_sub(TOMBSTONE_HEADER_LEN as u64) / 32)
-        .sum();
-    if declared > MAX_TOMBSTONE_HASHES as u64
-        || wanted.iter().any(|(_, obj)| obj.size > MAX_LIST_BYTES)
-    {
+    let fitted = fit_tombstone_cap(wanted, cap, generation);
+    if fitted.left_out_pgs > 0 {
         warn!(
             generation,
-            declared,
-            cap = MAX_TOMBSTONE_HASHES,
-            "pg-lists: tombstones exceed the in-memory cap: none kept, blobs stay under the orphan gates"
+            kept_rows = fitted.declared,
+            left_out_rows = fitted.left_out_rows,
+            left_out_pgs = fitted.left_out_pgs,
+            cap,
+            "pg-lists: tombstones exceed the in-memory cap: whole PGs left out, their blobs stay under the orphan gates"
         );
-        return (Vec::new(), 0);
+    }
+    let (wanted, declared) = (fitted.wanted, fitted.declared);
+    if wanted.is_empty() {
+        return (Vec::new(), empty_pgs);
     }
     use futures::StreamExt;
     let (ec_k, ec_m) = (manifest.ec_k, manifest.ec_m);
@@ -2471,6 +2484,74 @@ async fn load_tombstones(
         hashes.dedup();
     });
     (hashes, pgs_done + empty_pgs)
+}
+
+/// The non-empty `.deleted` objects a load fetches under `cap` rows.
+struct FittedTombstones {
+    wanted: Vec<(u32, ObjectEntry)>,
+    /// Rows the kept objects declare (signed sizes).
+    declared: u64,
+    left_out_rows: u64,
+    left_out_pgs: usize,
+}
+
+/// Keep whole PGs' tombstones up to `cap` rows, by the signed sizes,
+/// before any fetch. Under the cap everything is kept; above it PGs are
+/// taken greedily in PG order from a start that rotates with the
+/// generation (the same golden-ratio stride as the writer's budget), a PG
+/// that does not fit the remaining rows, or whose object exceeds
+/// [`MAX_LIST_BYTES`], being skipped. Leaving a PG out only sends its
+/// blobs back to the orphan gates: a tombstone lifts the age clause, its
+/// absence never deletes anything.
+fn fit_tombstone_cap(
+    mut wanted: Vec<(u32, ObjectEntry)>,
+    cap: u64,
+    generation: u64,
+) -> FittedTombstones {
+    let rows = |obj: &ObjectEntry| obj.size.saturating_sub(TOMBSTONE_HEADER_LEN as u64) / 32;
+    wanted.sort_unstable_by_key(|(pg, _)| *pg);
+    let total = wanted
+        .iter()
+        .fold(0u64, |total, (_, obj)| total.saturating_add(rows(obj)));
+    if total <= cap && wanted.iter().all(|(_, obj)| obj.size <= MAX_LIST_BYTES) {
+        return FittedTombstones {
+            wanted,
+            declared: total,
+            left_out_rows: 0,
+            left_out_pgs: 0,
+        };
+    }
+    let n = wanted.len();
+    let phase = u128::from(generation.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    // < n: a 64-bit fraction times n, shifted back.
+    let start = ((phase * n as u128) >> 64) as usize;
+    let mut keep = vec![false; n];
+    let mut remaining = cap;
+    for offset in 0..n {
+        let index = (start + offset) % n;
+        let (_, obj) = &wanted[index];
+        let count = rows(obj);
+        if obj.size <= MAX_LIST_BYTES && count <= remaining {
+            remaining -= count;
+            keep[index] = true;
+        }
+    }
+    let mut fitted = FittedTombstones {
+        wanted: Vec::with_capacity(n),
+        declared: 0,
+        left_out_rows: 0,
+        left_out_pgs: 0,
+    };
+    for ((pg, obj), keep) in wanted.into_iter().zip(keep) {
+        if keep {
+            fitted.declared = fitted.declared.saturating_add(rows(&obj));
+            fitted.wanted.push((pg, obj));
+        } else {
+            fitted.left_out_rows = fitted.left_out_rows.saturating_add(rows(&obj));
+            fitted.left_out_pgs += 1;
+        }
+    }
+    fitted
 }
 
 /// Builders that write a bucket layout to a directory, shared by the
@@ -5021,6 +5102,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((loaded.tombstone_pgs, loaded.tombstones.len()), (0, 0));
+    }
+
+    /// The writer's contract (pg-lists `MAX_TOMBSTONE_ROWS`): a generation
+    /// whose `.deleted` rows total exactly the reader's cap, split over
+    /// several PGs, is kept whole by this reader. Writes 256 MiB of
+    /// fixtures: `cargo test --release -p miner -- --ignored
+    /// tombstones_at_the_reader_cap`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "writes 256 MiB of tombstone fixtures"]
+    async fn tombstones_at_the_reader_cap_are_kept_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = deterministic_key(1);
+        let half = (MAX_TOMBSTONE_HASHES / 2) as u32;
+        let fx = write_generation_with_tombstones(
+            dir.path(),
+            &key,
+            7,
+            &[10, 11],
+            &unindexed(),
+            &|pg| sorted_records(pg, 5),
+            Some(&|pg| (0..half).map(|i| hash_for(pg, 1_000 + i)).collect()),
+        );
+        let source = DirListSource::new(dir.path());
+        let manifest = fetch_manifest(&source, 7, &fx.validator_hex())
+            .await
+            .unwrap();
+        let loaded = load_generation(&source, &manifest, &[10, 11], MY_UID, 2, cache_dir().path())
+            .await
+            .unwrap();
+        assert_eq!(loaded.tombstone_pgs, 2);
+        assert_eq!(loaded.tombstones.len(), MAX_TOMBSTONE_HASHES);
+        assert!(loaded.is_tombstoned(&hash_for(11, 1_000 + half - 1)));
+    }
+
+    /// Above the cap the load keeps whole PGs up to it instead of nothing:
+    /// every kept PG complete, the rest left out before any GET (their
+    /// bodies may be absent), and the same selection on every load.
+    #[tokio::test]
+    async fn tombstones_over_the_cap_keep_whole_pgs_up_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = deterministic_key(1);
+        let rows =
+            |pg: u32| -> Vec<[u8; 32]> { (0..pg - 9).map(|i| hash_for(pg, 1_000 + i)).collect() };
+        // PG 10..=13 carry 1, 2, 3, 4 rows: 10 in all.
+        let fx = write_generation_with_tombstones(
+            dir.path(),
+            &key,
+            7,
+            &[10, 11, 12, 13],
+            &unindexed(),
+            &|pg| sorted_records(pg, 5),
+            Some(&rows),
+        );
+        let source = DirListSource::new(dir.path());
+        let manifest = fetch_manifest(&source, 7, &fx.validator_hex())
+            .await
+            .unwrap();
+        let pgs = [10u32, 11, 12, 13];
+        let (all, done) = load_tombstones(&source, &manifest, pgs.into_iter(), 2, 10).await;
+        assert_eq!((all.len(), done), (10, 4), "at the cap: everything");
+
+        let (kept, done) = load_tombstones(&source, &manifest, pgs.into_iter(), 2, 6).await;
+        assert!(!kept.is_empty() && kept.len() <= 6, "{}", kept.len());
+        assert!(done < 4);
+        // Whole PGs only: a PG is either entirely in or entirely out.
+        let mut kept_rows = 0;
+        for pg in pgs {
+            let hits = rows(pg).iter().filter(|h| kept.contains(h)).count();
+            assert!(hits == 0 || hits == rows(pg).len(), "PG {pg} split");
+            kept_rows += hits;
+        }
+        assert_eq!(kept_rows, kept.len());
+        // Left-out PGs are never fetched.
+        for pg in pgs {
+            if rows(pg).iter().all(|h| !kept.contains(h)) {
+                std::fs::remove_file(dir.path().join(format!("gen/7/pg/{pg:05}.deleted"))).unwrap();
+            }
+        }
+        let (again, _) = load_tombstones(&source, &manifest, pgs.into_iter(), 2, 6).await;
+        assert_eq!(again, kept, "deterministic, no GET of a left-out PG");
+
+        // A cap below every PG keeps none, and says so by `tombstone_pgs`.
+        let (none, done) = load_tombstones(&source, &manifest, pgs.into_iter(), 2, 0).await;
+        assert_eq!((none.len(), done), (0, 0));
     }
 
     /// A header-only `.deleted` names no hash: it is counted without a

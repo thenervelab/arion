@@ -802,10 +802,15 @@ pub fn live_shards_page(after_hash: Option<&str>, limit: usize) -> Result<Vec<(S
 /// read before SQLite opened it): an old or copied database may carry
 /// rows and `stored_at` values that no longer describe the disk, and the
 /// count runs as usual.
-pub fn rebuild_from_fs(blobs_dir: &Path) -> Result<usize> {
+///
+/// `store_id` names the store in the clean-stop marker (the single root,
+/// or the comma-joined list of a multi-root store: a changed root list
+/// does not inherit the marker); `roots` are the store roots walked, each
+/// on its own filesystem.
+pub fn rebuild_from_fs(store_id: &Path, roots: &[&Path]) -> Result<usize> {
     let clean_stop = DB_PATH
         .get()
-        .is_some_and(|db| started_after_clean_stop(db, blobs_dir));
+        .is_some_and(|db| started_after_clean_stop(db, store_id));
     let db_age = DB_AGE_AT_OPEN.get().copied().flatten();
     let skip = skip_startup_count(clean_stop, startup_count_enabled(), db_age);
     if !clean_stop && !startup_count_enabled() && !skip {
@@ -815,7 +820,7 @@ pub fn rebuild_from_fs(blobs_dir: &Path) -> Result<usize> {
             "inventory: INVENTORY_STARTUP_COUNT=false ignored, no clean-stop marker and the database is old or its age unknown: counting the store"
         );
     }
-    rebuild_from_fs_inner(blobs_dir, skip)
+    rebuild_from_fs_inner(roots, skip)
 }
 
 /// Whether the startup count may be skipped: after a clean stop, or when
@@ -853,8 +858,9 @@ fn startup_count_from(raw: Option<&str>) -> bool {
 }
 
 /// [`rebuild_from_fs`] once the clean-stop marker has been judged.
-fn rebuild_from_fs_inner(blobs_dir: &Path, skip_count: bool) -> Result<usize> {
-    if !blobs_dir.exists() {
+fn rebuild_from_fs_inner(roots: &[&Path], skip_count: bool) -> Result<usize> {
+    let roots: Vec<&Path> = roots.iter().copied().filter(|r| r.exists()).collect();
+    if roots.is_empty() {
         return Ok(0);
     }
     let existing_before: i64 = db()?.lock().unwrap_or_else(|e| e.into_inner()).query_row(
@@ -876,11 +882,13 @@ fn rebuild_from_fs_inner(blobs_dir: &Path, skip_count: bool) -> Result<usize> {
     // the sharded ab/cd tree; a fresh DB on a sharded-layout node must see
     // every blob or the inventory would truthfully describe an empty store.
     let mut fs_count = 0i64;
-    crate::flat_store::for_each_bin(blobs_dir, &mut |h, _| {
-        if h.len() == 64 {
-            fs_count += 1;
-        }
-    });
+    for root in &roots {
+        crate::flat_store::for_each_bin(root, &mut |h, _| {
+            if h.len() == 64 {
+                fs_count += 1;
+            }
+        });
+    }
 
     let conn = db()?.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -946,18 +954,20 @@ fn rebuild_from_fs_inner(blobs_dir: &Path, skip_count: bool) -> Result<usize> {
         Ok(n)
     };
     let mut flush_err: Option<anyhow::Error> = None;
-    crate::flat_store::for_each_bin(blobs_dir, &mut |h, _| {
-        if flush_err.is_some() || h.len() != 64 {
-            return;
-        }
-        batch.push(h.to_string());
-        if batch.len() >= 10_000 {
-            match flush(&mut batch) {
-                Ok(n) => inserted += n,
-                Err(e) => flush_err = Some(e),
+    for root in &roots {
+        crate::flat_store::for_each_bin(root, &mut |h, _| {
+            if flush_err.is_some() || h.len() != 64 {
+                return;
             }
-        }
-    });
+            batch.push(h.to_string());
+            if batch.len() >= 10_000 {
+                match flush(&mut batch) {
+                    Ok(n) => inserted += n,
+                    Err(e) => flush_err = Some(e),
+                }
+            }
+        });
+    }
     if let Some(e) = flush_err {
         return Err(e);
     }
@@ -1610,7 +1620,7 @@ mod tests {
     /// `rebuild_from_fs` under the marker a test restart consumed.
     fn rebuild_after_restart(db_path: &std::path::Path, blobs: &std::path::Path) -> usize {
         let found = RESTART_FOUND.lock().unwrap().clone();
-        rebuild_from_fs_inner(blobs, marker_vouches(found.as_deref(), db_path, blobs)).unwrap()
+        rebuild_from_fs_inner(&[blobs], marker_vouches(found.as_deref(), db_path, blobs)).unwrap()
     }
 
     /// The count walk of `rebuild_from_fs` is skipped only after a clean

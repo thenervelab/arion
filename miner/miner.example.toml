@@ -43,6 +43,13 @@ family_id = "datacenter-1"
 # Directory for blob storage
 path = "data/miner/blobs"
 
+# Several storage roots, one per disk (env: STORAGE_PATHS, comma separated).
+# Each root runs its own store; when set, `path` is ignored. Every root must
+# be an existing directory on its own mounted disk. A root holding a packed
+# store from a single-path layout needs `miner split-union-index` first
+# (README, "Multiple storage roots").
+# paths = ["/data/d1/arion", "/data/d2/arion"]
+
 # Data directory for keypair and state
 data_dir = "data/miner"
 

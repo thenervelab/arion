@@ -2,6 +2,52 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.37] - 2026-10-15
+
+### Miner
+
+One store per disk, and tombstones kept per PG instead of dropped whole.
+
+- **Multiple storage roots** (`STORAGE_PATHS`, comma-separated absolute
+  paths): the miner runs one complete store per disk (with the packed
+  backend: own volumes, writer, index, delete journal and trash) behind a
+  routing layer, instead of one store on an aggregated mount. Writes spread
+  over the writable roots by free space above `STORAGE_ROOT_RESERVE_BYTES`
+  (4 GiB); a blob already held by a root (live or trashed) is written there
+  again. Reads try the roots in the order listed. A root that fills up turns
+  `full`: still read, no new writes. A root that fails, disappears or turns
+  read-only is taken out on its own (`down`, `offline`) and its shards are
+  reported absent while the node keeps serving and storing on the others; a
+  probe every `STORAGE_ROOT_PROBE_SECS` (15) brings it back. Deletes,
+  removals and trash purges received meanwhile are journaled in
+  `{data_dir}/storage-roots.pending` and applied before the root serves
+  again. Copies written twice while a root was away are resolved to the
+  first copy that verifies (up to a bounded suspect list; beyond it the
+  extra copies are served but not cleaned up, logged at warn). Capacity
+  reported to the validator is the sum over the usable roots, each
+  filesystem counted once. A root directory is never created by the miner (a
+  missing directory means an unmounted disk) and gets a `.arion-root` marker
+  on first use. `PACKED_INFLIGHT_MAX_BYTES` is shared equally between roots.
+  `STORAGE_PATH` alone behaves as before.
+- **`miner split-union-index`**: moves a packed store run on a union mount
+  whose create policy keeps each file on one branch to one root per branch
+  without moving data, by deriving one index per branch (live entries,
+  trash, delete journal) from the union index. Dry run, crash-safe and
+  rerunnable; the former index is kept as `packed/index.union-<id>`.
+  Runbook and rollback in `miner/README.md`, "Multiple storage roots".
+- **Tombstones kept per PG up to the cap.** When the tombstone rows of a
+  node's PGs exceed the reader's cap (8 M hashes), the miner used to drop
+  the whole tombstone class. It now keeps the tombstones of whole PGs up to
+  the cap, chosen from the signed sizes before any download (greedy from a
+  start that rotates with the generation, objects above 256 MiB skipped);
+  the other PGs stay under the orphan gates. Memory stays bounded by the
+  same cap, and one body that fails to verify still drops every tombstone
+  of the load.
+- **Streamed hash listings.** Stores expose `for_each_hash`; the
+  rebalance builds its local hash set from it, and the hybrid flat/packed
+  store streams both layouts instead of materializing every blob name as a
+  `String` plus a second copy of the set.
+
 ## [0.1.36] - 2026-10-06
 
 ### Miner
