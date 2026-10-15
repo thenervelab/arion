@@ -519,15 +519,23 @@ pub async fn self_rebalance_pg(
     // The directory walk is blocking IO that can take minutes on a large
     // store with a cold dentry cache; run it on the blocking pool so the
     // async workers (heartbeats included) keep flowing.
+    //
+    // Streamed straight into the set of 32-byte hashes: the former
+    // `list_hashes()` materialized every name as a String first (~100 B
+    // each, then the set on top), a multi-GB transient on a large node.
     let local_hashes: std::collections::HashSet<iroh_blobs::Hash> = {
         let store_for_scan = Arc::clone(&store);
-        let hash_strings = tokio::task::spawn_blocking(move || store_for_scan.list_hashes())
-            .await
-            .expect("list_hashes task panicked");
-        let set: std::collections::HashSet<iroh_blobs::Hash> = hash_strings
-            .iter()
-            .filter_map(|h| iroh_blobs::Hash::from_str(h).ok())
-            .collect();
+        let set = tokio::task::spawn_blocking(move || {
+            let mut set = std::collections::HashSet::new();
+            store_for_scan.for_each_hash(&mut |h| {
+                if let Ok(hash) = iroh_blobs::Hash::from_str(h) {
+                    set.insert(hash);
+                }
+            });
+            set
+        })
+        .await
+        .expect("hash listing task panicked");
         trace!(
             local_blobs = set.len(),
             "Built local hash set from flat store"

@@ -853,6 +853,10 @@ impl crate::store::BlobStore for FlatBlobStore {
         FlatBlobStore::list_hashes(self)
     }
 
+    fn for_each_hash(&self, visit: &mut dyn FnMut(&str)) {
+        for_each_bin(&self.data_dir, &mut |h, _| visit(h));
+    }
+
     fn list_trashed_hashes(&self) -> Vec<String> {
         FlatBlobStore::list_trashed_hashes(self)
     }

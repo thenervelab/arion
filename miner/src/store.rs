@@ -22,7 +22,15 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-/// Backend-agnostic interface to the miner's blob store.
+/// Capacity of the storage a backend writes to, as reported to the
+/// validator (registration and heartbeat). A multi-root store reports the
+/// sum over its usable roots, each filesystem counted once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskSpace {
+    pub total: u64,
+    pub available: u64,
+}
+
 /// Snapshot of a backend's in-flight write budget against one payload,
 /// taken before the payload is read off the wire (see
 /// [`BlobStore::inflight_headroom`]).
@@ -59,6 +67,7 @@ impl InflightHeadroom {
     }
 }
 
+/// Backend-agnostic interface to the miner's blob store.
 #[async_trait::async_trait]
 pub trait BlobStore: Send + Sync + std::fmt::Debug {
     /// Store blob data atomically under its hex hash.
@@ -120,8 +129,29 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug {
     /// Permanently remove one blob from the trash. No-op if absent.
     async fn purge_trashed(&self, hash_hex: &str) -> std::io::Result<()>;
 
-    /// All live blob hashes.
+    /// All live blob hashes. Materializes the whole listing: prefer
+    /// [`for_each_hash`](Self::for_each_hash) wherever the caller does not
+    /// need the `Vec` itself (tens of millions of names are gigabytes of
+    /// heap).
     fn list_hashes(&self) -> Vec<String>;
+
+    /// Stream every live blob hash to `visit`, each exactly once, without
+    /// materializing the listing. Blocking (walks the backing storage):
+    /// call from `spawn_blocking`. The default goes through
+    /// [`list_hashes`](Self::list_hashes); backends override it.
+    fn for_each_hash(&self, visit: &mut dyn FnMut(&str)) {
+        for h in self.list_hashes() {
+            visit(&h);
+        }
+    }
+
+    /// Total and available bytes of the storage this backend writes to,
+    /// `None` when the backend does not know (the caller then measures the
+    /// data directory's filesystem, the single-root behaviour). Blocking
+    /// (`statvfs` or a cached value).
+    fn disk_space(&self) -> Option<DiskSpace> {
+        None
+    }
 
     /// All trashed blob hashes.
     fn list_trashed_hashes(&self) -> Vec<String>;
@@ -205,6 +235,12 @@ impl<T: BlobStore + ?Sized> BlobStore for std::sync::Arc<T> {
     }
     fn list_hashes(&self) -> Vec<String> {
         (**self).list_hashes()
+    }
+    fn for_each_hash(&self, visit: &mut dyn FnMut(&str)) {
+        (**self).for_each_hash(visit)
+    }
+    fn disk_space(&self) -> Option<DiskSpace> {
+        (**self).disk_space()
     }
     fn list_trashed_hashes(&self) -> Vec<String> {
         (**self).list_trashed_hashes()

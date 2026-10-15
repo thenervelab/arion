@@ -3859,7 +3859,7 @@ dependencies = [
 
 [[package]]
 name = "miner"
-version = "0.1.36"
+version = "0.1.37"
 dependencies = [
  "anyhow",
  "async-trait",

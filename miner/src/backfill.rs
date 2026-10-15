@@ -220,10 +220,10 @@ pub enum SourceMode {
     ReadOnly,
     /// Move (`BACKFILL_LOCAL_SOURCE_DELETE=true` on a durable live store):
     /// a source file may be unlinked once its blob is in the live store.
-    /// A root that overlaps `live_root` (the live store's directory: same,
-    /// inside or containing it) stays read-only, since its files may be
-    /// the live copies themselves.
-    Move { live_root: PathBuf },
+    /// A root that overlaps one of `live_roots` (the live store's
+    /// directories, one per storage root: same, inside or containing it)
+    /// stays read-only, since its files may be the live copies themselves.
+    Move { live_roots: Vec<PathBuf> },
 }
 
 /// Where a verified local copy was read: root index, exact path, and the
@@ -282,12 +282,16 @@ impl LocalSources {
                 Ok(store) => {
                     let removable = match mode {
                         SourceMode::ReadOnly => None,
-                        SourceMode::Move { live_root } => {
-                            let canonical = removable_root(dir, live_root);
+                        SourceMode::Move { live_roots } => {
+                            let canonical = live_roots
+                                .iter()
+                                .map(|live| removable_root(dir, live))
+                                .collect::<Option<Vec<PathBuf>>>()
+                                .and_then(|c| c.into_iter().next());
                             if canonical.is_none() {
                                 tracing::warn!(
                                     path = %dir.display(),
-                                    live_root = %live_root.display(),
+                                    live_roots = ?live_roots,
                                     "backfill: local source overlaps the live store (or cannot be resolved), its files are never removed"
                                 );
                             }
@@ -1256,7 +1260,7 @@ pub(crate) mod tests {
         let foreign = outside.path().join(format!("{h}.bin"));
         std::fs::write(&foreign, &data).unwrap();
         let move_mode = SourceMode::Move {
-            live_root: live.path().to_path_buf(),
+            live_roots: vec![live.path().to_path_buf()],
         };
         let local = LocalSources::open(&[root.path().to_path_buf()], &move_mode);
         assert_eq!(local.removable_roots(), 1);
@@ -1364,7 +1368,9 @@ pub(crate) mod tests {
         ] {
             let overlapping = LocalSources::open(
                 &[root.path().to_path_buf()],
-                &SourceMode::Move { live_root },
+                &SourceMode::Move {
+                    live_roots: vec![live_root],
+                },
             );
             assert_eq!(overlapping.removable_roots(), 0);
             assert!(failed(
@@ -1374,7 +1380,9 @@ pub(crate) mod tests {
         let parent = root.path().parent().unwrap().to_path_buf();
         let containing = LocalSources::open(
             &[root.path().to_path_buf()],
-            &SourceMode::Move { live_root: parent },
+            &SourceMode::Move {
+                live_roots: vec![parent],
+            },
         );
         assert_eq!(
             containing.removable_roots(),

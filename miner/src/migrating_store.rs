@@ -161,15 +161,21 @@ impl BlobStore for MigratingStore {
     }
 
     fn list_hashes(&self) -> Vec<String> {
-        // Union, packed first (authoritative), flat entries not yet moved.
-        let mut out = self.packed.list_hashes();
-        let mut seen: std::collections::HashSet<String> = out.iter().cloned().collect();
-        for h in self.flat.list_hashes() {
-            if seen.insert(h.clone()) {
-                out.push(h);
-            }
-        }
+        let mut out = Vec::new();
+        self.for_each_hash(&mut |h| out.push(h.to_string()));
         out
+    }
+
+    /// Union, packed first (authoritative), then the flat entries not yet
+    /// moved. Deduplicated by asking the packed index, not by a set of
+    /// every name seen (that set alone was gigabytes on a large node).
+    fn for_each_hash(&self, visit: &mut dyn FnMut(&str)) {
+        self.packed.for_each_hash(visit);
+        self.flat.for_each_hash(&mut |h| {
+            if !self.packed.has(h) {
+                visit(h);
+            }
+        });
     }
 
     fn list_trashed_hashes(&self) -> Vec<String> {

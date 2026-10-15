@@ -9,6 +9,7 @@ mod gateway_keepalive;
 mod inventory;
 mod migrating_store;
 mod mmap_index;
+mod multi_root_store;
 mod p2p;
 mod packed_store;
 // The obligation-list backfill loop is not part of the release binary: it
@@ -92,6 +93,25 @@ enum Commands {
         /// Target data directory (default: data/miner)
         #[arg(short, long, default_value = "data/miner")]
         data_dir: String,
+    },
+    /// Split the packed index of a store run on a union mount into one
+    /// index per branch, so the branches can be listed in STORAGE_PATHS
+    /// without moving any data. The miner must be stopped and the union
+    /// still mounted. Idempotent; see README "Multiple storage roots".
+    SplitUnionIndex {
+        /// Blob directory as seen through the union mount (the former
+        /// STORAGE_PATH)
+        #[arg(long)]
+        union: String,
+        /// Branch blob directories, comma separated, in the order of the
+        /// future STORAGE_PATHS
+        #[arg(long)]
+        roots: String,
+        /// Check the layout and count what each branch would get; writes
+        /// nothing on the branches (the union store is opened as a miner
+        /// start would open it)
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -297,7 +317,154 @@ async fn handle_subcommand(command: Commands) -> Result<()> {
 
             Ok(())
         }
+        Commands::SplitUnionIndex {
+            union,
+            roots,
+            dry_run,
+        } => {
+            let union = std::path::PathBuf::from(union);
+            let roots: Vec<std::path::PathBuf> = config::split_storage_paths(&roots)
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .collect();
+            let report = tokio::task::spawn_blocking(move || {
+                packed_store::split::split_union_index(&union, &roots, dry_run)
+            })
+            .await?
+            .map_err(|e| anyhow::anyhow!("split-union-index: {e}"))?;
+            if report.nothing_to_split {
+                info!("split-union-index: the union holds no packed index, nothing to split");
+                return Ok(());
+            }
+            for r in &report.roots {
+                info!(
+                    root = %r.root.display(),
+                    volumes = r.volumes,
+                    live = r.live,
+                    trash = r.trash,
+                    live_bytes = r.live_bytes,
+                    "split-union-index: branch"
+                );
+            }
+            info!(
+                split = %report.split_id,
+                resumed = report.resumed,
+                union_scanned_bytes = report.union_scanned_bytes,
+                dry_run = report.dry_run,
+                "split-union-index: {}",
+                if report.dry_run {
+                    "dry run, nothing written"
+                } else {
+                    "done: unmount the union, set STORAGE_PATHS to the branches"
+                }
+            );
+            Ok(())
+        }
     }
+}
+
+/// Blob store roots from `STORAGE_PATHS` / `storage.paths`, `None` when
+/// unset (single-path mode, `STORAGE_PATH`). Entries must be absolute.
+fn resolve_storage_roots(
+    config: &config::MinerConfig,
+    cli_storage_path: Option<&str>,
+) -> Result<Option<Vec<std::path::PathBuf>>> {
+    if config.storage.paths.is_empty() {
+        return Ok(None);
+    }
+    if cli_storage_path.is_some() {
+        warn!("STORAGE_PATH / --storage-path ignored: STORAGE_PATHS is set");
+    }
+    let mut roots = Vec::with_capacity(config.storage.paths.len());
+    for p in &config.storage.paths {
+        let path = std::path::PathBuf::from(p);
+        if !path.is_absolute() || p.contains('\n') {
+            anyhow::bail!("STORAGE_PATHS entry {p:?} is not an absolute path");
+        }
+        roots.push(path);
+    }
+    Ok(Some(roots))
+}
+
+/// Open one store root with the configured backend. `inflight_budget`
+/// overrides the packed store's process-wide write budget (a multi-root
+/// store gives each root its share). Blocking: volume scans and directory
+/// probes; on a runtime worker it goes through `helpers::blocking`.
+fn open_backend(
+    blobs_dir: &std::path::Path,
+    backend: &str,
+    inflight_budget: Option<u64>,
+) -> Result<Arc<dyn BlobStore>> {
+    let store: Arc<dyn BlobStore> = match backend {
+        "packed" => {
+            let packed_root = blobs_dir.join("packed");
+            let packed = helpers::blocking(|| match inflight_budget {
+                Some(b) => packed_store::PackedStore::open_with_budget(&packed_root, b),
+                None => packed_store::PackedStore::open(&packed_root),
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to open packed blob store: {}", e))?;
+            if helpers::blocking(|| migrating_store::flat_data_present(blobs_dir)) {
+                // Existing per-file blobs: serve through the hybrid (packed
+                // first, flat fallback) and drain the flat layout in the
+                // background. Resumable across restarts — the cursor is the
+                // existence of the flat files themselves.
+                let flat =
+                    Arc::new(FlatBlobStore::new(blobs_dir).map_err(|e| {
+                        anyhow::anyhow!("Failed to initialize flat blob store: {}", e)
+                    })?);
+                let progress = Arc::new(migrating_store::MigrationProgress::default());
+                tokio::spawn(migrating_store::run_migration(
+                    Arc::clone(&flat),
+                    Arc::clone(&packed),
+                    blobs_dir.to_path_buf(),
+                    Arc::clone(&progress),
+                    None,
+                ));
+                info!(path = %blobs_dir.display(), "Initialized packed storage with flat->packed migration");
+                Arc::new(migrating_store::MigratingStore { flat, packed })
+            } else {
+                info!(path = %packed_root.display(), "Initialized packed blob storage");
+                packed
+            }
+        }
+        "flat" => {
+            let s = Arc::new(
+                FlatBlobStore::new(blobs_dir)
+                    .map_err(|e| anyhow::anyhow!("Failed to initialize blob store: {}", e))?,
+            );
+            info!(path = %blobs_dir.display(), "Initialized flat-file blob storage");
+            s
+        }
+        other => {
+            anyhow::bail!("Unknown STORE_BACKEND '{other}' (expected 'flat' or 'packed')");
+        }
+    };
+    Ok(store)
+}
+
+/// Unsigned integer environment knob, `default` when unset or unparseable
+/// (logged at warn).
+fn env_u64(name: &str, default: u64) -> u64 {
+    match std::env::var(name) {
+        Ok(v) => v.trim().parse().unwrap_or_else(|_| {
+            warn!(name, value = %v, default, "not an unsigned integer, using the default");
+            default
+        }),
+        Err(_) => default,
+    }
+}
+
+/// Total and available bytes reported to the validator: the store's own
+/// figure (a multi-root store sums its usable roots), else the data
+/// directory's filesystem (the single-root behaviour).
+fn storage_space(store: &dyn BlobStore, data_dir: &std::path::Path) -> (u64, u64) {
+    helpers::blocking(|| match store.disk_space() {
+        Some(space) => (space.total, space.available),
+        None => (
+            fs2::total_space(data_dir).unwrap_or(0),
+            free_space(data_dir).unwrap_or(0),
+        ),
+    })
 }
 
 /// Shared context for registration and heartbeat functions.
@@ -588,48 +755,65 @@ async fn run_miner(cli: Cli) -> Result<()> {
     let backend = std::env::var("STORE_BACKEND")
         .ok()
         .unwrap_or_else(|| config.storage.backend.clone());
-    let store: Arc<dyn BlobStore> = match backend.as_str() {
-        "packed" => {
-            // Volume scan and directory probes: off the runtime workers.
-            let packed =
-                helpers::blocking(|| packed_store::PackedStore::open(blobs_dir.join("packed")))
-                    .map_err(|e| anyhow::anyhow!("Failed to open packed blob store: {}", e))?;
-            if helpers::blocking(|| migrating_store::flat_data_present(&blobs_dir)) {
-                // Existing per-file blobs: serve through the hybrid (packed
-                // first, flat fallback) and drain the flat layout in the
-                // background. Resumable across restarts — the cursor is the
-                // existence of the flat files themselves.
-                let flat =
-                    Arc::new(FlatBlobStore::new(&blobs_dir).map_err(|e| {
-                        anyhow::anyhow!("Failed to initialize flat blob store: {}", e)
-                    })?);
-                let progress = Arc::new(migrating_store::MigrationProgress::default());
-                tokio::spawn(migrating_store::run_migration(
-                    Arc::clone(&flat),
-                    Arc::clone(&packed),
-                    blobs_dir.clone(),
-                    Arc::clone(&progress),
-                    None,
-                ));
-                info!(path = %blobs_dir.display(), "Initialized packed storage with flat->packed migration");
-                Arc::new(migrating_store::MigratingStore { flat, packed })
-            } else {
-                info!(path = %blobs_dir.join("packed").display(), "Initialized packed blob storage");
-                packed
-            }
+    if backend != "flat" && backend != "packed" {
+        anyhow::bail!("Unknown STORE_BACKEND '{backend}' (expected 'flat' or 'packed')");
+    }
+    // `STORAGE_PATHS` (one store per disk) or the single `STORAGE_PATH`.
+    let storage_roots = resolve_storage_roots(&config, cli.storage_path.as_deref())?;
+    let (store, store_roots, store_id): (
+        Arc<dyn BlobStore>,
+        Vec<std::path::PathBuf>,
+        std::path::PathBuf,
+    ) = match storage_roots {
+        None => {
+            helpers::blocking(|| multi_root_store::refuse_member_root(&blobs_dir))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let store = open_backend(&blobs_dir, &backend, None)?;
+            (store, vec![blobs_dir.clone()], blobs_dir.clone())
         }
-        "flat" => {
-            let s = Arc::new(
-                FlatBlobStore::new(&blobs_dir)
-                    .map_err(|e| anyhow::anyhow!("Failed to initialize blob store: {}", e))?,
+        Some(roots) => {
+            let budget = (limits::get().inflight_budget_bytes / roots.len() as u64)
+                .max(limits::ENV_MIN_INFLIGHT_BUDGET);
+            let reserve = env_u64(
+                "STORAGE_ROOT_RESERVE_BYTES",
+                multi_root_store::DEFAULT_RESERVE_BYTES,
             );
-            info!(path = %blobs_dir.display(), "Initialized flat-file blob storage");
-            s
-        }
-        other => {
-            anyhow::bail!("Unknown STORE_BACKEND '{other}' (expected 'flat' or 'packed')");
+            let probe_every = std::time::Duration::from_secs(
+                env_u64(
+                    "STORAGE_ROOT_PROBE_SECS",
+                    multi_root_store::DEFAULT_PROBE_INTERVAL.as_secs(),
+                )
+                .max(1),
+            );
+            let backend_for_roots = backend.clone();
+            let factory: Arc<multi_root_store::RootFactory> =
+                Arc::new(move |root: &std::path::Path| {
+                    open_backend(root, &backend_for_roots, Some(budget))
+                        .map_err(|e| std::io::Error::other(format!("{e:#}")))
+                });
+            let multi =
+                multi_root_store::MultiRootStore::open(roots.clone(), factory, &data_dir, reserve)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to open the storage roots: {e}"))?;
+            multi.spawn_health_loop(probe_every);
+            info!(
+                roots = multi.root_count(),
+                backend = %backend,
+                inflight_budget_per_root = budget,
+                reserve_bytes = reserve,
+                "Initialized multi-root blob storage"
+            );
+            let id = std::path::PathBuf::from(
+                roots
+                    .iter()
+                    .map(|r| r.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            (multi, roots, id)
         }
     };
+    let blobs_dir = store_roots[0].clone();
 
     // Store blobs_dir globally
     {
@@ -654,7 +838,8 @@ async fn run_miner(cli: Cli) -> Result<()> {
     }
     {
         let store_bg = Arc::clone(&store);
-        let blobs_bg = blobs_dir.clone();
+        let roots_bg = store_roots.clone();
+        let store_id_bg = store_id.clone();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
             // First: the rebuild and the reconciliation write through the
@@ -662,9 +847,11 @@ async fn run_miner(cli: Cli) -> Result<()> {
             if let Err(e) = tokio::task::spawn_blocking(inventory::build_trashed_index).await {
                 warn!(error = %e, "inventory: trashed_at index build task panicked");
             }
-            let rebuild_dir = blobs_bg.clone();
-            match tokio::task::spawn_blocking(move || inventory::rebuild_from_fs(&rebuild_dir))
-                .await
+            match tokio::task::spawn_blocking(move || {
+                let roots: Vec<&std::path::Path> = roots_bg.iter().map(|r| r.as_path()).collect();
+                inventory::rebuild_from_fs(&store_id_bg, &roots)
+            })
+            .await
             {
                 Ok(Ok(rebuilt)) if rebuilt > 0 => {
                     info!(count = rebuilt, "inventory: rebuilt from filesystem")
@@ -810,7 +997,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
         purge_cfg,
         backfill_cfg,
         endpoint.clone(),
-        blobs_dir.clone(),
+        store_roots.clone(),
     ));
     #[cfg(not(feature = "backfill"))]
     {
@@ -1067,7 +1254,7 @@ async fn run_miner(cli: Cli) -> Result<()> {
     // 4. Nothing accepts writes any more: seal the inventory so the next
     // start skips the O(blobs) filesystem count (waits for in-flight blob
     // writes, refuses on any doubt; see `inventory::rebuild_from_fs`).
-    inventory::seal_on_clean_shutdown(&blobs_dir, inventory::CLEAN_STOP_DRAIN_TIMEOUT).await;
+    inventory::seal_on_clean_shutdown(&store_id, inventory::CLEAN_STOP_DRAIN_TIMEOUT).await;
 
     // 5. Persist the store's open-time cache (packed: the index snapshot,
     // so the next open scans only what is appended after it instead of
@@ -1305,8 +1492,7 @@ fn spawn_heartbeat_loop(
 
             // Calculate available storage
             let max_storage_gb = ctx.config.storage.max_storage_gb;
-            let disk_available = helpers::blocking(|| free_space(&ctx.data_dir)).unwrap_or(0);
-            let disk_total = helpers::blocking(|| fs2::total_space(&ctx.data_dir)).unwrap_or(0);
+            let (disk_total, disk_available) = storage_space(ctx.store.as_ref(), &ctx.data_dir);
 
             let (total_storage, reported_available) = if max_storage_gb > 0 {
                 let max_bytes = max_storage_gb.saturating_mul(1024 * 1024 * 1024);
@@ -1592,8 +1778,7 @@ fn spawn_heartbeat_loop(
 /// Perform a single registration attempt with the validator.
 async fn register_with_validator_once(ctx: &MinerContext) -> Result<quinn::Connection> {
     // Calculate storage stats
-    let disk_available = helpers::blocking(|| free_space(&ctx.data_dir)).unwrap_or(0);
-    let disk_total = helpers::blocking(|| fs2::total_space(&ctx.data_dir)).unwrap_or(0);
+    let (disk_total, disk_available) = storage_space(ctx.store.as_ref(), &ctx.data_dir);
 
     let (total, reported_available) = if ctx.config.storage.max_storage_gb > 0 {
         let max_bytes = ctx
@@ -1707,4 +1892,32 @@ async fn register_with_validator_once(ctx: &MinerContext) -> Result<quinn::Conne
 
     result?;
     Ok(conn)
+}
+
+#[cfg(test)]
+mod storage_roots_tests {
+    use super::*;
+
+    #[test]
+    fn single_path_mode_unless_storage_paths_is_set() {
+        let mut config = config::MinerConfig::default();
+        assert!(
+            resolve_storage_roots(&config, Some("/data/blobs"))
+                .unwrap()
+                .is_none()
+        );
+        config.storage.paths = vec!["/data/d1/s".into(), "/data/d2/s".into()];
+        let roots = resolve_storage_roots(&config, Some("/data/blobs"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            roots,
+            vec![
+                std::path::PathBuf::from("/data/d1/s"),
+                std::path::PathBuf::from("/data/d2/s")
+            ]
+        );
+        config.storage.paths = vec!["relative/s".into()];
+        assert!(resolve_storage_roots(&config, None).is_err());
+    }
 }

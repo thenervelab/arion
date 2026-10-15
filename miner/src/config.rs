@@ -159,6 +159,12 @@ pub struct StorageConfig {
     #[serde(default = "default_storage_path")]
     pub path: String,
 
+    /// Several blob storage roots, one per disk (`STORAGE_PATHS`, comma
+    /// separated): one independent store per root. Takes precedence over
+    /// `path` when non-empty; see `multi_root_store`.
+    #[serde(default)]
+    pub paths: Vec<String>,
+
     /// Storage backend: "flat" (one file per blob, the default) or
     /// "packed" (append-only volumes + in-RAM index). Overridable via the
     /// STORE_BACKEND env var. "packed" only serves blobs written while in
@@ -203,6 +209,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             path: default_storage_path(),
+            paths: Vec::new(),
             backend: default_store_backend(),
             max_storage_gb: 0,
             data_dir: default_data_dir(),
@@ -211,6 +218,15 @@ impl Default for StorageConfig {
             trash_max_bytes: 0,
         }
     }
+}
+
+/// `STORAGE_PATHS` entries: comma separated, trimmed, empty ones dropped.
+pub fn split_storage_paths(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn default_store_backend() -> String {
@@ -312,6 +328,9 @@ impl MinerConfig {
         // Storage overrides
         if let Ok(val) = std::env::var("STORAGE_PATH") {
             config.storage.path = val;
+        }
+        if let Ok(val) = std::env::var("STORAGE_PATHS") {
+            config.storage.paths = split_storage_paths(&val);
         }
         env_parse("MAX_STORAGE_GB", &mut config.storage.max_storage_gb);
         env_parse("TRASH_ENABLED", &mut config.storage.trash_enabled);
@@ -447,6 +466,19 @@ fn default_p2p_direct_wait_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_paths_split_on_commas_and_default_to_single_path_mode() {
+        assert_eq!(
+            split_storage_paths(" /mnt/a/s , /mnt/b/s,,/mnt/c s "),
+            vec!["/mnt/a/s", "/mnt/b/s", "/mnt/c s"]
+        );
+        assert!(split_storage_paths(" , ").is_empty());
+        assert!(StorageConfig::default().paths.is_empty());
+        let cfg: StorageConfig = toml::from_str("paths = [\"/mnt/a\", \"/mnt/b\"]").unwrap();
+        assert_eq!(cfg.paths, vec!["/mnt/a", "/mnt/b"]);
+        assert_eq!(cfg.path, default_storage_path());
+    }
 
     // SAFETY: `set_var`/`remove_var` are unsafe in Rust 2024 edition because
     // concurrent env modification is UB. Each test uses a unique prefixed
