@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.38] - 2026-10-24
+
+### Miner
+
+- Dependency updates (QUIC stack: `quinn-proto` 0.11.18). No behaviour or
+  configuration change.
+
 ## [0.1.37] - 2026-10-15
 
 ### Miner
